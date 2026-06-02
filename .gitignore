@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# ArcGIS generated tool metadata, locks and scratch
+*.pyt.xml
+*.lock
+*.sr.lock
+*.rd.lock
+schema.ini
+
+# File geodatabases and data (this repo is code, not data)
+*.gdb/
+*.sde
+*.tif
+*.tif.aux.xml
+*.tif.ovr
+*.tfw
+*.img
+*.vat.dbf
+
+# OS and editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+# Local project instructions (kept private, not shared)
+Claude.md
+CLAUDE.md
