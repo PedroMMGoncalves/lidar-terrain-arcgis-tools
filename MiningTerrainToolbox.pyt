@@ -891,15 +891,15 @@ class DeriveSurfaces(object):
         p_recurse.value = True
 
         p_out = arcpy.Parameter(
-            displayName="Output folder", name="out_folder",
-            datatype="DEFolder", parameterType="Required", direction="Output")
+            displayName="Output folder (per_mina_subfolder or flat only)", name="out_folder",
+            datatype="DEFolder", parameterType="Optional", direction="Output")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
             datatype="GPString", parameterType="Required", direction="Input")
         p_struct.filter.type = "ValueList"
-        p_struct.filter.list = ["per_mina_subfolder", "flat"]
-        p_struct.value = "per_mina_subfolder"
+        p_struct.filter.list = ["same_as_input", "per_mina_subfolder", "flat"]
+        p_struct.value = "same_as_input"
 
         p_source = arcpy.Parameter(
             displayName="Source", name="source_filter",
@@ -972,6 +972,8 @@ class DeriveSurfaces(object):
             return False
 
     def updateParameters(self, parameters):
+        # Output folder is only needed for per_mina_subfolder or flat output.
+        parameters[2].enabled = parameters[3].valueAsText != "same_as_input"
         # Azimuth/altitude only matter for a Traditional hillshade.
         traditional = bool(parameters[7].value) and parameters[11].valueAsText == "Traditional"
         parameters[12].enabled = traditional
@@ -979,6 +981,9 @@ class DeriveSurfaces(object):
         return
 
     def updateMessages(self, parameters):
+        if parameters[3].valueAsText != "same_as_input" and not parameters[2].valueAsText:
+            parameters[2].setErrorMessage("Output folder is required unless output structure is "
+                                          "same_as_input.")
         return
 
     def execute(self, parameters, messages):
@@ -1000,6 +1005,11 @@ class DeriveSurfaces(object):
 
         arcpy.env.overwriteOutput = overwrite_existing
         multidirectional = do_hillshade and hillshade_type == "Multidirectional"
+
+        if output_structure != "same_as_input" and not out_folder:
+            msg = "Output folder is required unless output structure is same_as_input."
+            _err(msg)
+            raise ValueError(msg)
 
         wanted = []
         if do_slope:
@@ -1066,9 +1076,12 @@ class DeriveSurfaces(object):
                 arcpy.SetProgressorPosition()
                 _assert_projected_raster(path)
 
-                location = out_folder
-                if output_structure == "per_mina_subfolder":
+                if output_structure == "same_as_input":
+                    location = os.path.dirname(path)
+                elif output_structure == "per_mina_subfolder":
                     location = os.path.join(out_folder, mina)
+                else:
+                    location = out_folder
                 if not os.path.isdir(location):
                     os.makedirs(location)
 
@@ -1168,15 +1181,15 @@ class ReclassifyFactor(object):
             datatype="GPLong", parameterType="Optional", direction="Input")
 
         p_out = arcpy.Parameter(
-            displayName="Output folder", name="out_folder",
-            datatype="DEFolder", parameterType="Required", direction="Output")
+            displayName="Output folder (per_mina_subfolder or flat only)", name="out_folder",
+            datatype="DEFolder", parameterType="Optional", direction="Output")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
             datatype="GPString", parameterType="Required", direction="Input")
         p_struct.filter.type = "ValueList"
-        p_struct.filter.list = ["per_mina_subfolder", "flat"]
-        p_struct.value = "per_mina_subfolder"
+        p_struct.filter.list = ["same_as_input", "per_mina_subfolder", "flat"]
+        p_struct.value = "same_as_input"
 
         p_nodata = arcpy.Parameter(
             displayName="Unmapped values to NoData", name="nodata_for_unmapped",
@@ -1202,6 +1215,8 @@ class ReclassifyFactor(object):
         parameters[3].enabled = inc_slope
         parameters[4].enabled = inc_aspect
         parameters[5].enabled = inc_aspect
+        # Output folder is only needed for per_mina_subfolder or flat output.
+        parameters[6].enabled = parameters[7].valueAsText != "same_as_input"
         return
 
     def updateMessages(self, parameters):
@@ -1217,6 +1232,9 @@ class ReclassifyFactor(object):
                 validate_value_table(table)
             except Exception as exc:
                 parameters[idx].setErrorMessage(str(exc))
+        if parameters[7].valueAsText != "same_as_input" and not parameters[6].valueAsText:
+            parameters[6].setErrorMessage("Output folder is required unless output structure is "
+                                          "same_as_input.")
         return
 
     def execute(self, parameters, messages):
@@ -1233,6 +1251,11 @@ class ReclassifyFactor(object):
         overwrite_existing = bool(parameters[9].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
+
+        if output_structure != "same_as_input" and not out_folder:
+            msg = "Output folder is required unless output structure is same_as_input."
+            _err(msg)
+            raise ValueError(msg)
 
         inc_slope = factor in ("SLOPE", "BOTH")
         inc_aspect = factor in ("ASPECT", "BOTH")
@@ -1305,9 +1328,12 @@ class ReclassifyFactor(object):
         for path, mina, source, product in rasters:
             arcpy.SetProgressorPosition()
             out_name = build_output_name(mina, source, product, reclass=True) + ".tif"
-            location = out_folder
-            if output_structure == "per_mina_subfolder":
+            if output_structure == "same_as_input":
+                location = os.path.dirname(path)
+            elif output_structure == "per_mina_subfolder":
                 location = os.path.join(out_folder, mina)
+            else:
+                location = out_folder
             if not os.path.isdir(location):
                 os.makedirs(location)
             out_path = os.path.join(location, out_name)

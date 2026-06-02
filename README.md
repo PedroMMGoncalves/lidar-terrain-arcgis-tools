@@ -103,7 +103,8 @@ Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox 
 | --- | --- |
 | Input mosaics folder | The Tool 1 output. |
 | Recurse subfolders | On (default) finds the `per_mina_subfolder` layout. |
-| Output folder, Output structure | As in Tool 1. |
+| Output structure | `same_as_input` (default; each surface is written next to its input mosaic), `per_mina_subfolder`, or `flat`. |
+| Output folder | Only for `per_mina_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
 | Source | `BOTH` (default), `DEM`, or `DSM`. |
 | Slope, Aspect, Hillshade, Profile curvature, Plan curvature | One checkbox each. |
 | Z factor | Default 1 (project is metric). |
@@ -122,7 +123,8 @@ Ordinal classes for slope and aspect, from a value table.
 | Factor to process | `BOTH` (default), `SLOPE`, or `ASPECT`. |
 | Slope classes, Aspect classes | Value tables of `class_id`, `min`, `max`. `[min, max)`, last class inclusive at the top. |
 | Flat class value | Optional. Class for the Aspect Flat (-1). |
-| Output folder, Output structure | As above. |
+| Output structure | `same_as_input` (default; each reclassified raster is written next to its input), `per_mina_subfolder`, or `flat`. |
+| Output folder | Only for `per_mina_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
 | Unmapped values to NoData | On (default). Off makes any cell outside all classes a fail loud error. |
 | Overwrite existing outputs | Off skips existing reclassified rasters. |
 
