@@ -7,6 +7,7 @@
 [![Spatial Analyst](https://img.shields.io/badge/Extension-Spatial_Analyst-orange.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-spatial-analyst/overview)
 [![Image Analyst](https://img.shields.io/badge/Extension-Image_Analyst-orange.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-image-analyst/overview)
 [![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 A single ArcGIS Pro Python Toolbox (`.pyt`) that processes, in batch, DGT LiDAR elevation data to generate topographic factors for a multicriteria suitability analysis (MCDA) for renewable energy (solar PV focus) on abandoned mining areas in mainland Portugal.
 
@@ -14,7 +15,7 @@ This toolbox is the **factor engine only**. The weighted overlay and the REN/RAN
 
 ## Contents
 
-[Summary](#summary) - [Method](#method) - [Requirements](#requirements) - [Installation](#installation) - [Usage](#usage) - [Naming convention](#naming-convention) - [Example](#example) - [Tests](#tests) - [Troubleshooting](#troubleshooting) - [Limitations and notes](#limitations-and-notes) - [Contributing](#contributing) - [License](#license)
+[Summary](#summary) - [Method](#method) - [Requirements](#requirements) - [Installation](#installation) - [Usage](#usage) - [Naming convention](#naming-convention) - [Example](#example) - [Tests](#tests) - [Troubleshooting](#troubleshooting) - [Limitations and notes](#limitations-and-notes) - [Contributing](#contributing) - [Citation](#citation) - [License](#license)
 
 ---
 
@@ -219,6 +220,12 @@ Issues and pull requests are welcome. When reporting a problem, please include:
 
 ---
 
+## Citation
+
+If you use this toolbox, please cite it via the metadata in [`CITATION.cff`](CITATION.cff) (GitHub renders this in the sidebar as "Cite this repository"). A versioned DOI is minted via Zenodo for each GitHub release.
+
+---
+
 ## License
 
-To be defined.
+GNU General Public License v3.0 or later. See [LICENSE](LICENSE).

@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "lidar-terrain-arcgis-tools: ArcGIS Pro toolbox for LiDAR-derived topographic factors"
+type: software
+authors:
+  - given-names: Pedro
+    family-names: Gonçalves
+repository-code: "https://github.com/PedroMMGoncalves/lidar-terrain-arcgis-tools"
+license: GPL-3.0-or-later
+# doi: add the Zenodo concept DOI here after the first GitHub release
