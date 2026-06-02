@@ -25,6 +25,7 @@ execute it as a script).
 import os
 import re
 import unicodedata
+import xml.etree.ElementTree as ET
 
 try:
     import arcpy
@@ -273,40 +274,61 @@ def validate_value_table(rows):
     return ordered
 
 
-_LINEAR_UNITS_TO_M = {
-    "millimeters": 0.001, "millimeter": 0.001,
-    "centimeters": 0.01, "centimeter": 0.01,
-    "decimeters": 0.1, "decimeter": 0.1,
-    "meters": 1.0, "meter": 1.0,
-    "kilometers": 1000.0, "kilometer": 1000.0,
-    "feet": 0.3048, "foot": 0.3048,
-    "yards": 0.9144, "yard": 0.9144,
-    "miles": 1609.344, "mile": 1609.344,
-    "nauticalmiles": 1852.0, "nauticalmile": 1852.0,
-}
+def build_mina_groups(rows):
+    """Group AOI features by mina so each mina yields one output.
 
+    `rows` is an iterable of (fid, raw_mina). A mina can have several AOI polygons,
+    and therefore several download folders, so features sharing the same raw `Mina`
+    value are merged into one group that keeps every fid. The caller then gathers
+    tiles from all of that mina's folders into a single mosaic.
 
-def linear_unit_to_meters(linear_unit):
-    """Convert an ArcGIS Linear Unit string like "5 Kilometers" to meters.
-
-    The project is metric, so buffers are computed in meters. Fails loud on an
-    unknown or non linear unit (for example DecimalDegrees), since a degree based
-    buffer would be wrong here.
+    Returns a list of (final_name, [fids]) ordered by the group's smallest fid. Two
+    DIFFERENT raw names that sanitize to the same safe name get a numeric suffix via
+    dedupe_name (a genuine collision, not a merge). Raises ValueError (via
+    sanitize_name) on an empty mina value.
     """
-    if not linear_unit:
-        raise ValueError("Empty buffer distance.")
-    parts = str(linear_unit).split()
-    if len(parts) != 2:
-        raise ValueError("Buffer distance must be 'value unit', got: {!r}".format(linear_unit))
-    value_str, unit = parts
+    groups = {}
+    for fid, raw in rows:
+        key = "" if raw is None else str(raw).strip()
+        groups.setdefault(key, []).append(int(fid))
+
+    result = []
+    used = set()
+    for raw in sorted(groups, key=lambda r: min(groups[r])):
+        try:
+            base = sanitize_name(raw)
+        except ValueError as exc:
+            raise ValueError("AOI feature(s) with FID {} have an unusable Mina value '{}': {}".format(
+                sorted(groups[raw]), raw, exc))
+        final = dedupe_name(base, used)
+        used.add(final)
+        result.append((final, sorted(groups[raw])))
+    return result
+
+
+def _parse_vrt_extent(xml_text):
+    """Parse a GDAL .vrt XML string. Returns (xmin, ymin, xmax, ymax).
+
+    Uses rasterXSize/rasterYSize and the GeoTransform (origin plus pixel size). Pure
+    function, unit tested. Coordinates are in the VRT's own CRS, which for this data
+    is the project CRS (tiles are ETRS89). Raises ValueError on a malformed VRT.
+    """
+    root = ET.fromstring(xml_text)
     try:
-        value = float(value_str.replace(",", "."))
-    except ValueError:
-        raise ValueError("Buffer distance value is not numeric: {!r}".format(value_str))
-    factor = _LINEAR_UNITS_TO_M.get(unit.lower())
-    if factor is None:
-        raise ValueError("Unsupported buffer unit '{}'. Use a linear unit (meters, kilometers), not degrees.".format(unit))
-    return value * factor
+        w = int(root.attrib["rasterXSize"])
+        h = int(root.attrib["rasterYSize"])
+    except (KeyError, ValueError):
+        raise ValueError("VRT has no valid rasterXSize/rasterYSize.")
+    gt_el = root.find("GeoTransform")
+    if gt_el is None or not gt_el.text:
+        raise ValueError("VRT has no GeoTransform.")
+    gt = [float(v) for v in gt_el.text.replace(",", " ").split()]
+    if len(gt) != 6:
+        raise ValueError("VRT GeoTransform must have 6 values, got {}.".format(len(gt)))
+    x0, dx, _, y0, _, dy = gt
+    xs = (x0, x0 + w * dx)
+    ys = (y0, y0 + h * dy)
+    return (min(xs), min(ys), max(xs), max(ys))
 
 
 # ===========================================================================
@@ -317,10 +339,8 @@ class Toolbox(object):
     def __init__(self):
         self.label = "Mining Terrain Factor Toolbox"
         self.alias = "MiningTerrain"
-        # Tools are registered incrementally. Passo 0 ships the shared helpers and
-        # the self tests only. Each Tool class is added here as it is built and
-        # validated:
-        #   BuildMosaicsByPolygon  (category "Mosaicking")       -> implemented
+        # Tools are registered incrementally as each is built and validated:
+        #   BuildMosaicsByPolygon  (category "Mosaicking")        -> implemented
         #   DeriveSurfaces         (category "Surfaces")
         #   ReclassifyFactor       (category "Reclassification")
         # A future fifth tool for solar irradiation (Area Solar Radiation) would be
@@ -356,89 +376,108 @@ def _same_crs(sr_a, sr_b):
     return sr_a.exportToString() == sr_b.exportToString()
 
 
-def _build_tile_index(folder):
-    """List .tif tiles in `folder` and return (footprints, tile_sr).
+def _gather_product_tiles(folders, product_prefix):
+    """Collect the .tif tiles for one product across a mina's download folders.
 
-    footprints is a list of (tile_path, extent_polygon). For a regular tile grid
-    the rectangular extent is the exact footprint (spec 4.2). Fails loud if the
-    folder has no rasters, if the tiles are not in a projected CRS (geographic or
-    undefined are invalid for slope and aspect downstream), or if the tiles are not
-    all in the same CRS.
+    product_prefix is "MDT" (DEM) or "MDS" (DSM). Recurses each folder, keeps files
+    whose name starts with product_prefix (case insensitive), and dedups by file name
+    (adjacent AOIs of the same mina share tiles, the tile code identifies them).
+    Returns (paths, tile_sr). Returns ([], None) if no tile matches.
+
+    CRS is validated once per folder (tiles within a DGT download are homogeneous):
+    fail loud on a geographic, undefined, or mixed CRS across the mina's folders.
     """
-    prev_ws = arcpy.env.workspace
-    try:
-        arcpy.env.workspace = folder
-        names = arcpy.ListRasters("*", "TIF") or []
-    finally:
-        arcpy.env.workspace = prev_ws
-
-    if not names:
-        msg = "No .tif tiles found in '{}'.".format(folder)
-        _err(msg)
-        raise ValueError(msg)
-
-    footprints = []
+    seen = set()
+    paths = []
     ref_sr = None
-    for name in names:
-        path = os.path.join(folder, name)
-        desc = arcpy.Describe(path)
-        sr = desc.spatialReference
-        if ref_sr is None:
-            ref_sr = sr
-            if sr is None or sr.type != "Projected":
-                msg = ("Tiles in '{}' have a geographic or undefined CRS ('{}'). A projected "
-                       "CRS in meters is required (project CRS EPSG:{}). Reproject the tiles "
-                       "first.").format(folder, sr.name if sr else "Unknown", PROJECT_EPSG)
-                _err(msg)
-                raise ValueError(msg)
-            if not sr.factoryCode:
-                _warn("Tiles in '{}' use a projected CRS without an EPSG/WKID ('{}'). "
-                      "Project CRS is EPSG:{}.".format(folder, sr.name, PROJECT_EPSG))
-            elif int(sr.factoryCode) != PROJECT_EPSG:
-                _warn("Tiles in '{}' are EPSG:{} ('{}'), not the project EPSG:{}. Proceeding.".format(
-                    folder, sr.factoryCode, sr.name, PROJECT_EPSG))
-        elif not _same_crs(ref_sr, sr):
-            msg = ("Tiles in '{}' are not all in the same CRS ({} vs {}). All tiles must "
-                   "share one projected CRS.").format(folder, _crs_label(ref_sr), _crs_label(sr))
-            _err(msg)
-            raise ValueError(msg)
-        footprints.append((path, desc.extent.polygon))
-    return footprints, ref_sr
+    for folder in folders:
+        folder_checked = False
+        for dirpath, _dirnames, filenames in os.walk(folder):
+            for fn in filenames:
+                if not fn.lower().endswith(".tif"):
+                    continue
+                if not fn.upper().startswith(product_prefix.upper()):
+                    continue
+                path = os.path.join(dirpath, fn)
+                if not folder_checked:
+                    folder_checked = True
+                    sr = arcpy.Describe(path).spatialReference
+                    if sr is None or sr.type != "Projected":
+                        msg = ("Tile '{}' has a geographic or undefined CRS ('{}'). A projected "
+                               "CRS in meters is required (project CRS EPSG:{}).").format(
+                                   path, sr.name if sr else "Unknown", PROJECT_EPSG)
+                        _err(msg)
+                        raise ValueError(msg)
+                    if ref_sr is None:
+                        ref_sr = sr
+                        if not sr.factoryCode:
+                            _warn("Tiles use a projected CRS without an EPSG/WKID ('{}'). "
+                                  "Project CRS is EPSG:{}.".format(sr.name, PROJECT_EPSG))
+                        elif int(sr.factoryCode) != PROJECT_EPSG:
+                            _warn("Tiles are EPSG:{} ('{}'), not the project EPSG:{}. Proceeding.".format(
+                                sr.factoryCode, sr.name, PROJECT_EPSG))
+                    elif not _same_crs(ref_sr, sr):
+                        msg = ("Tile '{}' CRS ({}) differs from the others ({}). All tiles of a "
+                               "mina must share one projected CRS.").format(
+                                   path, _crs_label(sr), _crs_label(ref_sr))
+                        _err(msg)
+                        raise ValueError(msg)
+                if fn in seen:
+                    continue
+                seen.add(fn)
+                paths.append(path)
+    return paths, ref_sr
+
+
+def _folder_extent_polygon(folder, sr):
+    """Coverage extent of a download folder as a Polygon in `sr`, read from the
+    folder's .vrt (one cheap XML read). Returns None if the folder has no .vrt.
+
+    Used only as a spatial sanity check that a folder maps to the right mina. `sr` must
+    be the tiles CRS, since the VRT coordinates are in the tiles CRS. The caller projects
+    the AOI geometry into that CRS before comparing.
+    """
+    vrt = None
+    for fn in os.listdir(folder):
+        if fn.lower().endswith(".vrt"):
+            vrt = os.path.join(folder, fn)
+            break
+    if vrt is None:
+        return None
+    with open(vrt, "r", encoding="utf-8") as fh:
+        xmin, ymin, xmax, ymax = _parse_vrt_extent(fh.read())
+    corners = arcpy.Array([arcpy.Point(xmin, ymin), arcpy.Point(xmin, ymax),
+                           arcpy.Point(xmax, ymax), arcpy.Point(xmax, ymin),
+                           arcpy.Point(xmin, ymin)])
+    return arcpy.Polygon(corners, sr)
 
 
 class BuildMosaicsByPolygon(object):
     def __init__(self):
         self.label = "Build Mosaics By Polygon"
-        self.description = ("For each mining polygon, buffer it, select the LiDAR tiles "
-                            "that intersect, and write one mosaic per mina, in batch, for "
-                            "the DEM and/or DSM tile folders.")
+        self.description = ("Build one DEM and one DSM mosaic per mina from the DGT LiDAR "
+                            "download folders. Each folder 02_DGT_LiDAR_Data_<FID> holds the "
+                            "tiles of one AOI; folders are matched to minas by FID and merged "
+                            "per mina. The spatial selection was already done at download time "
+                            "(5 km buffer per AOI), so no buffering or tile intersection is needed.")
         self.category = "Mosaicking"
         self.canRunInBackground = False
 
     def getParameterInfo(self):
-        p_polys = arcpy.Parameter(
-            displayName="Mining polygons", name="in_polygons",
+        p_aoi = arcpy.Parameter(
+            displayName="AOI layer (FID maps to download folder)", name="in_aoi",
             datatype="GPFeatureLayer", parameterType="Required", direction="Input")
-        p_polys.filter.list = ["Polygon"]
+        p_aoi.filter.list = ["Polygon"]
 
         p_field = arcpy.Parameter(
             displayName="Mina name field", name="mina_field",
             datatype="Field", parameterType="Required", direction="Input")
-        p_field.parameterDependencies = [p_polys.name]
+        p_field.parameterDependencies = [p_aoi.name]
         p_field.filter.list = ["Text", "Short", "Long"]
 
-        p_dem = arcpy.Parameter(
-            displayName="DEM tiles folder", name="dem_tiles_folder",
-            datatype="DEFolder", parameterType="Optional", direction="Input")
-
-        p_dsm = arcpy.Parameter(
-            displayName="DSM tiles folder", name="dsm_tiles_folder",
-            datatype="DEFolder", parameterType="Optional", direction="Input")
-
-        p_buffer = arcpy.Parameter(
-            displayName="Buffer distance", name="buffer_distance",
-            datatype="GPLinearUnit", parameterType="Required", direction="Input")
-        p_buffer.value = "5 Kilometers"
+        p_root = arcpy.Parameter(
+            displayName="LiDAR root folder", name="lidar_root",
+            datatype="DEFolder", parameterType="Required", direction="Input")
 
         p_out = arcpy.Parameter(
             displayName="Output folder", name="out_folder",
@@ -450,6 +489,13 @@ class BuildMosaicsByPolygon(object):
         p_struct.filter.type = "ValueList"
         p_struct.filter.list = ["per_mina_subfolder", "flat"]
         p_struct.value = "per_mina_subfolder"
+
+        p_products = arcpy.Parameter(
+            displayName="Products", name="products",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_products.filter.type = "ValueList"
+        p_products.filter.list = ["BOTH", "DEM", "DSM"]
+        p_products.value = "BOTH"
 
         p_pixel = arcpy.Parameter(
             displayName="Pixel type", name="pixel_type",
@@ -471,33 +517,47 @@ class BuildMosaicsByPolygon(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
-        return [p_polys, p_field, p_dem, p_dsm, p_buffer, p_out,
-                p_struct, p_pixel, p_method, p_overwrite]
+        p_skip = arcpy.Parameter(
+            displayName="Skip minas with missing folders", name="skip_incomplete",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_skip.value = True
+
+        p_verify = arcpy.Parameter(
+            displayName="Verify folder extent against AOI polygon", name="verify_extent",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_verify.value = True
+
+        p_prefix = arcpy.Parameter(
+            displayName="Folder name prefix (FID follows)", name="folder_prefix",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_prefix.value = "02_DGT_LiDAR_Data_"
+
+        return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
+                p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix]
 
     def isLicensed(self):
-        # Tool 1 uses core Mosaic To New Raster, no Spatial Analyst needed (spec 4.1).
+        # Uses core Mosaic To New Raster, no Spatial Analyst needed.
         return True
 
     def updateParameters(self, parameters):
         return
 
     def updateMessages(self, parameters):
-        if not parameters[2].valueAsText and not parameters[3].valueAsText:
-            parameters[2].setErrorMessage("Provide at least one tiles folder (DEM or DSM).")
-            parameters[3].setErrorMessage("Provide at least one tiles folder (DEM or DSM).")
         return
 
     def execute(self, parameters, messages):
-        in_polygons = parameters[0].valueAsText
+        in_aoi = parameters[0].valueAsText
         mina_field = parameters[1].valueAsText
-        dem_folder = parameters[2].valueAsText
-        dsm_folder = parameters[3].valueAsText
-        buffer_distance = parameters[4].valueAsText
-        out_folder = parameters[5].valueAsText
-        output_structure = parameters[6].valueAsText
-        pixel_type = parameters[7].valueAsText
-        mosaic_method = parameters[8].valueAsText
-        overwrite_existing = bool(parameters[9].value)
+        lidar_root = parameters[2].valueAsText
+        out_folder = parameters[3].valueAsText
+        output_structure = parameters[4].valueAsText
+        products_param = parameters[5].valueAsText
+        pixel_type = parameters[6].valueAsText
+        mosaic_method = parameters[7].valueAsText
+        overwrite_existing = bool(parameters[8].value)
+        skip_incomplete = bool(parameters[9].value)
+        verify_extent = bool(parameters[10].value)
+        folder_prefix = parameters[11].valueAsText
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -505,83 +565,134 @@ class BuildMosaicsByPolygon(object):
             _warn("pixel_type is {}, but DGT LiDAR is floating point. Non float types "
                   "lose elevation precision.".format(pixel_type))
 
-        buffer_m = linear_unit_to_meters(buffer_distance)
+        products = [("DEM", "MDT"), ("DSM", "MDS")]
+        if products_param == "DEM":
+            products = [("DEM", "MDT")]
+        elif products_param == "DSM":
+            products = [("DSM", "MDS")]
 
-        sources = []
-        if dem_folder:
-            sources.append(("DEM", dem_folder))
-        if dsm_folder:
-            sources.append(("DSM", dsm_folder))
-        if not sources:
-            msg = "Provide at least one tiles folder (DEM or DSM)."
+        aoi_desc = arcpy.Describe(in_aoi)
+        aoi_sr = aoi_desc.spatialReference
+        if aoi_sr is None or aoi_sr.name in (None, "", "Unknown"):
+            msg = "AOI layer has no spatial reference. Define its CRS first."
+            _err(msg)
+            raise ValueError(msg)
+        _msg("AOI layer CRS: {}.".format(_crs_label(aoi_sr)))
+        if aoi_sr.factoryCode and int(aoi_sr.factoryCode) != PROJECT_EPSG:
+            _warn("AOI layer is {}, not the project EPSG:{}. Polygons are projected for the "
+                  "extent check only.".format(_crs_label(aoi_sr), PROJECT_EPSG))
+
+        # The download folder number equals the AOI FID. The folders were named at download
+        # time from the original shapefile FID (0 based), which OID@ returns.
+        oid_field = getattr(aoi_desc, "OIDFieldName", "") or ""
+        if oid_field.upper() != "FID":
+            _warn("AOI OID field is '{}', not 'FID'. Folders were numbered by the original "
+                  "shapefile FID. If this layer is not that shapefile, the folder to mina "
+                  "mapping may be wrong.".format(oid_field))
+
+        # Read fid -> (raw name, geometry).
+        fid_to_mina = {}
+        fid_to_geom = {}
+        with arcpy.da.SearchCursor(in_aoi, ["OID@", "SHAPE@", mina_field]) as cursor:
+            for oid, shape, raw in cursor:
+                fid_to_mina[int(oid)] = raw
+                fid_to_geom[int(oid)] = shape
+
+        if not fid_to_mina:
+            msg = "AOI layer '{}' has no features.".format(in_aoi)
             _err(msg)
             raise ValueError(msg)
 
-        polys_sr = arcpy.Describe(in_polygons).spatialReference
-        if polys_sr is None or polys_sr.name in (None, "", "Unknown"):
-            msg = "Mining polygons have no spatial reference. Define their CRS first."
-            _err(msg)
-            raise ValueError(msg)
+        # One output per mina. Features sharing a Mina value are merged.
+        groups = build_mina_groups([(fid, fid_to_mina[fid]) for fid in fid_to_mina])
 
-        # Read polygons once and resolve sanitized, collision free mina names once,
-        # so the same mina gets the same name across DEM and DSM (spec 3.7).
-        features = []          # list of (final_mina, geometry)
-        used = set()
-        n_collisions = 0
-        with arcpy.da.SearchCursor(in_polygons, ["SHAPE@", mina_field]) as cursor:
-            for shape, raw in cursor:
-                if shape is None:
-                    _warn("A feature has null geometry. Skipping it.")
+        # Map the download folders that are present, by FID.
+        fid_to_folder = {}
+        for entry in os.listdir(lidar_root):
+            full = os.path.join(lidar_root, entry)
+            if not os.path.isdir(full) or not entry.startswith(folder_prefix):
+                continue
+            suffix = entry[len(folder_prefix):]
+            if suffix.isdigit():
+                fid_to_folder[int(suffix)] = full
+
+        total = len(groups)
+        built_minas = 0
+        present_minas = 0
+        created_count = 0
+        skipped_no_data = []
+        skipped_incomplete = []
+        skipped_no_tiles = []
+        skipped_mismatch = []
+
+        arcpy.SetProgressor("step", "Building one mosaic per mina...", 0, total, 1)
+        for final_mina, fids in groups:
+            arcpy.SetProgressorPosition()
+            present = [f for f in fids if f in fid_to_folder]
+            missing = [f for f in fids if f not in fid_to_folder]
+
+            if not present:
+                _warn("Mina '{}': no download folders present yet (FIDs {}). Skipping.".format(
+                    final_mina, fids))
+                skipped_no_data.append(final_mina)
+                continue
+            if missing and skip_incomplete:
+                _warn("Mina '{}': missing folders for FIDs {}. Skipping (incomplete). Re-run "
+                      "when the download finishes.".format(final_mina, missing))
+                skipped_incomplete.append(final_mina)
+                continue
+
+            present_folders = [fid_to_folder[f] for f in present]
+
+            # Gather tiles per product first. This validates the tile CRS (fail loud) and
+            # yields the tile spatial reference used by the extent check and the mosaic.
+            gathered = {}              # source -> (tiles, tile_sr)
+            ref_tile_sr = None
+            for source, prefix in products:
+                tiles, sr = _gather_product_tiles(present_folders, prefix)
+                if tiles:
+                    gathered[source] = (tiles, sr)
+                    if ref_tile_sr is None:
+                        ref_tile_sr = sr
+            if not gathered:
+                _warn("Mina '{}': folders present but no DEM/DSM tiles found. Skipping.".format(final_mina))
+                skipped_no_tiles.append(final_mina)
+                continue
+
+            # Spatial sanity check: each folder's VRT extent must contain its FID's AOI
+            # polygon centroid. Catches a wrong FID to folder mapping (disjoint was too weak,
+            # an adjacent folder still overlaps).
+            if verify_extent:
+                mismatch = False
+                for f in present:
+                    folder_poly = _folder_extent_polygon(fid_to_folder[f], ref_tile_sr)
+                    if folder_poly is None:
+                        _warn("Mina '{}': folder for FID {} has no .vrt, cannot verify extent.".format(
+                            final_mina, f))
+                        continue
+                    geom = fid_to_geom[f]
+                    if geom is None:
+                        continue
+                    geom_t = geom if _same_crs(aoi_sr, ref_tile_sr) else geom.projectAs(ref_tile_sr)
+                    centroid = arcpy.PointGeometry(geom_t.centroid, ref_tile_sr)
+                    if not folder_poly.contains(centroid):
+                        _warn("Mina '{}': folder for FID {} does not contain its AOI polygon "
+                              "centroid. Possible wrong FID mapping. Skipping this mina.".format(
+                                  final_mina, f))
+                        mismatch = True
+                        break
+                if mismatch:
+                    skipped_mismatch.append(final_mina)
                     continue
-                base = sanitize_name(raw)
-                final = dedupe_name(base, used)
-                if final != base:
-                    n_collisions += 1
-                    _warn("Name collision: '{}' already used, using '{}' instead.".format(base, final))
-                used.add(final)
-                features.append((final, shape))
 
-        if not features:
-            msg = "No usable polygons found in '{}'.".format(in_polygons)
-            _err(msg)
-            raise ValueError(msg)
+            if missing:
+                _warn("Mina '{}': building a PARTIAL mosaic, missing FIDs {}. Re-run with "
+                      "overwrite enabled after the download finishes to refresh it.".format(
+                          final_mina, missing))
 
-        total_minas = len(features)
-        no_coverage = []       # list of (mina, source)
-
-        for source, folder in sources:
-            footprints, tile_sr = _build_tile_index(folder)
-            _msg("Source {}: {} tiles, CRS {}.".format(source, len(footprints), _crs_label(tile_sr)))
-
-            # CRS policy: tiles are the reference. If the polygons differ, reproject
-            # the polygon geometries (vector, lossless), never the tiles.
-            need_proj = not _same_crs(polys_sr, tile_sr)
-            transform = None
-            if need_proj:
-                candidates = arcpy.ListTransformations(polys_sr, tile_sr)
-                transform = candidates[0] if candidates else None
-                _warn("Polygons CRS ({}) differs from tiles CRS ({}). Reprojecting "
-                      "polygons{}.".format(
-                          _crs_label(polys_sr), _crs_label(tile_sr),
-                          " using transformation '{}'".format(transform) if transform
-                          else " (no datum transformation applied)"))
-
-            arcpy.SetProgressor("step", "Mosaicking {} tiles per mina...".format(source),
-                                0, total_minas, 1)
-            for final_mina, shape in features:
-                geom = shape.projectAs(tile_sr, transform) if need_proj else shape
-                buffered = geom.buffer(buffer_m)
-                # not disjoint == intersects. Tiles that only touch the buffer edge are
-                # included on purpose (extra edge coverage for downstream surfaces).
-                selected = [path for path, foot in footprints if not buffered.disjoint(foot)]
-                arcpy.SetProgressorPosition()
-
-                if not selected:
-                    _warn("Mina '{}' ({}): no tiles intersect the buffered polygon. "
-                          "Skipping.".format(final_mina, source))
-                    no_coverage.append((final_mina, source))
-                    continue
-
+            created_here = 0
+            existing_here = 0
+            for source, (tiles, sr) in gathered.items():
                 out_name = build_output_name(final_mina, source) + ".tif"
                 location = out_folder
                 if output_structure == "per_mina_subfolder":
@@ -593,30 +704,43 @@ class BuildMosaicsByPolygon(object):
                 if os.path.exists(out_path) and not overwrite_existing:
                     _msg("Mina '{}' ({}): output exists, skipping ({}).".format(
                         final_mina, source, out_name))
+                    existing_here += 1
                     continue
                 if os.path.exists(out_path) and overwrite_existing:
-                    _msg("Mina '{}' ({}): overwriting existing {}.".format(
-                        final_mina, source, out_name))
+                    _msg("Mina '{}' ({}): overwriting existing {}.".format(final_mina, source, out_name))
 
                 arcpy.management.MosaicToNewRaster(
-                    input_rasters=selected,
+                    input_rasters=tiles,
                     output_location=location,
                     raster_dataset_name_with_extension=out_name,
-                    coordinate_system_for_the_raster=tile_sr,
+                    coordinate_system_for_the_raster=sr,
                     pixel_type=pixel_type,
                     number_of_bands=1,
                     mosaic_method=mosaic_method,
                 )
-                _msg("Mina '{}' ({}): mosaicked {} tiles -> {}".format(
-                    final_mina, source, len(selected), out_name))
+                _msg("Mina '{}' ({}): mosaicked {} tiles from {} folder(s) -> {}".format(
+                    final_mina, source, len(tiles), len(present_folders), out_name))
+                created_here += 1
 
-            arcpy.ResetProgressor()
+            created_count += created_here
+            if created_here:
+                built_minas += 1
+            elif existing_here:
+                present_minas += 1
 
-        _msg("Done. Minas: {}. Sources: {}. No coverage cases: {}. Collisions resolved: {}.".format(
-            total_minas, ", ".join(s for s, _ in sources), len(no_coverage), n_collisions))
-        if no_coverage:
-            _warn("No coverage (mina, source): " + "; ".join(
-                "{} {}".format(m, s) for m, s in no_coverage))
+        arcpy.ResetProgressor()
+
+        _msg("Done. Minas: {}. Built now: {}. Already present: {}. Mosaics created: {}. Skipped "
+             "(no data: {}, incomplete: {}, no tiles: {}, extent mismatch: {}).".format(
+                 total, built_minas, present_minas, created_count,
+                 len(skipped_no_data), len(skipped_incomplete),
+                 len(skipped_no_tiles), len(skipped_mismatch)))
+        if skipped_incomplete:
+            _warn("Incomplete, re-run after download finishes: " + ", ".join(skipped_incomplete))
+        if skipped_no_tiles:
+            _warn("Folders present but no tiles found: " + ", ".join(skipped_no_tiles))
+        if skipped_mismatch:
+            _warn("Extent mismatch, check FID mapping: " + ", ".join(skipped_mismatch))
         return
 
 
@@ -701,14 +825,25 @@ def _run_self_tests():
     check("whole number float class_id accepted",
           validate_value_table([(1.0, 0, 10), (2.0, 10, 20)]) is not None)
 
-    print("linear_unit_to_meters")
-    check("kilometers", linear_unit_to_meters("5 Kilometers") == 5000.0)
-    check("meters", linear_unit_to_meters("250 Meters") == 250.0)
-    check("miles", abs(linear_unit_to_meters("1 Miles") - 1609.344) < 1e-6)
-    check("decimal comma tolerated", linear_unit_to_meters("2,5 Kilometers") == 2500.0)
-    check_raises("degrees rejected", lambda: linear_unit_to_meters("5 DecimalDegrees"))
-    check_raises("non numeric value rejected", lambda: linear_unit_to_meters("abc Meters"))
-    check_raises("missing unit rejected", lambda: linear_unit_to_meters("5"))
+    print("build_mina_groups")
+    groups = build_mina_groups([(3, "Cortes Pereira"), (4, "Cortes Pereira"), (0, "Alcaria Queimada")])
+    check("merges same mina across fids",
+          ("Cortes_Pereira", [3, 4]) in groups and ("Alcaria_Queimada", [0]) in groups)
+    check("ordered by smallest fid", groups[0][0] == "Alcaria_Queimada")
+    g2 = build_mina_groups([(0, "São João"), (1, "Sao Joao")])
+    check("different names that collide get deduped",
+          [n for n, _ in g2] == ["Sao_Joao", "Sao_Joao_2"])
+    check("each colliding group keeps its own fid", g2[0][1] == [0] and g2[1][1] == [1])
+
+    print("_parse_vrt_extent")
+    vrt = ('<VRTDataset rasterXSize="100" rasterYSize="50">'
+           '<SRS>EPSG:3763</SRS>'
+           '<GeoTransform>1000.0, 2.0, 0.0, 5000.0, 0.0, -2.0</GeoTransform>'
+           '</VRTDataset>')
+    check("extent from geotransform",
+          _parse_vrt_extent(vrt) == (1000.0, 4900.0, 1200.0, 5000.0))
+    check_raises("vrt without geotransform raises",
+                 lambda: _parse_vrt_extent('<VRTDataset rasterXSize="1" rasterYSize="1"></VRTDataset>'))
 
     print("")
     if failures:
