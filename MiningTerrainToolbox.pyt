@@ -273,6 +273,42 @@ def validate_value_table(rows):
     return ordered
 
 
+_LINEAR_UNITS_TO_M = {
+    "millimeters": 0.001, "millimeter": 0.001,
+    "centimeters": 0.01, "centimeter": 0.01,
+    "decimeters": 0.1, "decimeter": 0.1,
+    "meters": 1.0, "meter": 1.0,
+    "kilometers": 1000.0, "kilometer": 1000.0,
+    "feet": 0.3048, "foot": 0.3048,
+    "yards": 0.9144, "yard": 0.9144,
+    "miles": 1609.344, "mile": 1609.344,
+    "nauticalmiles": 1852.0, "nauticalmile": 1852.0,
+}
+
+
+def linear_unit_to_meters(linear_unit):
+    """Convert an ArcGIS Linear Unit string like "5 Kilometers" to meters.
+
+    The project is metric, so buffers are computed in meters. Fails loud on an
+    unknown or non linear unit (for example DecimalDegrees), since a degree based
+    buffer would be wrong here.
+    """
+    if not linear_unit:
+        raise ValueError("Empty buffer distance.")
+    parts = str(linear_unit).split()
+    if len(parts) != 2:
+        raise ValueError("Buffer distance must be 'value unit', got: {!r}".format(linear_unit))
+    value_str, unit = parts
+    try:
+        value = float(value_str.replace(",", "."))
+    except ValueError:
+        raise ValueError("Buffer distance value is not numeric: {!r}".format(value_str))
+    factor = _LINEAR_UNITS_TO_M.get(unit.lower())
+    if factor is None:
+        raise ValueError("Unsupported buffer unit '{}'. Use a linear unit (meters, kilometers), not degrees.".format(unit))
+    return value * factor
+
+
 # ===========================================================================
 # Toolbox
 # ===========================================================================
@@ -284,21 +320,304 @@ class Toolbox(object):
         # Tools are registered incrementally. Passo 0 ships the shared helpers and
         # the self tests only. Each Tool class is added here as it is built and
         # validated:
-        #   BuildMosaicsByPolygon  (category "Mosaicking")
+        #   BuildMosaicsByPolygon  (category "Mosaicking")       -> implemented
         #   DeriveSurfaces         (category "Surfaces")
         #   ReclassifyFactor       (category "Reclassification")
         # A future fifth tool for solar irradiation (Area Solar Radiation) would be
         # registered here too. Out of scope now, no functional stub.
-        self.tools = []
+        self.tools = [BuildMosaicsByPolygon]
 
 
 # ===========================================================================
-# Tools (added incrementally, one per agreed step)
+# Tools
 # ===========================================================================
+#   BuildMosaicsByPolygon  (Mosaicking)        -> implemented below
+#   DeriveSurfaces         (Surfaces)          -> after Tool 1 is validated
+#   ReclassifyFactor       (Reclassification)  -> after Tool 2 (imports numpy lazily)
+# A future fifth tool for solar irradiation (Area Solar Radiation) would go here.
 
-# BuildMosaicsByPolygon  -> next step
-# DeriveSurfaces         -> after Tool 1 is validated
-# ReclassifyFactor       -> after Tool 2 is validated (imports numpy lazily here)
+
+def _crs_label(sr):
+    """Human readable CRS label for logs. Uses EPSG/WKID when present, else the name."""
+    if sr is None:
+        return "undefined"
+    return "EPSG:{}".format(sr.factoryCode) if sr.factoryCode else "{} (no EPSG/WKID)".format(sr.name)
+
+
+def _same_crs(sr_a, sr_b):
+    """True if two spatial references are the same CRS. Compares EPSG/WKID when both
+    have one, else falls back to the full WKT, so a CRS defined only by WKT
+    (factoryCode 0) is not wrongly treated as equal to a different WKT only CRS.
+    """
+    if sr_a is None or sr_b is None:
+        return sr_a is sr_b
+    if sr_a.factoryCode and sr_b.factoryCode:
+        return sr_a.factoryCode == sr_b.factoryCode
+    return sr_a.exportToString() == sr_b.exportToString()
+
+
+def _build_tile_index(folder):
+    """List .tif tiles in `folder` and return (footprints, tile_sr).
+
+    footprints is a list of (tile_path, extent_polygon). For a regular tile grid
+    the rectangular extent is the exact footprint (spec 4.2). Fails loud if the
+    folder has no rasters, if the tiles are not in a projected CRS (geographic or
+    undefined are invalid for slope and aspect downstream), or if the tiles are not
+    all in the same CRS.
+    """
+    prev_ws = arcpy.env.workspace
+    try:
+        arcpy.env.workspace = folder
+        names = arcpy.ListRasters("*", "TIF") or []
+    finally:
+        arcpy.env.workspace = prev_ws
+
+    if not names:
+        msg = "No .tif tiles found in '{}'.".format(folder)
+        _err(msg)
+        raise ValueError(msg)
+
+    footprints = []
+    ref_sr = None
+    for name in names:
+        path = os.path.join(folder, name)
+        desc = arcpy.Describe(path)
+        sr = desc.spatialReference
+        if ref_sr is None:
+            ref_sr = sr
+            if sr is None or sr.type != "Projected":
+                msg = ("Tiles in '{}' have a geographic or undefined CRS ('{}'). A projected "
+                       "CRS in meters is required (project CRS EPSG:{}). Reproject the tiles "
+                       "first.").format(folder, sr.name if sr else "Unknown", PROJECT_EPSG)
+                _err(msg)
+                raise ValueError(msg)
+            if not sr.factoryCode:
+                _warn("Tiles in '{}' use a projected CRS without an EPSG/WKID ('{}'). "
+                      "Project CRS is EPSG:{}.".format(folder, sr.name, PROJECT_EPSG))
+            elif int(sr.factoryCode) != PROJECT_EPSG:
+                _warn("Tiles in '{}' are EPSG:{} ('{}'), not the project EPSG:{}. Proceeding.".format(
+                    folder, sr.factoryCode, sr.name, PROJECT_EPSG))
+        elif not _same_crs(ref_sr, sr):
+            msg = ("Tiles in '{}' are not all in the same CRS ({} vs {}). All tiles must "
+                   "share one projected CRS.").format(folder, _crs_label(ref_sr), _crs_label(sr))
+            _err(msg)
+            raise ValueError(msg)
+        footprints.append((path, desc.extent.polygon))
+    return footprints, ref_sr
+
+
+class BuildMosaicsByPolygon(object):
+    def __init__(self):
+        self.label = "Build Mosaics By Polygon"
+        self.description = ("For each mining polygon, buffer it, select the LiDAR tiles "
+                            "that intersect, and write one mosaic per mina, in batch, for "
+                            "the DEM and/or DSM tile folders.")
+        self.category = "Mosaicking"
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_polys = arcpy.Parameter(
+            displayName="Mining polygons", name="in_polygons",
+            datatype="GPFeatureLayer", parameterType="Required", direction="Input")
+        p_polys.filter.list = ["Polygon"]
+
+        p_field = arcpy.Parameter(
+            displayName="Mina name field", name="mina_field",
+            datatype="Field", parameterType="Required", direction="Input")
+        p_field.parameterDependencies = [p_polys.name]
+        p_field.filter.list = ["Text", "Short", "Long"]
+
+        p_dem = arcpy.Parameter(
+            displayName="DEM tiles folder", name="dem_tiles_folder",
+            datatype="DEFolder", parameterType="Optional", direction="Input")
+
+        p_dsm = arcpy.Parameter(
+            displayName="DSM tiles folder", name="dsm_tiles_folder",
+            datatype="DEFolder", parameterType="Optional", direction="Input")
+
+        p_buffer = arcpy.Parameter(
+            displayName="Buffer distance", name="buffer_distance",
+            datatype="GPLinearUnit", parameterType="Required", direction="Input")
+        p_buffer.value = "5 Kilometers"
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder", name="out_folder",
+            datatype="DEFolder", parameterType="Required", direction="Output")
+
+        p_struct = arcpy.Parameter(
+            displayName="Output structure", name="output_structure",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_struct.filter.type = "ValueList"
+        p_struct.filter.list = ["per_mina_subfolder", "flat"]
+        p_struct.value = "per_mina_subfolder"
+
+        p_pixel = arcpy.Parameter(
+            displayName="Pixel type", name="pixel_type",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_pixel.filter.type = "ValueList"
+        p_pixel.filter.list = ["8_BIT_UNSIGNED", "16_BIT_SIGNED", "16_BIT_UNSIGNED",
+                               "32_BIT_SIGNED", "32_BIT_UNSIGNED", "32_BIT_FLOAT", "64_BIT"]
+        p_pixel.value = "32_BIT_FLOAT"
+
+        p_method = arcpy.Parameter(
+            displayName="Mosaic method (overlaps)", name="mosaic_method",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_method.filter.type = "ValueList"
+        p_method.filter.list = ["FIRST", "LAST", "BLEND", "MEAN", "MINIMUM", "MAXIMUM"]
+        p_method.value = "FIRST"
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_polys, p_field, p_dem, p_dsm, p_buffer, p_out,
+                p_struct, p_pixel, p_method, p_overwrite]
+
+    def isLicensed(self):
+        # Tool 1 uses core Mosaic To New Raster, no Spatial Analyst needed (spec 4.1).
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        if not parameters[2].valueAsText and not parameters[3].valueAsText:
+            parameters[2].setErrorMessage("Provide at least one tiles folder (DEM or DSM).")
+            parameters[3].setErrorMessage("Provide at least one tiles folder (DEM or DSM).")
+        return
+
+    def execute(self, parameters, messages):
+        in_polygons = parameters[0].valueAsText
+        mina_field = parameters[1].valueAsText
+        dem_folder = parameters[2].valueAsText
+        dsm_folder = parameters[3].valueAsText
+        buffer_distance = parameters[4].valueAsText
+        out_folder = parameters[5].valueAsText
+        output_structure = parameters[6].valueAsText
+        pixel_type = parameters[7].valueAsText
+        mosaic_method = parameters[8].valueAsText
+        overwrite_existing = bool(parameters[9].value)
+
+        arcpy.env.overwriteOutput = overwrite_existing
+
+        if pixel_type != "32_BIT_FLOAT":
+            _warn("pixel_type is {}, but DGT LiDAR is floating point. Non float types "
+                  "lose elevation precision.".format(pixel_type))
+
+        buffer_m = linear_unit_to_meters(buffer_distance)
+
+        sources = []
+        if dem_folder:
+            sources.append(("DEM", dem_folder))
+        if dsm_folder:
+            sources.append(("DSM", dsm_folder))
+        if not sources:
+            msg = "Provide at least one tiles folder (DEM or DSM)."
+            _err(msg)
+            raise ValueError(msg)
+
+        polys_sr = arcpy.Describe(in_polygons).spatialReference
+        if polys_sr is None or polys_sr.name in (None, "", "Unknown"):
+            msg = "Mining polygons have no spatial reference. Define their CRS first."
+            _err(msg)
+            raise ValueError(msg)
+
+        # Read polygons once and resolve sanitized, collision free mina names once,
+        # so the same mina gets the same name across DEM and DSM (spec 3.7).
+        features = []          # list of (final_mina, geometry)
+        used = set()
+        n_collisions = 0
+        with arcpy.da.SearchCursor(in_polygons, ["SHAPE@", mina_field]) as cursor:
+            for shape, raw in cursor:
+                if shape is None:
+                    _warn("A feature has null geometry. Skipping it.")
+                    continue
+                base = sanitize_name(raw)
+                final = dedupe_name(base, used)
+                if final != base:
+                    n_collisions += 1
+                    _warn("Name collision: '{}' already used, using '{}' instead.".format(base, final))
+                used.add(final)
+                features.append((final, shape))
+
+        if not features:
+            msg = "No usable polygons found in '{}'.".format(in_polygons)
+            _err(msg)
+            raise ValueError(msg)
+
+        total_minas = len(features)
+        no_coverage = []       # list of (mina, source)
+
+        for source, folder in sources:
+            footprints, tile_sr = _build_tile_index(folder)
+            _msg("Source {}: {} tiles, CRS {}.".format(source, len(footprints), _crs_label(tile_sr)))
+
+            # CRS policy: tiles are the reference. If the polygons differ, reproject
+            # the polygon geometries (vector, lossless), never the tiles.
+            need_proj = not _same_crs(polys_sr, tile_sr)
+            transform = None
+            if need_proj:
+                candidates = arcpy.ListTransformations(polys_sr, tile_sr)
+                transform = candidates[0] if candidates else None
+                _warn("Polygons CRS ({}) differs from tiles CRS ({}). Reprojecting "
+                      "polygons{}.".format(
+                          _crs_label(polys_sr), _crs_label(tile_sr),
+                          " using transformation '{}'".format(transform) if transform
+                          else " (no datum transformation applied)"))
+
+            arcpy.SetProgressor("step", "Mosaicking {} tiles per mina...".format(source),
+                                0, total_minas, 1)
+            for final_mina, shape in features:
+                geom = shape.projectAs(tile_sr, transform) if need_proj else shape
+                buffered = geom.buffer(buffer_m)
+                # not disjoint == intersects. Tiles that only touch the buffer edge are
+                # included on purpose (extra edge coverage for downstream surfaces).
+                selected = [path for path, foot in footprints if not buffered.disjoint(foot)]
+                arcpy.SetProgressorPosition()
+
+                if not selected:
+                    _warn("Mina '{}' ({}): no tiles intersect the buffered polygon. "
+                          "Skipping.".format(final_mina, source))
+                    no_coverage.append((final_mina, source))
+                    continue
+
+                out_name = build_output_name(final_mina, source) + ".tif"
+                location = out_folder
+                if output_structure == "per_mina_subfolder":
+                    location = os.path.join(out_folder, final_mina)
+                if not os.path.isdir(location):
+                    os.makedirs(location)
+                out_path = os.path.join(location, out_name)
+
+                if os.path.exists(out_path) and not overwrite_existing:
+                    _msg("Mina '{}' ({}): output exists, skipping ({}).".format(
+                        final_mina, source, out_name))
+                    continue
+                if os.path.exists(out_path) and overwrite_existing:
+                    _msg("Mina '{}' ({}): overwriting existing {}.".format(
+                        final_mina, source, out_name))
+
+                arcpy.management.MosaicToNewRaster(
+                    input_rasters=selected,
+                    output_location=location,
+                    raster_dataset_name_with_extension=out_name,
+                    coordinate_system_for_the_raster=tile_sr,
+                    pixel_type=pixel_type,
+                    number_of_bands=1,
+                    mosaic_method=mosaic_method,
+                )
+                _msg("Mina '{}' ({}): mosaicked {} tiles -> {}".format(
+                    final_mina, source, len(selected), out_name))
+
+            arcpy.ResetProgressor()
+
+        _msg("Done. Minas: {}. Sources: {}. No coverage cases: {}. Collisions resolved: {}.".format(
+            total_minas, ", ".join(s for s, _ in sources), len(no_coverage), n_collisions))
+        if no_coverage:
+            _warn("No coverage (mina, source): " + "; ".join(
+                "{} {}".format(m, s) for m, s in no_coverage))
+        return
 
 
 # ===========================================================================
@@ -381,6 +700,15 @@ def _run_self_tests():
     check_raises("bool class_id raises", lambda: validate_value_table([(True, 0, 10)]))
     check("whole number float class_id accepted",
           validate_value_table([(1.0, 0, 10), (2.0, 10, 20)]) is not None)
+
+    print("linear_unit_to_meters")
+    check("kilometers", linear_unit_to_meters("5 Kilometers") == 5000.0)
+    check("meters", linear_unit_to_meters("250 Meters") == 250.0)
+    check("miles", abs(linear_unit_to_meters("1 Miles") - 1609.344) < 1e-6)
+    check("decimal comma tolerated", linear_unit_to_meters("2,5 Kilometers") == 2500.0)
+    check_raises("degrees rejected", lambda: linear_unit_to_meters("5 DecimalDegrees"))
+    check_raises("non numeric value rejected", lambda: linear_unit_to_meters("abc Meters"))
+    check_raises("missing unit rejected", lambda: linear_unit_to_meters("5"))
 
     print("")
     if failures:
