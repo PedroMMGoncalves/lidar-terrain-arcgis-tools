@@ -363,18 +363,18 @@ class Toolbox(object):
         self.alias = "MiningTerrain"
         # Tools are registered incrementally as each is built and validated:
         #   BuildMosaicsByPolygon  (category "Mosaicking")        -> implemented
-        #   DeriveSurfaces         (category "Surfaces")
+        #   DeriveSurfaces         (category "Surfaces")           -> implemented
         #   ReclassifyFactor       (category "Reclassification")
         # A future fifth tool for solar irradiation (Area Solar Radiation) would be
         # registered here too. Out of scope now, no functional stub.
-        self.tools = [BuildMosaicsByPolygon]
+        self.tools = [BuildMosaicsByPolygon, DeriveSurfaces]
 
 
 # ===========================================================================
 # Tools
 # ===========================================================================
 #   BuildMosaicsByPolygon  (Mosaicking)        -> implemented below
-#   DeriveSurfaces         (Surfaces)          -> after Tool 1 is validated
+#   DeriveSurfaces         (Surfaces)          -> implemented below
 #   ReclassifyFactor       (Reclassification)  -> after Tool 2 (imports numpy lazily)
 # A future fifth tool for solar irradiation (Area Solar Radiation) would go here.
 
@@ -804,6 +804,279 @@ class BuildMosaicsByPolygon(object):
             _warn("Folders present but no tiles found: " + ", ".join(skipped_no_tiles))
         if skipped_mismatch:
             _warn("Extent mismatch, check FID mapping: " + ", ".join(skipped_mismatch))
+        return
+
+
+def _assert_projected_raster(path):
+    """Return the raster spatial reference, failing loud if it is geographic or undefined.
+    Slope and aspect in degrees on a geographic CRS are invalid (spec 3.2). Warns if the
+    CRS is projected but not the project EPSG.
+    """
+    sr = arcpy.Describe(path).spatialReference
+    if sr is None or sr.type != "Projected":
+        msg = ("Mosaic '{}' has a geographic or undefined CRS ('{}'). A projected CRS in "
+               "meters is required for slope and aspect (project CRS EPSG:{}).").format(
+                   path, sr.name if sr else "Unknown", PROJECT_EPSG)
+        _err(msg)
+        raise ValueError(msg)
+    if sr.factoryCode and int(sr.factoryCode) != PROJECT_EPSG:
+        _warn("Mosaic '{}' is {}, not the project EPSG:{}. Proceeding.".format(
+            path, _crs_label(sr), PROJECT_EPSG))
+    return sr
+
+
+class DeriveSurfaces(object):
+    def __init__(self):
+        self.label = "Derive Surfaces"
+        self.description = ("Derive topographic surfaces (slope, aspect, hillshade, profile "
+                            "and plan curvature) in batch from the per mina DEM and DSM mosaics "
+                            "produced by Build Mosaics By Polygon. Each surface has its own "
+                            "checkbox. Only slope and aspect feed the reclassification tool.")
+        self.category = "Surfaces"
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Input mosaics folder", name="in_mosaics_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder", name="out_folder",
+            datatype="DEFolder", parameterType="Required", direction="Output")
+
+        p_struct = arcpy.Parameter(
+            displayName="Output structure", name="output_structure",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_struct.filter.type = "ValueList"
+        p_struct.filter.list = ["per_mina_subfolder", "flat"]
+        p_struct.value = "per_mina_subfolder"
+
+        p_source = arcpy.Parameter(
+            displayName="Source", name="source_filter",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_source.filter.type = "ValueList"
+        p_source.filter.list = ["BOTH", "DEM", "DSM"]
+        p_source.value = "BOTH"
+
+        p_slope = arcpy.Parameter(
+            displayName="Slope (degrees)", name="do_slope",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_slope.value = True
+
+        p_aspect = arcpy.Parameter(
+            displayName="Aspect", name="do_aspect",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_aspect.value = True
+
+        p_hill = arcpy.Parameter(
+            displayName="Hillshade", name="do_hillshade",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_hill.value = True
+
+        p_profc = arcpy.Parameter(
+            displayName="Profile curvature", name="do_profile_curvature",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_profc.value = True
+
+        p_planc = arcpy.Parameter(
+            displayName="Plan curvature", name="do_plan_curvature",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_planc.value = True
+
+        p_z = arcpy.Parameter(
+            displayName="Z factor", name="z_factor",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_z.value = 1
+
+        p_htype = arcpy.Parameter(
+            displayName="Hillshade type", name="hillshade_type",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_htype.filter.type = "ValueList"
+        p_htype.filter.list = ["Multidirectional", "Traditional"]
+        p_htype.value = "Multidirectional"
+
+        p_az = arcpy.Parameter(
+            displayName="Hillshade azimuth (Traditional)", name="hillshade_azimuth",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_az.value = 315
+
+        p_alt = arcpy.Parameter(
+            displayName="Hillshade altitude (Traditional)", name="hillshade_altitude",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_alt.value = 45
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_in, p_recurse, p_out, p_struct, p_source, p_slope, p_aspect, p_hill,
+                p_profc, p_planc, p_z, p_htype, p_az, p_alt, p_overwrite]
+
+    def isLicensed(self):
+        # Needs Spatial Analyst (slope/aspect/curvature/traditional hillshade). Image Analyst
+        # is checked out at run time only for multidirectional hillshade.
+        try:
+            return arcpy.CheckExtension("Spatial") == "Available"
+        except Exception:
+            return False
+
+    def updateParameters(self, parameters):
+        # Azimuth/altitude only matter for a Traditional hillshade.
+        traditional = bool(parameters[7].value) and parameters[11].valueAsText == "Traditional"
+        parameters[12].enabled = traditional
+        parameters[13].enabled = traditional
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        out_folder = parameters[2].valueAsText
+        output_structure = parameters[3].valueAsText
+        source_filter = parameters[4].valueAsText
+        do_slope = bool(parameters[5].value)
+        do_aspect = bool(parameters[6].value)
+        do_hillshade = bool(parameters[7].value)
+        do_profc = bool(parameters[8].value)
+        do_planc = bool(parameters[9].value)
+        z_factor = float(parameters[10].value)
+        hillshade_type = parameters[11].valueAsText
+        azimuth = float(parameters[12].value) if parameters[12].value is not None else 315.0
+        altitude = float(parameters[13].value) if parameters[13].value is not None else 45.0
+        overwrite_existing = bool(parameters[14].value)
+
+        arcpy.env.overwriteOutput = overwrite_existing
+        multidirectional = do_hillshade and hillshade_type == "Multidirectional"
+
+        wanted = []
+        if do_slope:
+            wanted.append("SLOPE")
+        if do_aspect:
+            wanted.append("ASPECT")
+        if do_hillshade:
+            wanted.append("HILLSHADE")
+        if do_profc:
+            wanted.append("PROFC")
+        if do_planc:
+            wanted.append("PLANC")
+        if not wanted:
+            _warn("No surfaces selected. Nothing to do.")
+            return
+
+        # Spatial Analyst is required. Image Analyst only for the multidirectional hillshade.
+        if arcpy.CheckExtension("Spatial") != "Available":
+            msg = "Spatial Analyst extension is not available. It is required for this tool."
+            _err(msg)
+            raise RuntimeError(msg)
+        arcpy.CheckOutExtension("Spatial")
+        ia_checked_out = False
+        try:
+            if multidirectional:
+                if arcpy.CheckExtension("ImageAnalyst") != "Available":
+                    msg = ("Multidirectional hillshade needs the Image Analyst extension, which is "
+                           "not available. Choose Traditional, or turn hillshade off.")
+                    _err(msg)
+                    raise RuntimeError(msg)
+                arcpy.CheckOutExtension("ImageAnalyst")
+                ia_checked_out = True
+
+            allowed_sources = SOURCES if source_filter == "BOTH" else (source_filter,)
+
+            # Discover base mosaics (source set, product None) matching the source filter.
+            mosaics = []
+            if recurse:
+                walker = os.walk(in_folder)
+            else:
+                only_files = [n for n in os.listdir(in_folder)
+                              if os.path.isfile(os.path.join(in_folder, n))]
+                walker = [(in_folder, [], only_files)]
+            for dirpath, _dirs, files in walker:
+                for fn in files:
+                    if not fn.lower().endswith(".tif"):
+                        continue
+                    info = parse_source_and_product(fn)
+                    if info["source"] is None or info["product"] is not None or info["mina"] is None:
+                        continue                          # not a base mosaic, skip
+                    if info["source"] not in allowed_sources:
+                        continue
+                    mosaics.append((os.path.join(dirpath, fn), info["mina"], info["source"]))
+
+            if not mosaics:
+                msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), in_folder)
+                _err(msg)
+                raise ValueError(msg)
+
+            total = len(mosaics)
+            created = 0
+            arcpy.SetProgressor("step", "Deriving surfaces...", 0, total, 1)
+            for path, mina, source in mosaics:
+                arcpy.SetProgressorPosition()
+                _assert_projected_raster(path)
+
+                location = out_folder
+                if output_structure == "per_mina_subfolder":
+                    location = os.path.join(out_folder, mina)
+                if not os.path.isdir(location):
+                    os.makedirs(location)
+
+                # Resolve which selected surfaces still need writing (idempotency).
+                targets = {}
+                todo = {}
+                for product in wanted:
+                    target = os.path.join(location, build_output_name(mina, source, product) + ".tif")
+                    targets[product] = target
+                    if os.path.exists(target) and not overwrite_existing:
+                        _msg("{} ({}): {} exists, skipping.".format(mina, source, os.path.basename(target)))
+                        todo[product] = False
+                    else:
+                        todo[product] = True
+
+                if todo.get("SLOPE"):
+                    arcpy.sa.Slope(path, "DEGREE", z_factor).save(targets["SLOPE"])
+                    created += 1
+                if todo.get("ASPECT"):
+                    # Aspect takes no z_factor (it is direction only); z_factor applies to
+                    # slope, hillshade and curvature.
+                    arcpy.sa.Aspect(path).save(targets["ASPECT"])
+                    created += 1
+                if todo.get("HILLSHADE"):
+                    if multidirectional:
+                        # arcpy.ia.Hillshade hillshade_type is an integer: 1 = multidirectional,
+                        # 0 = single direction. The UI string is mapped to this integer here.
+                        arcpy.ia.Hillshade(path, hillshade_type=1,
+                                           z_factor=z_factor).save(targets["HILLSHADE"])
+                    else:
+                        arcpy.sa.Hillshade(path, azimuth, altitude, "SHADOWS", z_factor).save(
+                            targets["HILLSHADE"])
+                    created += 1
+
+                # Profile and plan curvature share one Curvature call; pass only the wanted outputs.
+                want_profc = todo.get("PROFC", False)
+                want_planc = todo.get("PLANC", False)
+                if want_profc or want_planc:
+                    # "#" skips an unwanted optional output. The returned standard curvature
+                    # is intentionally discarded; only profile and plan are kept.
+                    arcpy.sa.Curvature(path, z_factor,
+                                       targets["PROFC"] if want_profc else "#",
+                                       targets["PLANC"] if want_planc else "#")
+                    created += (1 if want_profc else 0) + (1 if want_planc else 0)
+
+                _msg("{} ({}): surfaces done.".format(mina, source))
+
+            arcpy.ResetProgressor()
+            _msg("Done. Mosaics processed: {}. Surfaces created: {}.".format(total, created))
+        finally:
+            arcpy.CheckInExtension("Spatial")
+            if ia_checked_out:
+                arcpy.CheckInExtension("ImageAnalyst")
         return
 
 
