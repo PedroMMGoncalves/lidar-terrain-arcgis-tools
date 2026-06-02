@@ -331,6 +331,28 @@ def _parse_vrt_extent(xml_text):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def detect_folder_prefix(names):
+    """Infer the common folder name prefix that precedes the trailing FID integer.
+
+    `names` is the list of data folder names (those that hold tiles). For each name that
+    ends in digits, the prefix is the part before those digits. Returns the single common
+    prefix. Raises ValueError if no name ends in digits, or if the names imply more than
+    one prefix (ambiguous), so the caller can ask for an explicit prefix instead.
+    """
+    prefixes = set()
+    for name in names:
+        m = re.search(r"\d+$", name)
+        if m:
+            prefixes.add(name[:m.start()])
+    if not prefixes:
+        raise ValueError("Cannot auto-detect a folder prefix: no data folder name ends in a "
+                         "number. Set the folder prefix explicitly.")
+    if len(prefixes) > 1:
+        raise ValueError("Cannot auto-detect a folder prefix: found more than one ({}). Set "
+                         "the folder prefix explicitly.".format(sorted(prefixes)))
+    return next(iter(prefixes))
+
+
 # ===========================================================================
 # Toolbox
 # ===========================================================================
@@ -374,6 +396,21 @@ def _same_crs(sr_a, sr_b):
     if sr_a.factoryCode and sr_b.factoryCode:
         return sr_a.factoryCode == sr_b.factoryCode
     return sr_a.exportToString() == sr_b.exportToString()
+
+
+def _is_data_folder(folder):
+    """True if `folder` directly contains a tile or tile subfolder for either product, i.e.
+    an immediate entry whose name starts with MDT or MDS (case insensitive). Cheap shallow
+    check used to tell real LiDAR folders from base data or scratch folders.
+    """
+    try:
+        for entry in os.listdir(folder):
+            upper = entry.upper()
+            if upper.startswith("MDT") or upper.startswith("MDS"):
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def _gather_product_tiles(folders, product_prefix):
@@ -528,9 +565,8 @@ class BuildMosaicsByPolygon(object):
         p_verify.value = True
 
         p_prefix = arcpy.Parameter(
-            displayName="Folder name prefix (FID follows)", name="folder_prefix",
-            datatype="GPString", parameterType="Required", direction="Input")
-        p_prefix.value = "02_DGT_LiDAR_Data_"
+            displayName="Folder name prefix (optional, blank to auto-detect)", name="folder_prefix",
+            datatype="GPString", parameterType="Optional", direction="Input")
 
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
                 p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix]
@@ -606,15 +642,42 @@ class BuildMosaicsByPolygon(object):
         # One output per mina. Features sharing a Mina value are merged.
         groups = build_mina_groups([(fid, fid_to_mina[fid]) for fid in fid_to_mina])
 
-        # Map the download folders that are present, by FID.
-        fid_to_folder = {}
-        for entry in os.listdir(lidar_root):
+        # Find data folders (immediate subdirs that hold MDT/MDS tiles), resolve the name
+        # prefix (explicit parameter, or auto-detected from those folder names), and map each
+        # folder to its FID (the trailing integer). Fail loud on an ambiguous mapping.
+        data_folders = []
+        for entry in sorted(os.listdir(lidar_root)):
             full = os.path.join(lidar_root, entry)
-            if not os.path.isdir(full) or not entry.startswith(folder_prefix):
+            if os.path.isdir(full) and _is_data_folder(full):
+                data_folders.append((entry, full))
+        if not data_folders:
+            msg = "No LiDAR data folders (with MDT/MDS tiles) found under '{}'.".format(lidar_root)
+            _err(msg)
+            raise ValueError(msg)
+
+        if folder_prefix:
+            prefix = folder_prefix
+        else:
+            prefix = detect_folder_prefix([name for name, _ in data_folders])
+            _msg("Auto-detected folder prefix: '{}'.".format(prefix))
+
+        fid_to_folder = {}
+        for name, full in data_folders:
+            if not name.startswith(prefix):
+                _warn("Data folder '{}' does not match prefix '{}'. Skipping it.".format(name, prefix))
                 continue
-            suffix = entry[len(folder_prefix):]
-            if suffix.isdigit():
-                fid_to_folder[int(suffix)] = full
+            suffix = name[len(prefix):]
+            if not suffix.isdigit():
+                _warn("Data folder '{}' has no FID number after the prefix. Skipping it.".format(name))
+                continue
+            fid = int(suffix)
+            if fid in fid_to_folder:
+                msg = ("Two data folders map to FID {}: '{}' and '{}'. Ambiguous mapping; set "
+                       "an explicit folder prefix.").format(
+                           fid, os.path.basename(fid_to_folder[fid]), name)
+                _err(msg)
+                raise ValueError(msg)
+            fid_to_folder[fid] = full
 
         total = len(groups)
         built_minas = 0
@@ -844,6 +907,17 @@ def _run_self_tests():
           _parse_vrt_extent(vrt) == (1000.0, 4900.0, 1200.0, 5000.0))
     check_raises("vrt without geotransform raises",
                  lambda: _parse_vrt_extent('<VRTDataset rasterXSize="1" rasterYSize="1"></VRTDataset>'))
+
+    print("detect_folder_prefix")
+    check("common prefix detected",
+          detect_folder_prefix(["02_DGT_LiDAR_Data_0", "02_DGT_LiDAR_Data_1",
+                                 "02_DGT_LiDAR_Data_21"]) == "02_DGT_LiDAR_Data_")
+    check("padding does not change prefix",
+          detect_folder_prefix(["X_007", "X_7"]) == "X_")
+    check_raises("inconsistent prefixes raise",
+                 lambda: detect_folder_prefix(["a_7", "b_8"]))
+    check_raises("no trailing number raises",
+                 lambda: detect_folder_prefix(["nodigits", "also_none"]))
 
     print("")
     if failures:
