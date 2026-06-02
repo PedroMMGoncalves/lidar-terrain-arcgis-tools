@@ -565,7 +565,7 @@ class BuildMosaicsByPolygon(object):
         p_verify.value = True
 
         p_prefix = arcpy.Parameter(
-            displayName="Folder name prefix (optional, blank to auto-detect)", name="folder_prefix",
+            displayName="Folder name prefix (leave blank to find the data automatically)", name="folder_prefix",
             datatype="GPString", parameterType="Optional", direction="Input")
 
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
