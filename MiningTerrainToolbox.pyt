@@ -45,6 +45,7 @@ SOURCES = ("DEM", "DSM")
 PRODUCTS = ("SLOPE", "ASPECT", "HILLSHADE", "PROFC", "PLANC")
 RECLASS_SUFFIX = "RCL"
 MAX_NAME_LEN = 40                                    # margin for suffixes like _DEM_ASPECT_RCL
+RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
 
 
 # ===========================================================================
@@ -353,6 +354,34 @@ def detect_folder_prefix(names):
     return next(iter(prefixes))
 
 
+def reclassify_array(arr, classes, nodata_out, flat_value=None, flat_class=None):
+    """Apply [min, max) class intervals to a numpy float array, returning an int32 array.
+
+    classes is the sorted list of (class_id, lo, hi) returned by validate_value_table. The
+    class with the largest hi is inclusive at the top ([lo, hi]); all others are [lo, hi).
+    A class_id may repeat across rows (the Aspect North split) and works naturally. Cells in
+    no class, and NaN cells (input NoData), become nodata_out. If flat_value is not None,
+    cells equal to it map to flat_class (the Aspect Flat = -1 case); this override runs after
+    the class masks, so flat_value wins over any class interval that happens to contain it.
+    nodata_out is reserved end to end (the caller guards class ids and the flat class against it).
+    """
+    import numpy as np
+    out = np.full(arr.shape, nodata_out, dtype=np.int32)
+    if classes:
+        global_max = max(hi for _, _, hi in classes)
+        with np.errstate(invalid="ignore"):           # NaN comparisons stay False, so NoData
+            for class_id, lo, hi in classes:
+                if hi == global_max:
+                    mask = (arr >= lo) & (arr <= hi)   # last class inclusive at the top
+                else:
+                    mask = (arr >= lo) & (arr < hi)
+                out[mask] = class_id
+    if flat_value is not None and flat_class is not None:
+        with np.errstate(invalid="ignore"):
+            out[arr == flat_value] = flat_class
+    return out
+
+
 # ===========================================================================
 # Toolbox
 # ===========================================================================
@@ -364,10 +393,10 @@ class Toolbox(object):
         # Tools are registered incrementally as each is built and validated:
         #   BuildMosaicsByPolygon  (category "Mosaicking")        -> implemented
         #   DeriveSurfaces         (category "Surfaces")           -> implemented
-        #   ReclassifyFactor       (category "Reclassification")
+        #   ReclassifyFactor       (category "Reclassification")   -> implemented
         # A future fifth tool for solar irradiation (Area Solar Radiation) would be
         # registered here too. Out of scope now, no functional stub.
-        self.tools = [BuildMosaicsByPolygon, DeriveSurfaces]
+        self.tools = [BuildMosaicsByPolygon, DeriveSurfaces, ReclassifyFactor]
 
 
 # ===========================================================================
@@ -375,7 +404,7 @@ class Toolbox(object):
 # ===========================================================================
 #   BuildMosaicsByPolygon  (Mosaicking)        -> implemented below
 #   DeriveSurfaces         (Surfaces)          -> implemented below
-#   ReclassifyFactor       (Reclassification)  -> after Tool 2 (imports numpy lazily)
+#   ReclassifyFactor       (Reclassification)  -> implemented below (imports numpy lazily)
 # A future fifth tool for solar irradiation (Area Solar Radiation) would go here.
 
 
@@ -1080,8 +1109,258 @@ class DeriveSurfaces(object):
         return
 
 
+class ReclassifyFactor(object):
+    def __init__(self):
+        self.label = "Reclassify Factor"
+        self.description = ("Reclassify Slope and Aspect factor rasters into ordinal integer "
+                            "classes defined in a value table, in batch, with [min, max) "
+                            "semantics (the last class inclusive at the top). Uses numpy for "
+                            "deterministic boundaries. Curvature and hillshade are not "
+                            "reclassified.")
+        self.category = "Reclassification"
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Input factor rasters folder", name="in_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_factor = arcpy.Parameter(
+            displayName="Factor to process", name="factor_to_process",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_factor.filter.type = "ValueList"
+        p_factor.filter.list = ["BOTH", "SLOPE", "ASPECT"]
+        p_factor.value = "BOTH"
+
+        p_slope = arcpy.Parameter(
+            displayName="Slope classes (class_id, min, max)", name="slope_classes",
+            datatype="GPValueTable", parameterType="Optional", direction="Input")
+        p_slope.columns = [["GPLong", "class_id"], ["GPDouble", "min_value"], ["GPDouble", "max_value"]]
+
+        p_aspect = arcpy.Parameter(
+            displayName="Aspect classes (class_id, min, max)", name="aspect_classes",
+            datatype="GPValueTable", parameterType="Optional", direction="Input")
+        p_aspect.columns = [["GPLong", "class_id"], ["GPDouble", "min_value"], ["GPDouble", "max_value"]]
+
+        p_flat = arcpy.Parameter(
+            displayName="Flat class value (Aspect -1)", name="flat_class_value",
+            datatype="GPLong", parameterType="Optional", direction="Input")
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder", name="out_folder",
+            datatype="DEFolder", parameterType="Required", direction="Output")
+
+        p_struct = arcpy.Parameter(
+            displayName="Output structure", name="output_structure",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_struct.filter.type = "ValueList"
+        p_struct.filter.list = ["per_mina_subfolder", "flat"]
+        p_struct.value = "per_mina_subfolder"
+
+        p_nodata = arcpy.Parameter(
+            displayName="Unmapped values to NoData", name="nodata_for_unmapped",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_nodata.value = True
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_in, p_recurse, p_factor, p_slope, p_aspect, p_flat, p_out,
+                p_struct, p_nodata, p_overwrite]
+
+    def isLicensed(self):
+        # Pure numpy reclassification (RasterToNumPyArray / NumPyArrayToRaster). No extension.
+        return True
+
+    def updateParameters(self, parameters):
+        factor = parameters[2].valueAsText
+        inc_slope = factor in ("SLOPE", "BOTH")
+        inc_aspect = factor in ("ASPECT", "BOTH")
+        parameters[3].enabled = inc_slope
+        parameters[4].enabled = inc_aspect
+        parameters[5].enabled = inc_aspect
+        return
+
+    def updateMessages(self, parameters):
+        # Validate the class tables early, so gaps/overlaps surface in the dialog.
+        factor = parameters[2].valueAsText
+        to_check = []
+        if factor in ("SLOPE", "BOTH") and parameters[3].value:
+            to_check.append((3, parameters[3].value))
+        if factor in ("ASPECT", "BOTH") and parameters[4].value:
+            to_check.append((4, parameters[4].value))
+        for idx, table in to_check:
+            try:
+                validate_value_table(table)
+            except Exception as exc:
+                parameters[idx].setErrorMessage(str(exc))
+        return
+
+    def execute(self, parameters, messages):
+        import numpy as np
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        factor = parameters[2].valueAsText
+        slope_vt = parameters[3].value
+        aspect_vt = parameters[4].value
+        flat_param = parameters[5].value
+        out_folder = parameters[6].valueAsText
+        output_structure = parameters[7].valueAsText
+        nodata_for_unmapped = bool(parameters[8].value)
+        overwrite_existing = bool(parameters[9].value)
+
+        arcpy.env.overwriteOutput = overwrite_existing
+
+        inc_slope = factor in ("SLOPE", "BOTH")
+        inc_aspect = factor in ("ASPECT", "BOTH")
+
+        # Validate the class tables BEFORE any write (fail loud).
+        slope_classes = None
+        aspect_classes = None
+        if inc_slope:
+            if not slope_vt:
+                msg = "Slope classes table is required when processing SLOPE."
+                _err(msg)
+                raise ValueError(msg)
+            slope_classes = validate_value_table(slope_vt)
+        if inc_aspect:
+            if not aspect_vt:
+                msg = "Aspect classes table is required when processing ASPECT."
+                _err(msg)
+                raise ValueError(msg)
+            aspect_classes = validate_value_table(aspect_vt)
+
+        flat_class = int(flat_param) if flat_param is not None else None
+        if flat_class is not None and not inc_aspect:
+            _warn("flat_class_value is set but ASPECT is not being processed; the flat class "
+                  "applies only to Aspect and will be ignored.")
+
+        # The NoData sentinel must not collide with a real class id, or the flat class when used.
+        used_ids = [cid for cid, _, _ in (slope_classes or [])]
+        used_ids += [cid for cid, _, _ in (aspect_classes or [])]
+        if flat_class is not None and inc_aspect:
+            used_ids.append(flat_class)
+        if RECLASS_NODATA in used_ids:
+            msg = ("Class id {} collides with the NoData value used for reclassified outputs. "
+                   "Use a different class id.").format(RECLASS_NODATA)
+            _err(msg)
+            raise ValueError(msg)
+
+        wanted_products = []
+        if inc_slope:
+            wanted_products.append("SLOPE")
+        if inc_aspect:
+            wanted_products.append("ASPECT")
+
+        # Discover factor rasters (Slope/Aspect, not already reclassified).
+        rasters = []
+        if recurse:
+            walker = os.walk(in_folder)
+        else:
+            only_files = [n for n in os.listdir(in_folder)
+                          if os.path.isfile(os.path.join(in_folder, n))]
+            walker = [(in_folder, [], only_files)]
+        for dirpath, _dirs, files in walker:
+            for fn in files:
+                if not fn.lower().endswith(".tif"):
+                    continue
+                info = parse_source_and_product(fn)
+                if (info["product"] not in wanted_products or info["mina"] is None
+                        or info["source"] is None or info["reclass"]):
+                    continue
+                rasters.append((os.path.join(dirpath, fn), info["mina"], info["source"], info["product"]))
+
+        if not rasters:
+            msg = "No {} factor rasters found in '{}'.".format("/".join(wanted_products), in_folder)
+            _err(msg)
+            raise ValueError(msg)
+
+        total = len(rasters)
+        created = 0
+        skipped_existing = 0
+        arcpy.SetProgressor("step", "Reclassifying factors...", 0, total, 1)
+        for path, mina, source, product in rasters:
+            arcpy.SetProgressorPosition()
+            out_name = build_output_name(mina, source, product, reclass=True) + ".tif"
+            location = out_folder
+            if output_structure == "per_mina_subfolder":
+                location = os.path.join(out_folder, mina)
+            if not os.path.isdir(location):
+                os.makedirs(location)
+            out_path = os.path.join(location, out_name)
+
+            if os.path.exists(out_path) and not overwrite_existing:
+                _msg("{} ({}): {} exists, skipping.".format(mina, source, out_name))
+                skipped_existing += 1
+                continue
+
+            src = arcpy.Raster(path)
+            sr = src.spatialReference
+            if sr is None or sr.name in (None, "", "Unknown"):
+                _warn("{} ({}): input {} has an undefined CRS; the output CRS will be undefined "
+                      "too.".format(mina, source, product))
+            lower_left = arcpy.Point(src.extent.XMin, src.extent.YMin)
+            cell_w = src.meanCellWidth
+            cell_h = src.meanCellHeight
+
+            # Read as float (Slope/Aspect are float; an integer array cannot hold NaN) and map the
+            # raster's own NoData to NaN explicitly, so reclassify_array sends it to output NoData.
+            try:
+                arr = arcpy.RasterToNumPyArray(path).astype("float32")
+            except MemoryError:
+                msg = ("{} ({}) {} is too large to load into memory for reclassification. Reduce "
+                       "the AOI extent or process fewer rasters at a time.").format(mina, source, product)
+                _err(msg)
+                raise
+            nodata_val = src.noDataValue
+            if nodata_val is not None:
+                arr[arr == nodata_val] = float("nan")
+
+            classes = slope_classes if product == "SLOPE" else aspect_classes
+            use_flat = product == "ASPECT" and flat_class is not None
+            out_arr = reclassify_array(arr, classes, RECLASS_NODATA,
+                                       flat_value=-1 if use_flat else None,
+                                       flat_class=flat_class if use_flat else None)
+
+            # Strict coverage: with the option off, any real-data cell that fell outside all
+            # classes is an error (the table does not cover the value range).
+            if not nodata_for_unmapped:
+                with np.errstate(invalid="ignore"):
+                    unmapped = (out_arr == RECLASS_NODATA) & ~np.isnan(arr)
+                    if use_flat:
+                        unmapped &= (arr != -1)
+                n_unmapped = int(unmapped.sum())
+                if n_unmapped:
+                    msg = ("{} ({}) {}: {} cells fall outside all classes and 'Unmapped values to "
+                           "NoData' is off. Extend the class table to cover the full value range, "
+                           "or turn the option on.").format(mina, source, product, n_unmapped)
+                    _err(msg)
+                    raise ValueError(msg)
+
+            out_raster = arcpy.NumPyArrayToRaster(out_arr, lower_left, cell_w, cell_h,
+                                                  value_to_nodata=RECLASS_NODATA)
+            out_raster.save(out_path)
+            arcpy.management.DefineProjection(out_path, sr)        # NumPyArrayToRaster leaves CRS undefined
+            _msg("{} ({}): reclassified {} ({}) -> {}".format(
+                mina, source, product, _crs_label(sr), out_name))
+            created += 1
+
+        arcpy.ResetProgressor()
+        _msg("Done. Factor rasters: {}. Reclassified: {}. Skipped existing: {}. Output NoData: {}.".format(
+            total, created, skipped_existing, RECLASS_NODATA))
+        return
+
+
 # ===========================================================================
-# Self tests (pure functions, no arcpy, no numpy). Run: python MiningTerrainToolbox.pyt
+# Self tests (pure functions; numpy tests run only if numpy is importable).
+# Run: python MiningTerrainToolbox.pyt
 # ===========================================================================
 
 def _run_self_tests():
@@ -1191,6 +1470,23 @@ def _run_self_tests():
                  lambda: detect_folder_prefix(["a_7", "b_8"]))
     check_raises("no trailing number raises",
                  lambda: detect_folder_prefix(["nodigits", "also_none"]))
+
+    print("reclassify_array")
+    try:
+        import numpy as _np
+    except ImportError:
+        print("  skip (numpy not available)")
+    else:
+        cl = [(1, 0, 10), (2, 10, 20), (3, 20, 30)]
+        out = reclassify_array(_np.array([[0.0, 9.9, 10.0], [20.0, 29.9, 30.0]]), cl, 9999)
+        check("[min, max) bins and last class inclusive",
+              out.tolist() == [[1, 1, 2], [3, 3, 3]])
+        out2 = reclassify_array(_np.array([[40.0, float("nan")]]), cl, 9999)
+        check("out of range and NaN go to NoData", out2.tolist() == [[9999, 9999]])
+        asp = [(1, 0, 45), (2, 45, 135), (3, 135, 225), (4, 225, 315), (1, 315, 360)]
+        out3 = reclassify_array(_np.array([[0.0, 350.0, 360.0, -1.0]]), asp, 9999,
+                                flat_value=-1, flat_class=9)
+        check("aspect split classes plus flat", out3.tolist() == [[1, 1, 1, 9]])
 
     print("")
     if failures:
