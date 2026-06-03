@@ -193,7 +193,7 @@ Resample the named rasters to a coarser cell size (for example 2 m to 10 m), in 
 | Target cell size (meters) | Default 10. |
 | Overwrite existing outputs | Off skips existing resampled rasters. |
 
-The method is automatic per type: bilinear for continuous rasters, nearest for reclassified (`_RCL`) so the ordinal classes are preserved. A raster already at the target cell size is skipped; a target finer than the native cell size warns, since upsampling adds no real detail.
+The method is automatic per type: bilinear for continuous rasters, nearest for reclassified (`_RCL`) so the ordinal classes are preserved. A raster already at the target cell size is copied through unchanged, so the `Resample` folder stays a complete set; a target finer than the native cell size warns, since upsampling adds no real detail.
 
 ---
 

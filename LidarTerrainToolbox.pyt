@@ -1822,7 +1822,7 @@ class Resample(object):
         total = len(rasters)
         created = 0
         skipped_existing = 0
-        skipped_native = 0
+        copied_native = 0
         failed = []
         arcpy.SetProgressor("step", "Resampling rasters...", 0, total, 1)
         for path, info, token in rasters:
@@ -1844,8 +1844,11 @@ class Resample(object):
                 native = src.meanCellWidth
                 sr = src.spatialReference
                 if abs(native - target_cell) <= 1e-6:
-                    _msg("{} ({}): already at {:g} m, skipping.".format(area, token, native))
-                    skipped_native += 1
+                    # Already at the target: copy it through so the Resample folder is a
+                    # complete set of the selected types at the target resolution.
+                    arcpy.management.CopyRaster(path, out_path)
+                    _msg("{} ({}): already at {:g} m, copied -> {}".format(area, token, native, fn))
+                    copied_native += 1
                     continue
                 if target_cell < native:
                     _warn("{} ({}): target {:g} m is finer than native {:g} m; upsampling adds no "
@@ -1860,8 +1863,9 @@ class Resample(object):
                 failed.append("{} ({})".format(area, token))
 
         arcpy.ResetProgressor()
-        _msg("Done. Selected rasters: {}. Resampled: {}. Skipped (existing: {}, already at target: {}). "
-             "Failed: {}.".format(total, created, skipped_existing, skipped_native, len(failed)))
+        _msg("Done. Selected rasters: {}. Resampled: {}. Copied (already at target): {}. "
+             "Skipped existing: {}. Failed: {}.".format(
+                 total, created, copied_native, skipped_existing, len(failed)))
         if failed:
             msg = "Resample failed for: " + ", ".join(failed)
             _err(msg)
