@@ -25,7 +25,8 @@ Three tools form a pipeline, run in order, with the input and output folders alw
 
 1. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per mining area, from the DGT LiDAR download folders.
 2. **Generate Surfaces**: slope, aspect, hillshade and curvature (profile and plan) from each mosaic.
-3. **Reclassify Slope and Aspect**: ordinal integer classes for slope and aspect, defined in a value table.
+3. **Solar Radiation**: annual incoming solar radiation (global, kWh/m2) per mina, computed on the DEM with RasterSolarRadiation (GPU).
+4. **Reclassify Slope and Aspect**: ordinal integer classes for slope and aspect, defined in a value table.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -39,15 +40,18 @@ flowchart LR
     LID["DGT LiDAR folders<br/>..._&lt;FID&gt; with MDT (DEM) and MDS (DSM)"] --> T1
     T1 --> M["Per mina mosaics<br/>Mina_DEM.tif / Mina_DSM.tif"]
     M --> T2["Tool 2<br/>Generate Surfaces"]
+    M --> T3["Tool 3<br/>Solar Radiation"]
     T2 --> S["Surfaces<br/>SLOPE, ASPECT, HILLSHADE, PROFC, PLANC"]
-    S --> T3["Tool 3<br/>Reclassify Slope and Aspect"]
-    T3 --> R["Ordinal factors<br/>Mina_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
+    T3 --> SOL["Solar<br/>Mina_DEM_SOLAR.tif (kWh/m2)"]
+    S --> T4["Tool 4<br/>Reclassify Slope and Aspect"]
+    T4 --> R["Ordinal factors<br/>Mina_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
     R --> EXT["External, not in this toolbox:<br/>weighted overlay, REN/RAN/PDM exclusions"]
 ```
 
 - The DGT LiDAR arrives pre-split into one download folder per area of interest, where the folder name ends in the AOI feature FID and holds the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. The 5 km buffer selection was already applied at download time.
 - **Tool 1** groups AOI features by mina name (the folder number equals the feature FID), merges each mina's MDT and MDS tiles across all of its folders into one DEM and one DSM mosaic, and deduplicates tiles by name. It optionally verifies, per folder, that the tile extent contains the AOI polygon centroid (a guard against a wrong FID mapping).
 - **Tool 2** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
+- **Tool 3** computes annual global solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated). The DEM is resampled to a coarser solar cell size first (default 10 m) because annual insolation is a smooth field, which keeps the heavy whole year run tractable.
 - **Tool 3** reclassifies slope and aspect into ordinal integer classes using `[min, max)` semantics (the last class inclusive at the top), implemented in numpy for deterministic boundaries. The value table validation fails loud on gaps and on overlaps between different class ids before anything is written.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent check.
 
@@ -56,7 +60,7 @@ flowchart LR
 ## Requirements
 
 - ArcGIS Pro **3.7**, Windows (arcpy is Windows only on ArcGIS Pro 3.x). Uses the Python bundled with ArcGIS Pro and numpy from that environment; no extra packages.
-- **Spatial Analyst** extension for Tool 2 (slope, aspect, curvature, traditional hillshade).
+- **Spatial Analyst** extension for Tool 2 (slope, aspect, curvature, traditional hillshade) and Tool 3 (solar radiation). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
 - **Image Analyst** extension for Tool 2 only when the hillshade type is Multidirectional.
 - Tool 1 and Tool 3 need no extension (mosaicking is core, and the reclassification is pure numpy).
 - Tiles in the project CRS, ETRS89 / PT-TM06 (EPSG:3763). The tools log the CRS and warn if it differs.
@@ -112,7 +116,24 @@ Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox 
 | Hillshade azimuth, altitude | Traditional hillshade only. |
 | Overwrite existing outputs | Off skips existing surfaces. |
 
-### Tool 3, Reclassify Slope and Aspect
+### Tool 3, Solar Radiation
+
+Annual incoming solar radiation (global, kWh/m2) per mina, with `RasterSolarRadiation` (GPU when available). This is the heavy tool; expect long run times. The DEM is resampled to a coarser solar cell size first, since annual insolation is a smooth field.
+
+| Parameter | Description |
+| --- | --- |
+| Input mosaics folder | The Tool 1 output. |
+| Recurse subfolders | On (default). |
+| Output structure, Output folder | `same_as_input` default, as in the other tools. |
+| Source | `DEM` (default, the terrain resource for ground PV), `DSM`, or `BOTH`. |
+| Solar cell size | Meters to resample the DEM to before the run; default 10 (0 = native 2 m). |
+| Resample method | `BILINEAR` (default). |
+| Year | Whole year; the year only sets the leap year. |
+| Shadow neighborhood distance | How far to look for terrain shadows; default `1000 Meters`, adaptive. |
+| Transmittivity, Diffuse proportion | Atmosphere; defaults 0.6 and 0.3 (clear Alentejo sky). |
+| Overwrite | Off skips existing outputs. |
+
+### Tool 4, Reclassify Slope and Aspect
 
 Ordinal classes for slope and aspect, from a value table.
 
@@ -137,7 +158,7 @@ The value table allows the **same `class_id` on multiple rows**, which supports 
 A single convention links the three tools:
 
 - Mosaic: `{Mina}_{SOURCE}` where SOURCE is `DEM` or `DSM`.
-- Surface: `{Mina}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE`, `ASPECT`, `HILLSHADE`, `PROFC` or `PLANC`.
+- Surface: `{Mina}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE`, `ASPECT`, `HILLSHADE`, `PROFC`, `PLANC` or `SOLAR`.
 - Reclassified: the surface name plus `_RCL`.
 
 The `.tif` extension is added on write. Mina names are sanitized for ArcGIS and the file system (accents and c cedilla folded to ASCII, separators to underscore). If two different minas sanitize to the same name they get a numeric suffix; several AOI polygons of the **same** mina are merged into one output.

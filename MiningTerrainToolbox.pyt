@@ -58,7 +58,7 @@ except ImportError:
 
 PROJECT_EPSG = 3763                                  # ETRS89 / PT-TM06, meters
 SOURCES = ("DEM", "DSM")
-PRODUCTS = ("SLOPE", "ASPECT", "HILLSHADE", "PROFC", "PLANC")
+PRODUCTS = ("SLOPE", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLAR")
 RECLASS_SUFFIX = "RCL"
 MAX_NAME_LEN = 40                                    # margin for suffixes like _DEM_ASPECT_RCL
 RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
@@ -408,15 +408,15 @@ class Toolbox(object):
         self.alias = "LidarTerrain"
         # Tool labels are numbered so they sort in pipeline order at the toolbox root
         # (no toolset categories): 01 Build Mosaics by Polygon, 02 Generate Surfaces,
-        # 03 Solar Radiation (to be added), 04 Reclassify Slope and Aspect.
-        self.tools = [BuildMosaicsByPolygon, DeriveSurfaces, ReclassifyFactor]
+        # 03 Solar Radiation, 04 Reclassify Slope and Aspect.
+        self.tools = [BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation, ReclassifyFactor]
 
 
 # ===========================================================================
 # Tools
 # ===========================================================================
-#   01 BuildMosaicsByPolygon, 02 DeriveSurfaces, 04 ReclassifyFactor (imports numpy lazily).
-#   03 Solar Radiation (AreaSolarRadiation) to be added between 02 and 04.
+#   01 BuildMosaicsByPolygon, 02 DeriveSurfaces, 03 SolarRadiation, 04 ReclassifyFactor.
+#   SolarRadiation uses arcpy.sa.RasterSolarRadiation (GPU); ReclassifyFactor imports numpy lazily.
 
 
 def _crs_label(sr):
@@ -1392,6 +1392,235 @@ class ReclassifyFactor(object):
         return
 
 
+class SolarRadiation(object):
+    def __init__(self):
+        self.label = "03 - Solar Radiation"
+        self.description = ("Compute annual incoming solar radiation (global, kWh/m2) per mina from the "
+                            "DEM mosaics, in batch, with arcpy.sa.RasterSolarRadiation (GPU accelerated). "
+                            "The DEM is resampled to a coarser solar cell size first, because annual "
+                            "insolation is a smooth field, to keep the heavy whole year computation "
+                            "tractable. This is the heavy tool; expect long run times.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Input mosaics folder", name="in_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder (per_mina_subfolder or flat only)", name="out_folder",
+            datatype="DEFolder", parameterType="Optional", direction="Output")
+
+        p_struct = arcpy.Parameter(
+            displayName="Output structure", name="output_structure",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_struct.filter.type = "ValueList"
+        p_struct.filter.list = ["same_as_input", "per_mina_subfolder", "flat"]
+        p_struct.value = "same_as_input"
+
+        p_source = arcpy.Parameter(
+            displayName="Source", name="source_filter",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_source.filter.type = "ValueList"
+        p_source.filter.list = ["DEM", "DSM", "BOTH"]
+        p_source.value = "DEM"
+
+        p_cell = arcpy.Parameter(
+            displayName="Solar cell size in meters (0 = native)", name="solar_cell_size",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_cell.value = 10
+
+        p_method = arcpy.Parameter(
+            displayName="Resample method", name="resample_method",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_method.filter.type = "ValueList"
+        p_method.filter.list = ["BILINEAR", "CUBIC", "NEAREST"]
+        p_method.value = "BILINEAR"
+
+        p_year = arcpy.Parameter(
+            displayName="Year (whole year; only sets leap year)", name="year",
+            datatype="GPLong", parameterType="Required", direction="Input")
+        p_year.value = 2023
+
+        p_neigh = arcpy.Parameter(
+            displayName="Shadow neighborhood distance", name="neighborhood_distance",
+            datatype="GPLinearUnit", parameterType="Required", direction="Input")
+        p_neigh.value = "1000 Meters"
+
+        p_trans = arcpy.Parameter(
+            displayName="Transmittivity (0-1)", name="transmittivity",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_trans.value = 0.6
+
+        p_diff = arcpy.Parameter(
+            displayName="Diffuse proportion (0-1)", name="diffuse_proportion",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_diff.value = 0.3
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_in, p_recurse, p_out, p_struct, p_source, p_cell, p_method,
+                p_year, p_neigh, p_trans, p_diff, p_overwrite]
+
+    def isLicensed(self):
+        try:
+            return arcpy.CheckExtension("Spatial") == "Available"
+        except Exception:
+            return False
+
+    def updateParameters(self, parameters):
+        parameters[2].enabled = parameters[3].valueAsText != "same_as_input"
+        return
+
+    def updateMessages(self, parameters):
+        if parameters[3].valueAsText != "same_as_input" and not parameters[2].valueAsText:
+            parameters[2].setErrorMessage("Output folder is required unless output structure is "
+                                          "same_as_input.")
+        return
+
+    def execute(self, parameters, messages):
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        out_folder = parameters[2].valueAsText
+        output_structure = parameters[3].valueAsText
+        source_filter = parameters[4].valueAsText
+        solar_cell_size = float(parameters[5].value)
+        resample_method = parameters[6].valueAsText
+        year = int(parameters[7].value)
+        neighborhood = parameters[8].valueAsText
+        transmittivity = float(parameters[9].value)
+        diffuse_proportion = float(parameters[10].value)
+        overwrite_existing = bool(parameters[11].value)
+
+        # Idempotency is handled by an explicit os.path.exists skip below, so overwrite is
+        # left on to let the scratch resample step overwrite a stale temp cleanly.
+        arcpy.env.overwriteOutput = True
+
+        if arcpy.CheckExtension("Spatial") != "Available":
+            msg = "Spatial Analyst extension is not available. It is required for this tool."
+            _err(msg)
+            raise RuntimeError(msg)
+        if not hasattr(arcpy.sa, "RasterSolarRadiation"):
+            msg = "arcpy.sa.RasterSolarRadiation is not available in this ArcGIS Pro build."
+            _err(msg)
+            raise RuntimeError(msg)
+        if output_structure != "same_as_input" and not out_folder:
+            msg = "Output folder is required unless output structure is same_as_input."
+            _err(msg)
+            raise ValueError(msg)
+
+        allowed_sources = SOURCES if source_filter == "BOTH" else (source_filter,)
+        start_date = "1/1/{}".format(year)
+        end_date = "12/31/{}".format(year)
+
+        # Discover base mosaics (source set, product None) matching the source filter.
+        mosaics = []
+        if recurse:
+            walker = os.walk(in_folder)
+        else:
+            only_files = [n for n in os.listdir(in_folder)
+                          if os.path.isfile(os.path.join(in_folder, n))]
+            walker = [(in_folder, [], only_files)]
+        for dirpath, _dirs, files in walker:
+            for fn in files:
+                if not fn.lower().endswith(".tif"):
+                    continue
+                info = parse_source_and_product(fn)
+                if info["source"] is None or info["product"] is not None or info["mina"] is None:
+                    continue
+                if info["source"] not in allowed_sources:
+                    continue
+                mosaics.append((os.path.join(dirpath, fn), info["mina"], info["source"]))
+
+        if not mosaics:
+            msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), in_folder)
+            _err(msg)
+            raise ValueError(msg)
+
+        total = len(mosaics)
+        _warn("Solar radiation is a heavy whole year computation. {} mosaic(s) at a {} solar cell size "
+              "may take a long time; benchmark one mina first.".format(
+                  total, "{} m".format(solar_cell_size) if solar_cell_size > 0 else "native"))
+
+        arcpy.CheckOutExtension("Spatial")
+        created = 0
+        skipped_existing = 0
+        failed = []
+        try:
+            arcpy.SetProgressor("step", "Computing solar radiation...", 0, total, 1)
+            for path, mina, source in mosaics:
+                arcpy.SetProgressorPosition()
+                if source == "DSM":
+                    _warn("{}: solar is computed on the DSM (canopy and building surface), not the "
+                          "bare ground a PV plant would sit on.".format(mina))
+
+                out_name = build_output_name(mina, source, "SOLAR") + ".tif"
+                location = out_folder
+                if output_structure == "same_as_input":
+                    location = os.path.dirname(path)
+                elif output_structure == "per_mina_subfolder":
+                    location = os.path.join(out_folder, mina)
+                if not os.path.isdir(location):
+                    os.makedirs(location)
+                out_path = os.path.join(location, out_name)
+
+                if os.path.exists(out_path) and not overwrite_existing:
+                    _msg("{} ({}): {} exists, skipping.".format(mina, source, out_name))
+                    skipped_existing += 1
+                    continue
+
+                resampled = None
+                try:
+                    sr = _assert_projected_raster(path)
+                    native = arcpy.Raster(path).meanCellWidth
+                    surface = path
+                    if solar_cell_size and solar_cell_size > native:
+                        resampled = os.path.join(arcpy.env.scratchFolder, "solar_{}.tif".format(mina))
+                        arcpy.management.Resample(
+                            path, resampled, "{0} {0}".format(solar_cell_size), resample_method)
+                        surface = resampled
+
+                    rad = arcpy.sa.RasterSolarRadiation(
+                        in_surface_raster=surface,
+                        start_date_time=start_date,
+                        end_date_time=end_date,
+                        use_time_interval="NO_INTERVAL",
+                        neighborhood_distance=neighborhood,
+                        use_adaptive_neighborhood="ADAPTIVE_NEIGHBORHOOD",
+                        diffuse_model_type="UNIFORM_SKY",
+                        diffuse_proportion=diffuse_proportion,
+                        transmittivity=transmittivity,
+                        analysis_target_device="GPU_THEN_CPU",
+                    )
+                    rad.save(out_path)
+                    _msg("{} ({}): solar radiation (kWh/m2, {}) -> {}".format(
+                        mina, source, _crs_label(sr), out_name))
+                    created += 1
+                except Exception as exc:
+                    _warn("{} ({}): solar radiation failed: {}".format(mina, source, exc))
+                    failed.append(mina)
+                finally:
+                    if resampled and arcpy.Exists(resampled):
+                        arcpy.management.Delete(resampled)
+
+            arcpy.ResetProgressor()
+            _msg("Done. Mosaics: {}. Solar rasters created: {}. Skipped existing: {}. Failed: {}.".format(
+                total, created, skipped_existing, len(failed)))
+            if failed:
+                _warn("Failed minas: " + ", ".join(failed))
+        finally:
+            arcpy.CheckInExtension("Spatial")
+        return
+
+
 # ===========================================================================
 # Self tests (pure functions; numpy tests run only if numpy is importable).
 # Run: python MiningTerrainToolbox.pyt
@@ -1437,6 +1666,7 @@ def _run_self_tests():
         ("Sao_Domingos", "DEM", "SLOPE", True),
         ("Mina_Norte", "DSM", "ASPECT", False),
         ("MinaA", "DEM", None, False),               # base mosaic
+        ("MinaA", "DEM", "SOLAR", False),
     ]
     for mina, source, product, reclass in cases:
         name = build_output_name(mina, source, product, reclass)
