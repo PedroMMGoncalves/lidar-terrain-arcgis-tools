@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Mining Terrain Factor Toolbox - derives topographic factors from DGT LiDAR.
+# LiDAR Terrain Toolbox - derives topographic factors from LiDAR DEM and DSM.
 # Copyright (C) 2026 Pedro Gonçalves
 #
 # This program is free software: you can redistribute it and/or modify
@@ -16,12 +16,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
-Mining Terrain Factor Toolbox
+LiDAR Terrain Toolbox
 
 Single file ArcGIS Pro Python Toolbox (.pyt) that derives topographic factors from
-DGT LiDAR elevation data (DEM/DSM) in batch, per area of interest (mining polygons),
-for a downstream renewables suitability MCDA. Factor engine only. The weighted overlay
-and the REN/RAN/PDM exclusions are external steps, outside this toolbox.
+LiDAR elevation data (DEM/DSM) in batch, per area of interest: slope, aspect, hillshade,
+profile and plan curvature, and annual solar radiation. Factor engine only; any
+downstream analysis is external, outside this toolbox.
 
 Project CRS: ETRS89 / PT-TM06, EPSG:3763. Horizontal and vertical units in meters,
 so Z factor = 1.

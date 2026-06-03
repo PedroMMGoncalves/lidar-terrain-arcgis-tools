@@ -1,6 +1,6 @@
 # lidar-terrain-arcgis-tools
 
-> ArcGIS Pro Python toolbox that derives topographic factors (slope, aspect, hillshade, curvature) from DGT LiDAR DEM and DSM, per mining area, for a renewable energy suitability MCDA.
+> ArcGIS Pro Python toolbox that derives topographic factors (slope, aspect, hillshade, curvature, solar radiation) from LiDAR DEM and DSM, in batch, per area of interest.
 
 [![ArcGIS Pro](https://img.shields.io/badge/ArcGIS_Pro-3.7-green.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview)
 [![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org)
@@ -9,21 +9,21 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-A single ArcGIS Pro Python Toolbox (`.pyt`) that processes, in batch, DGT LiDAR elevation data to generate topographic factors for a multicriteria suitability analysis (MCDA) for renewable energy (solar PV focus) on abandoned mining areas in mainland Portugal.
+A single ArcGIS Pro Python Toolbox (`.pyt`) that processes, in batch, LiDAR elevation data (DEM and DSM), per area of interest, to generate topographic factors: slope, aspect, hillshade, profile and plan curvature, and annual solar radiation. Every output follows one consistent naming convention so it can feed any downstream analysis.
 
-This toolbox is the **factor engine only**. The weighted overlay and the REN/RAN/PDM exclusions are downstream steps done elsewhere and are NOT part of this toolbox. Project CRS: ETRS89 / PT-TM06 (EPSG:3763), meters, Z factor 1.
+This toolbox is the **factor engine only**. Any downstream analysis (suitability modeling, factor weighting, exclusion masks) is done elsewhere and is NOT part of this toolbox. Project CRS: ETRS89 / PT-TM06 (EPSG:3763), meters, Z factor 1.
 
 ## Contents
 
-[Summary](#summary) - [Method](#method) - [Requirements](#requirements) - [Installation](#installation) - [Usage](#usage) - [Naming convention](#naming-convention) - [Example](#example) - [Tests](#tests) - [Troubleshooting](#troubleshooting) - [Limitations and notes](#limitations-and-notes) - [Contributing](#contributing) - [Citation](#citation) - [License](#license)
+[Summary](#summary) - [Method](#method) - [Requirements](#requirements) - [Data source](#data-source) - [Installation](#installation) - [Usage](#usage) - [Naming convention](#naming-convention) - [Example](#example) - [Tests](#tests) - [Troubleshooting](#troubleshooting) - [Limitations and notes](#limitations-and-notes) - [Contributing](#contributing) - [Citation](#citation) - [License](#license)
 
 ---
 
 ## Summary
 
-Three tools form a pipeline, run in order, with the input and output folders always chosen explicitly by the user:
+Four tools form a pipeline, run in order, with the input and output folders always chosen explicitly by the user:
 
-1. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per mining area, from the DGT LiDAR download folders.
+1. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
 2. **Generate Surfaces**: slope, aspect, hillshade and curvature (profile and plan) from each mosaic.
 3. **Solar Radiation**: annual incoming solar radiation (global, kWh/m2) per area, computed on the DEM with RasterSolarRadiation (GPU).
 4. **Reclassify Slope and Aspect**: ordinal integer classes for slope and aspect, defined in a value table.
@@ -48,7 +48,7 @@ flowchart TD
     T3 --> SOL["Area_DEM_SOLAR.tif<br/>(kWh/m2)"]
     S --> T4["Tool 4<br/>Reclassify Slope and Aspect"]
     T4 --> RCL["Ordinal factors<br/>Area_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
-    RCL --> EXT["External, not in this toolbox<br/>weighted overlay, REN/RAN/PDM exclusions"]
+    RCL --> EXT["Analysis<br/>(external to this toolbox)"]
     SOL --> EXT
 
     classDef tool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff;
@@ -75,6 +75,18 @@ flowchart TD
 - **Image Analyst** extension for Tool 2 only when the hillshade type is Multidirectional.
 - Tool 1 and Tool 3 need no extension (mosaicking is core, and the reclassification is pure numpy).
 - Tiles in the project CRS, ETRS89 / PT-TM06 (EPSG:3763). The tools log the CRS and warn if it differs.
+
+---
+
+## Data source
+
+The tools were built for the DGT LiDAR survey of mainland Portugal, *Levantamento LiDAR de Portugal Continental*, produced by the [Direção-Geral do Território (DGT)](https://www.dgterritorio.gov.pt/levantamento-lidar-de-portugal-continental-0). The survey provides a 10 points/m2 LAZ point cloud and the derived terrain model (MDT, the DEM) and surface model (MDS, the DSM) at 0.5 m and 2 m resolution as GeoTIFF, under an open data policy with no usage restrictions. This toolbox consumes the 2 m models (`MDT-2m`, `MDS-2m`).
+
+The data is distributed through the DGT Data Center (CDD), which requires a free registration: <https://cdd.dgterritorio.gov.pt/dgt-fe>.
+
+The tiles used here were downloaded with the [DGT CDD Downloader](https://plugins.qgis.org/plugins/dgt_cdd_downloader/) plugin for QGIS (Duarte Carreira, Hugo Santos and Pedro Venâncio). It authenticates against the CDD portal, splits a large area into chunks, organizes the files per area, and can build a per folder VRT. That is the exact on disk layout Tool 1 expects: one download folder per area of interest, each with `MDT*` and `MDS*` subfolders and a per product `.vrt`.
+
+> The factor tools (2 to 4) work on any DEM and DSM raster. Only Tool 1 (mosaicking) is tailored to the DGT download folder layout described above.
 
 ---
 
@@ -141,7 +153,7 @@ Annual incoming solar radiation (global, kWh/m2) per area, with `RasterSolarRadi
 | Resample method | `BILINEAR` (default). |
 | Year | Whole year; the year only sets the leap year. |
 | Shadow neighborhood distance | How far to look for terrain shadows; default `1000 Meters`, adaptive. |
-| Transmittivity, Diffuse proportion | Atmosphere; defaults 0.6 and 0.3 (clear Alentejo sky). |
+| Transmittivity, Diffuse proportion | Atmosphere; defaults 0.6 and 0.3 (clear-sky conditions). |
 | Overwrite | Off skips existing outputs. |
 
 ### Tool 4, Reclassify Slope and Aspect
@@ -234,11 +246,11 @@ This exercises name sanitization and collision handling, the output name build a
 
 ## Limitations and notes
 
-- **The ordinal scale is not harmonized between factors.** You define arbitrary intervals per factor; only slope and aspect are reclassified. Harmonizing the classes for a weighted overlay is the downstream MCDA step, outside this toolbox. *Document this for whoever consumes the outputs, to avoid misuse.*
-- **Weighted overlay and the REN/RAN/PDM exclusions are external** and are not part of this toolbox.
+- **The ordinal scale is not harmonized between factors.** You define arbitrary intervals per factor; only slope and aspect are reclassified. Harmonizing the classes is a downstream analysis step, outside this toolbox. *Document this for whoever consumes the outputs, to avoid misuse.*
+- **The downstream analysis is external** and not part of this toolbox.
 - **Folder layout assumption (Tool 1):** the download folder number must equal the AOI feature FID (0 based shapefile FID). Loading the AOI as a geodatabase feature class (1 based OBJECTID) can shift the mapping; the tool warns when the OID field is not `FID`.
 - **Memory (Tool 3):** each factor raster is read into memory for the numpy reclassification. The per area extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
-- **Datum reprojection:** `projectAs` uses the default transformation. Where no default geographic transformation exists between datums it may need to be specified; unlikely in mainland Portugal.
+- **Datum reprojection:** `projectAs` uses the default transformation. Where no default geographic transformation exists between the input and project datums, it may need to be specified explicitly.
 - **Aspect Flat:** aspect uses -1 for flat. In Tool 3 the optional flat class wins over any class interval that happens to contain -1.
 
 ---
