@@ -21,12 +21,13 @@ This toolbox is the **factor engine only**. Any downstream analysis (suitability
 
 ## Summary
 
-Four tools form a pipeline, run in order, with the input and output folders always chosen explicitly by the user:
+Four tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. A fifth tool, Resample, is an optional utility you can run on any of the outputs:
 
 1. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
 2. **Generate Surfaces**: slope, aspect, hillshade and curvature (profile and plan) from each mosaic.
 3. **Solar Radiation**: annual incoming solar radiation (global, kWh/m2) per area, computed on the DEM with RasterSolarRadiation (GPU).
 4. **Reclassify Slope and Aspect**: ordinal integer classes for slope and aspect, defined in a value table.
+5. **Resample** (optional): resample the named rasters to a coarser cell size, for example 2 m to 10 m, into a `Resample` folder grouped by area.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -44,18 +45,22 @@ flowchart TD
     T1 --> M["Per area mosaics<br/>Area_DEM.tif / Area_DSM.tif"]
     M --> T2["Tool 2<br/>Generate Surfaces"]
     M --> T3["Tool 3<br/>Solar Radiation"]
+    M -.-> T5["Tool 5 (optional)<br/>Resample"]
     T2 --> S["Surfaces<br/>SLOPE, ASPECT, HILLSHADE, PROFC, PLANC"]
     T3 --> SOL["Area_DEM_SOLAR.tif<br/>(kWh/m2)"]
+    T5 -.-> RS["Resample folder<br/>coarser cell size (e.g. 2 m to 10 m)<br/>grouped by area"]
     S --> T4["Tool 4<br/>Reclassify Slope and Aspect"]
     T4 --> RCL["Ordinal factors<br/>Area_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
     RCL --> EXT["Analysis<br/>(external to this toolbox)"]
     SOL --> EXT
 
     classDef tool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff;
+    classDef opttool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff,stroke-dasharray:5 3;
     classDef data fill:#eaf2ff,stroke:#1f6feb,color:#0b2a5b;
     classDef ext fill:#f5f5f5,stroke:#999999,color:#333333,stroke-dasharray:4 3;
     class T1,T2,T3,T4 tool;
-    class AOI,LID,M,S,SOL,RCL data;
+    class T5 opttool;
+    class AOI,LID,M,S,SOL,RCL,RS data;
     class EXT ext;
 ```
 
@@ -64,6 +69,7 @@ flowchart TD
 - **Tool 2** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
 - **Tool 3** computes annual global solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated). The DEM is resampled to a coarser solar cell size first (default 10 m) because annual insolation is a smooth field, which keeps the heavy whole year run tractable.
 - **Tool 4** reclassifies slope and aspect into ordinal integer classes using `[min, max)` semantics (the last class inclusive at the top), implemented in numpy for deterministic boundaries. The value table validation fails loud on gaps and on overlaps between different class ids before anything is written.
+- **Tool 5** (optional) resamples the selected data types to a target cell size with core Resample, writing to a `Resample` folder grouped by area; continuous rasters use bilinear, reclassified (`_RCL`) rasters use nearest. Typical use is 2 m to 10 m to lighten the later steps.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent check.
 
 ---
@@ -73,14 +79,14 @@ flowchart TD
 - ArcGIS Pro **3.7**, Windows (arcpy is Windows only on ArcGIS Pro 3.x). Uses the Python bundled with ArcGIS Pro and numpy from that environment; no extra packages.
 - **Spatial Analyst** extension for Tool 2 (slope, aspect, curvature, traditional hillshade) and Tool 3 (solar radiation). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
 - **Image Analyst** extension for Tool 2 only when the hillshade type is Multidirectional.
-- Tool 1 and Tool 3 need no extension (mosaicking is core, and the reclassification is pure numpy).
+- Tools 1, 4 and 5 need no extension (mosaicking and resampling are core, and the reclassification is pure numpy).
 - Tiles in the project CRS, ETRS89 / PT-TM06 (EPSG:3763). The tools log the CRS and warn if it differs.
 
 ---
 
 ## Data source
 
-The tools were built for the DGT LiDAR survey of mainland Portugal, *Levantamento LiDAR de Portugal Continental*, produced by the [Direção-Geral do Território (DGT)](https://www.dgterritorio.gov.pt/levantamento-lidar-de-portugal-continental-0). The survey provides a 10 points/m2 LAZ point cloud and the derived terrain model (MDT, the DEM) and surface model (MDS, the DSM) at 0.5 m and 2 m resolution as GeoTIFF, under an open data policy with no usage restrictions. This toolbox consumes the 2 m models (`MDT-2m`, `MDS-2m`).
+The tools were built for the DGT LiDAR survey of mainland Portugal, *Levantamento LiDAR de Portugal Continental*, produced by the [Direção-Geral do Território (DGT)](https://www.dgterritorio.gov.pt/levantamento-lidar-de-portugal-continental-0). The survey provides a 10 points/m2 LAZ point cloud and the derived terrain model (MDT, the DEM) and surface model (MDS, the DSM) at 0.5 m and 2 m resolution as GeoTIFF, under an open data policy with no usage restrictions. This project used the 2 m models (`MDT-2m`, `MDS-2m`), but the tools are not tied to a resolution: Tool 1 mosaics any `MDT*` and `MDS*` tiles, so the 0.5 m models (`MDS-50cm-...`) work as well. When a download folder holds more than one resolution, set Tool 1's *Tile resolution* parameter (for example `2m` or `50cm`) to pick one; left blank it auto-detects a single resolution and fails loud on a mix, so a mosaic never blends cell sizes.
 
 The data is distributed through the DGT Data Center (CDD), which requires a free registration: <https://cdd.dgterritorio.gov.pt/dgt-fe>.
 
@@ -121,6 +127,7 @@ One DEM and one DSM mosaic per area, merging all of that area's download folders
 | Skip areas with missing folders | On (default) skips areas whose folders are not all present yet. |
 | Verify folder extent against AOI polygon | On (default) checks each folder maps to the right area. |
 | Folder name prefix | Optional. Leave blank to auto-detect the prefix from the data folders. |
+| Tile resolution | Optional. Leave blank to auto-detect; set (for example `2m` or `50cm`) to pick one resolution when a folder holds more than one. |
 
 ### Tool 2, Generate Surfaces
 
@@ -174,11 +181,25 @@ Ordinal classes for slope and aspect, from a value table.
 
 The value table allows the **same `class_id` on multiple rows**, which supports the circular aspect (for example North split into `315 to 360` and `0 to 45`, both class id 1). The tool does not detect wraparound; you partition the circle into linear rows. The validation fails loud on a gap, on an overlap between different class ids, on a non integer class id, and on `min` not less than `max`, before any raster is written.
 
+### Tool 5, Resample
+
+Resample the named rasters to a coarser cell size (for example 2 m to 10 m), in batch. An optional utility; point it at any folder of mosaics or surfaces. Outputs go to a `Resample` folder inside the results root, grouped by area, with the file names unchanged, so the other tools read them the same way.
+
+| Parameter | Description |
+| --- | --- |
+| Results folder | The results root; a `Resample` subfolder is created inside it. |
+| Recurse subfolders | On (default) finds the `per_area_subfolder` layout. |
+| Data types to resample | Multi-select: `DEM`, `DSM`, `SLOPE`, `ASPECT`, `HILLSHADE`, `PROFC`, `PLANC`, `SOLAR`, `SLOPE_RCL`, `ASPECT_RCL`. Default `DEM`, `DSM`. |
+| Target cell size (meters) | Default 10. |
+| Overwrite existing outputs | Off skips existing resampled rasters. |
+
+The method is automatic per type: bilinear for continuous rasters, nearest for reclassified (`_RCL`) so the ordinal classes are preserved. A raster already at the target cell size is skipped; a target finer than the native cell size warns, since upsampling adds no real detail.
+
 ---
 
 ## Naming convention
 
-A single convention links the three tools:
+A single convention links the tools:
 
 - Mosaic: `{Area}_{SOURCE}` where SOURCE is `DEM` or `DSM`.
 - Surface: `{Area}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE`, `ASPECT`, `HILLSHADE`, `PROFC`, `PLANC` or `SOLAR`.
@@ -213,7 +234,7 @@ Area 'Cortes_Pereira' (DSM): mosaicked 95 tiles from 2 folder(s) -> Cortes_Perei
 Done. Areas: 21. Built now: 21. Already present: 0. Mosaics created: 42. Skipped (no data: 0, incomplete: 0, no tiles: 0, extent mismatch: 0).
 ```
 
-You then point Tool 2 at this output folder to derive the surfaces, and Tool 3 at the Tool 2 output to reclassify slope and aspect.
+You then point Tool 2 at this output folder to derive the surfaces, and Tool 4 at the Tool 2 output to reclassify slope and aspect.
 
 ---
 
@@ -225,7 +246,7 @@ The shared helpers have pure unit tests inside the toolbox file, runnable outsid
 python LidarTerrainToolbox.pyt
 ```
 
-This exercises name sanitization and collision handling, the output name build and parse round trip, the value table validation (gaps, overlaps, repeated class id), the area grouping, the folder prefix auto-detection, the VRT extent parsing, and the numpy reclassification logic (the numpy tests are skipped if numpy is not installed in the Python being used). Under ArcGIS Pro the test block does not run; ArcGIS imports the module, it does not execute it as a script.
+This exercises name sanitization and collision handling, the output name build and parse round trip, the value table validation (gaps, overlaps, repeated class id), the area grouping, the folder prefix auto-detection, the VRT extent parsing, the tile resolution parsing and selection, the resample type mapping, and the numpy reclassification logic (the numpy tests are skipped if numpy is not installed in the Python being used). Under ArcGIS Pro the test block does not run; ArcGIS imports the module, it does not execute it as a script.
 
 ---
 
@@ -239,7 +260,7 @@ This exercises name sanitization and collision handling, the output name build a
 | `... does not contain its AOI polygon centroid` | A folder likely maps to the wrong area | Check the FID to folder mapping, or turn the extent check off to isolate. |
 | `Spatial Analyst extension is not available` | Tool 2 has no Spatial Analyst license | Enable Spatial Analyst in *Project > Licensing*. |
 | `Multidirectional hillshade needs the Image Analyst extension` | Tool 2 multidirectional without Image Analyst | Enable Image Analyst, or choose Traditional, or turn hillshade off. |
-| `Gap in coverage between ...` / `Overlap between different classes ...` | Tool 3 value table is not a clean tiling | Fix the class intervals so they tile the range with no holes or cross class overlaps. |
+| `Gap in coverage between ...` / `Overlap between different classes ...` | Tool 4 value table is not a clean tiling | Fix the class intervals so they tile the range with no holes or cross class overlaps. |
 | `Class id 9999 collides with the NoData value ...` | A class id or flat class equals the reserved NoData | Use a different class id. |
 
 ---
@@ -249,9 +270,9 @@ This exercises name sanitization and collision handling, the output name build a
 - **The ordinal scale is not harmonized between factors.** You define arbitrary intervals per factor; only slope and aspect are reclassified. Harmonizing the classes is a downstream analysis step, outside this toolbox. *Document this for whoever consumes the outputs, to avoid misuse.*
 - **The downstream analysis is external** and not part of this toolbox.
 - **Folder layout assumption (Tool 1):** the download folder number must equal the AOI feature FID (0 based shapefile FID). Loading the AOI as a geodatabase feature class (1 based OBJECTID) can shift the mapping; the tool warns when the OID field is not `FID`.
-- **Memory (Tool 3):** each factor raster is read into memory for the numpy reclassification. The per area extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
+- **Memory (Tool 4):** each factor raster is read into memory for the numpy reclassification. The per area extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
 - **Datum reprojection:** `projectAs` uses the default transformation. Where no default geographic transformation exists between the input and project datums, it may need to be specified explicitly.
-- **Aspect Flat:** aspect uses -1 for flat. In Tool 3 the optional flat class wins over any class interval that happens to contain -1.
+- **Aspect Flat:** aspect uses -1 for flat. In Tool 4 the optional flat class wins over any class interval that happens to contain -1.
 
 ---
 

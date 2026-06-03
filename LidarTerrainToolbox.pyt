@@ -62,6 +62,7 @@ PRODUCTS = ("SLOPE", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLAR")
 RECLASS_SUFFIX = "RCL"
 MAX_NAME_LEN = 40                                    # margin for suffixes like _DEM_ASPECT_RCL
 RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
+RESAMPLE_DIRNAME = "Resample"                        # output subfolder created by the Resample tool
 
 
 # ===========================================================================
@@ -212,6 +213,21 @@ def parse_source_and_product(filename):
     if not area:
         area = None                                  # normalize "" (junk input) to None
     return {"area": area, "source": source, "product": product, "reclass": reclass}
+
+
+def _resample_type_token(info):
+    """Type token used by the Resample type filter, from a parse_source_and_product dict.
+
+    A base mosaic is its source (DEM, DSM), a surface is its product (SLOPE, ASPECT, ...),
+    and a reclassified raster gets a _RCL suffix (SLOPE_RCL). Returns None when the name has
+    no known source, so non conforming files are never selected.
+    """
+    if info["source"] is None:
+        return None
+    token = info["product"] or info["source"]
+    if info["reclass"]:
+        token = token + "_" + RECLASS_SUFFIX
+    return token
 
 
 def _as_class_id(value):
@@ -409,7 +425,8 @@ class Toolbox(object):
         # Tool labels are numbered so they sort in pipeline order at the toolbox root
         # (no toolset categories): 01 Build Mosaics by Polygon, 02 Generate Surfaces,
         # 03 Solar Radiation, 04 Reclassify Slope and Aspect.
-        self.tools = [BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation, ReclassifyFactor]
+        self.tools = [BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation, ReclassifyFactor,
+                      Resample]
 
 
 # ===========================================================================
@@ -453,21 +470,65 @@ def _is_data_folder(folder):
     return False
 
 
-def _gather_product_tiles(folders, product_prefix):
+def _parse_tile_resolution(filename):
+    """Resolution token from a DGT tile name, or None.
+
+    DGT tiles are named like 'MDT-2m-<code>-MM-YYYY.tif' or 'MDS-50cm-...tif'; the token
+    is the segment after the product code (here '2m' or '50cm'), returned as written (the
+    product code match is case insensitive). Returns None when the name does not have the
+    'MD[TS]-<token>-...' shape, so non DGT or unlabeled names are left alone.
+    """
+    if not filename:
+        return None
+    parts = filename.split("-")
+    if len(parts) < 3 or parts[0].upper() not in ("MDT", "MDS"):
+        return None
+    token = parts[1].strip()
+    return token or None
+
+
+def _choose_resolution(tokens, requested):
+    """Decide which resolution token a mosaic should use.
+
+    `tokens` is the set of distinct resolution tokens (case folded) found among an area's
+    tiles, `requested` is the user's Tile resolution value or None for auto. Returns the
+    chosen token (lower case) or None, where None means no token filter (use every tile,
+    for unlabeled data). Fails loud in auto mode when tiles span more than one resolution,
+    so a mosaic never mixes cell sizes.
+    """
+    if requested:
+        return requested.strip().lower()
+    found = sorted(t for t in tokens if t)
+    if len(found) > 1:
+        raise ValueError("Tiles span more than one resolution ({}). Set the Tile "
+                         "resolution parameter to choose one.".format(", ".join(found)))
+    return found[0] if found else None
+
+
+def _gather_product_tiles(folders, product_prefix, resolution=None):
     """Collect the .tif tiles for one product across an area's download folders.
 
-    product_prefix is "MDT" (DEM) or "MDS" (DSM). Recurses each folder, keeps files
-    whose name starts with product_prefix (case insensitive), and dedups by file name
-    (adjacent AOIs of the same area share tiles, the tile code identifies them).
-    Returns (paths, tile_sr). Returns ([], None) if no tile matches.
+    product_prefix is "MDT" (DEM) or "MDS" (DSM). Recurses each folder, keeps files whose
+    name starts with product_prefix (case insensitive), and dedups by file name (adjacent
+    AOIs of the same area share tiles, the tile code identifies them). Returns
+    (paths, tile_sr, cell_size, resolution_used); returns ([], None, None, None) if no tile
+    matches.
 
-    CRS is validated once per folder (tiles within a DGT download are homogeneous):
-    fail loud on a geographic, undefined, or mixed CRS across the area's folders.
+    Resolution: tiles carry a token in the name (MDT-2m-..., MDS-50cm-...). If `resolution`
+    is given, only tiles with that token are kept (case insensitive). If it is None, the
+    token is auto-detected and tiles of more than one resolution fail loud, so a mosaic
+    never mixes cell sizes.
+
+    Validated per folder (tiles within a DGT download are homogeneous): fail loud on a
+    geographic, undefined, or mixed CRS, and, on the selected tiles, on a mixed cell size
+    across the area's folders.
     """
     seen = set()
-    paths = []
+    per_folder = []        # list of [(token, path), ...], one entry per folder
+    tokens = set()
     ref_sr = None
     for folder in folders:
+        folder_tiles = []
         folder_checked = False
         for dirpath, _dirnames, filenames in os.walk(folder):
             for fn in filenames:
@@ -494,7 +555,7 @@ def _gather_product_tiles(folders, product_prefix):
                             _warn("Tiles are EPSG:{} ('{}'), not the project EPSG:{}. Proceeding.".format(
                                 sr.factoryCode, sr.name, PROJECT_EPSG))
                     elif not _same_crs(ref_sr, sr):
-                        msg = ("Tile '{}' CRS ({}) differs from the others ({}). All tiles of a "
+                        msg = ("Tile '{}' CRS ({}) differs from the others ({}). All tiles of an "
                                "area must share one projected CRS.").format(
                                    path, _crs_label(sr), _crs_label(ref_sr))
                         _err(msg)
@@ -502,8 +563,39 @@ def _gather_product_tiles(folders, product_prefix):
                 if fn in seen:
                     continue
                 seen.add(fn)
-                paths.append(path)
-    return paths, ref_sr
+                token = _parse_tile_resolution(fn)
+                if token:
+                    tokens.add(token.lower())
+                folder_tiles.append((token, path))
+        per_folder.append(folder_tiles)
+
+    try:
+        chosen = _choose_resolution(tokens, resolution)
+    except ValueError as exc:
+        msg = "{} (product {}).".format(exc, product_prefix)
+        _err(msg)
+        raise ValueError(msg)
+
+    # Keep the chosen resolution, then validate cell size on the selected tiles only,
+    # sampling the first selected tile of each folder (cheap, mirrors the CRS check). Doing
+    # this after the filter is what lets two resolutions coexist when one is requested.
+    paths = []
+    ref_cell = None
+    for folder_tiles in per_folder:
+        selected = [p for t, p in folder_tiles
+                    if chosen is None or (t and t.lower() == chosen)]
+        if not selected:
+            continue
+        cell = float(arcpy.Describe(selected[0]).meanCellWidth)
+        if ref_cell is None:
+            ref_cell = cell
+        elif abs(cell - ref_cell) > 1e-6:
+            msg = ("Selected tiles span more than one cell size ({:g} m and {:g} m). All "
+                   "tiles of an area must share one cell size.").format(ref_cell, cell)
+            _err(msg)
+            raise ValueError(msg)
+        paths.extend(selected)
+    return paths, ref_sr, ref_cell, chosen
 
 
 def _folder_extent_polygon(folder, sr):
@@ -607,8 +699,12 @@ class BuildMosaicsByPolygon(object):
             displayName="Folder name prefix (leave blank to find the data automatically)", name="folder_prefix",
             datatype="GPString", parameterType="Optional", direction="Input")
 
+        p_res = arcpy.Parameter(
+            displayName="Tile resolution (leave blank to auto-detect, e.g. 2m or 50cm)", name="tile_resolution",
+            datatype="GPString", parameterType="Optional", direction="Input")
+
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
-                p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix]
+                p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res]
 
     def isLicensed(self):
         # Uses core Mosaic To New Raster, no Spatial Analyst needed.
@@ -633,6 +729,7 @@ class BuildMosaicsByPolygon(object):
         skip_incomplete = bool(parameters[9].value)
         verify_extent = bool(parameters[10].value)
         folder_prefix = parameters[11].valueAsText
+        tile_resolution = (parameters[12].valueAsText or "").strip() or None
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -748,12 +845,13 @@ class BuildMosaicsByPolygon(object):
 
             # Gather tiles per product first. This validates the tile CRS (fail loud) and
             # yields the tile spatial reference used by the extent check and the mosaic.
-            gathered = {}              # source -> (tiles, tile_sr)
+            gathered = {}              # source -> (tiles, tile_sr, cell, resolution)
             ref_tile_sr = None
-            for source, prefix in products:
-                tiles, sr = _gather_product_tiles(present_folders, prefix)
+            for source, product_prefix in products:
+                tiles, sr, cell, res_used = _gather_product_tiles(
+                    present_folders, product_prefix, tile_resolution)
                 if tiles:
-                    gathered[source] = (tiles, sr)
+                    gathered[source] = (tiles, sr, cell, res_used)
                     if ref_tile_sr is None:
                         ref_tile_sr = sr
             if not gathered:
@@ -794,7 +892,7 @@ class BuildMosaicsByPolygon(object):
 
             created_here = 0
             existing_here = 0
-            for source, (tiles, sr) in gathered.items():
+            for source, (tiles, sr, cell, res_used) in gathered.items():
                 out_name = build_output_name(final_area, source) + ".tif"
                 location = out_folder
                 if output_structure == "per_area_subfolder":
@@ -820,8 +918,9 @@ class BuildMosaicsByPolygon(object):
                     number_of_bands=1,
                     mosaic_method=mosaic_method,
                 )
-                _msg("Area '{}' ({}): mosaicked {} tiles from {} folder(s) -> {}".format(
-                    final_area, source, len(tiles), len(present_folders), out_name))
+                size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
+                _msg("Area '{}' ({}): mosaicked {} tiles ({}) from {} folder(s) -> {}".format(
+                    final_area, source, len(tiles), size_label, len(present_folders), out_name))
                 created_here += 1
 
             created_count += created_here
@@ -1621,6 +1720,155 @@ class SolarRadiation(object):
         return
 
 
+class Resample(object):
+    def __init__(self):
+        self.label = "05 - Resample"
+        self.description = ("Resample the named factor rasters (mosaics and surfaces) to a target "
+                            "cell size, in batch, selecting which data types to process. Outputs go "
+                            "to a 'Resample' folder inside the results root, grouped by area, with the "
+                            "file names unchanged. Continuous rasters use bilinear; reclassified "
+                            "(_RCL) rasters use nearest so the ordinal classes are preserved.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Results folder (a 'Resample' subfolder is created here)", name="in_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_types = arcpy.Parameter(
+            displayName="Data types to resample", name="types",
+            datatype="GPString", parameterType="Required", direction="Input", multiValue=True)
+        p_types.filter.type = "ValueList"
+        p_types.filter.list = ["DEM", "DSM", "SLOPE", "ASPECT", "HILLSHADE", "PROFC",
+                               "PLANC", "SOLAR", "SLOPE_RCL", "ASPECT_RCL"]
+        p_types.value = ["DEM", "DSM"]
+
+        p_cell = arcpy.Parameter(
+            displayName="Target cell size (meters)", name="target_cell_size",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_cell.value = 10
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_in, p_recurse, p_types, p_cell, p_overwrite]
+
+    def isLicensed(self):
+        # Core Data Management Resample, no extension needed.
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        if parameters[3].value is not None and float(parameters[3].value) <= 0:
+            parameters[3].setErrorMessage("Target cell size must be a positive number of meters.")
+        return
+
+    def execute(self, parameters, messages):
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        selected = set(str(s).upper() for s in (parameters[2].values or []))
+        target_cell = float(parameters[3].value)
+        overwrite_existing = bool(parameters[4].value)
+
+        arcpy.env.overwriteOutput = overwrite_existing
+
+        if target_cell <= 0:
+            msg = "Target cell size must be a positive number of meters."
+            _err(msg)
+            raise ValueError(msg)
+        if not selected:
+            msg = "Select at least one data type to resample."
+            _err(msg)
+            raise ValueError(msg)
+
+        out_root = os.path.join(in_folder, RESAMPLE_DIRNAME)
+
+        # Discover the named rasters of the selected types, never descending into the Resample
+        # output folder so a re-run does not resample its own outputs.
+        rasters = []
+        if recurse:
+            walker = os.walk(in_folder)
+        else:
+            only_files = [n for n in os.listdir(in_folder)
+                          if os.path.isfile(os.path.join(in_folder, n))]
+            walker = [(in_folder, [], only_files)]
+        for dirpath, dirs, files in walker:
+            dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
+            for fn in files:
+                if not fn.lower().endswith(".tif"):
+                    continue
+                info = parse_source_and_product(fn)
+                token = _resample_type_token(info)
+                if token is None or token not in selected:
+                    continue
+                rasters.append((os.path.join(dirpath, fn), info, token))
+
+        if not rasters:
+            msg = "No rasters of the selected types ({}) found in '{}'.".format(
+                ", ".join(sorted(selected)), in_folder)
+            _err(msg)
+            raise ValueError(msg)
+
+        _msg("Resampling {} raster(s) to {:g} m into '{}'.".format(len(rasters), target_cell, out_root))
+        total = len(rasters)
+        created = 0
+        skipped_existing = 0
+        skipped_native = 0
+        failed = []
+        arcpy.SetProgressor("step", "Resampling rasters...", 0, total, 1)
+        for path, info, token in rasters:
+            arcpy.SetProgressorPosition()
+            area = info["area"]
+            fn = os.path.basename(path)
+            location = os.path.join(out_root, area)
+            if not os.path.isdir(location):
+                os.makedirs(location)
+            out_path = os.path.join(location, fn)
+
+            if os.path.exists(out_path) and not overwrite_existing:
+                _msg("{} ({}): {} exists, skipping.".format(area, token, fn))
+                skipped_existing += 1
+                continue
+
+            try:
+                src = arcpy.Raster(path)
+                native = src.meanCellWidth
+                sr = src.spatialReference
+                if abs(native - target_cell) <= 1e-6:
+                    _msg("{} ({}): already at {:g} m, skipping.".format(area, token, native))
+                    skipped_native += 1
+                    continue
+                if target_cell < native:
+                    _warn("{} ({}): target {:g} m is finer than native {:g} m; upsampling adds no "
+                          "real detail.".format(area, token, target_cell, native))
+                method = "NEAREST" if info["reclass"] else "BILINEAR"
+                arcpy.management.Resample(path, out_path, "{0} {0}".format(target_cell), method)
+                _msg("{} ({}): resampled {:g} m -> {:g} m ({}, {}) -> {}".format(
+                    area, token, native, target_cell, method, _crs_label(sr), fn))
+                created += 1
+            except Exception as exc:
+                _err("{} ({}): resample failed: {}".format(area, token, exc))
+                failed.append("{} ({})".format(area, token))
+
+        arcpy.ResetProgressor()
+        _msg("Done. Selected rasters: {}. Resampled: {}. Skipped (existing: {}, already at target: {}). "
+             "Failed: {}.".format(total, created, skipped_existing, skipped_native, len(failed)))
+        if failed:
+            msg = "Resample failed for: " + ", ".join(failed)
+            _err(msg)
+            raise RuntimeError(msg)
+        return
+
+
 # ===========================================================================
 # Self tests (pure functions; numpy tests run only if numpy is importable).
 # Run: python LidarTerrainToolbox.pyt
@@ -1734,6 +1982,44 @@ def _run_self_tests():
                  lambda: detect_folder_prefix(["a_7", "b_8"]))
     check_raises("no trailing number raises",
                  lambda: detect_folder_prefix(["nodigits", "also_none"]))
+
+    print("_parse_tile_resolution")
+    check("2m token from a DGT name",
+          _parse_tile_resolution("MDT-2m-152470-07-2025_v01.tif") == "2m")
+    check("50cm token from a DGT name",
+          _parse_tile_resolution("MDS-50cm-152470-07-2025_v01.tif") == "50cm")
+    check("product code is case insensitive, token kept as written",
+          _parse_tile_resolution("mdt-2M-1-2-3.tif") == "2M")
+    check("dotted token kept",
+          _parse_tile_resolution("MDT-0.5m-1-2-3.tif") == "0.5m")
+    check("non DGT name yields None",
+          _parse_tile_resolution("hillshade.tif") is None)
+    check("too few segments yields None",
+          _parse_tile_resolution("MDT-2m.tif") is None)
+    check("empty name yields None",
+          _parse_tile_resolution("") is None)
+
+    print("_choose_resolution")
+    check("single token auto-detected",
+          _choose_resolution({"2m"}, None) == "2m")
+    check("no tokens means no filter",
+          _choose_resolution(set(), None) is None)
+    check("explicit request wins and is lowercased",
+          _choose_resolution({"2m", "50cm"}, "2M") == "2m")
+    check_raises("auto mode raises on mixed resolutions",
+                 lambda: _choose_resolution({"2m", "50cm"}, None))
+
+    print("_resample_type_token")
+    check("base mosaic source token",
+          _resample_type_token(parse_source_and_product("AreaA_DEM.tif")) == "DEM")
+    check("surface product token",
+          _resample_type_token(parse_source_and_product("AreaA_DEM_SLOPE.tif")) == "SLOPE")
+    check("reclassified token gets _RCL",
+          _resample_type_token(parse_source_and_product("AreaA_DEM_ASPECT_RCL.tif")) == "ASPECT_RCL")
+    check("solar product token",
+          _resample_type_token(parse_source_and_product("AreaA_DEM_SOLAR.tif")) == "SOLAR")
+    check("non conforming name yields None",
+          _resample_type_token(parse_source_and_product("random_file.tif")) is None)
 
     print("reclassify_array")
     try:
