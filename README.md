@@ -25,7 +25,7 @@ Three tools form a pipeline, run in order, with the input and output folders alw
 
 1. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per mining area, from the DGT LiDAR download folders.
 2. **Generate Surfaces**: slope, aspect, hillshade and curvature (profile and plan) from each mosaic.
-3. **Solar Radiation**: annual incoming solar radiation (global, kWh/m2) per mina, computed on the DEM with RasterSolarRadiation (GPU).
+3. **Solar Radiation**: annual incoming solar radiation (global, kWh/m2) per area, computed on the DEM with RasterSolarRadiation (GPU).
 4. **Reclassify Slope and Aspect**: ordinal integer classes for slope and aspect, defined in a value table.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
@@ -35,24 +35,35 @@ Every output is named by a single, consistent convention (see [Naming convention
 ## Method
 
 ```mermaid
-flowchart LR
-    AOI["AOI polygons<br/>Mina name + FID"] --> T1["Tool 1<br/>Build Mosaics By Polygon"]
-    LID["DGT LiDAR folders<br/>..._&lt;FID&gt; with MDT (DEM) and MDS (DSM)"] --> T1
-    T1 --> M["Per mina mosaics<br/>Mina_DEM.tif / Mina_DSM.tif"]
+flowchart TD
+    AOI["AOI polygons<br/>Area name + FID"]
+    LID["DGT LiDAR folders<br/>..._&lt;FID&gt; with MDT (DEM) and MDS (DSM)"]
+    AOI --> T1
+    LID --> T1
+    T1["Tool 1<br/>Build Mosaics by Polygon"]
+    T1 --> M["Per area mosaics<br/>Area_DEM.tif / Area_DSM.tif"]
     M --> T2["Tool 2<br/>Generate Surfaces"]
     M --> T3["Tool 3<br/>Solar Radiation"]
     T2 --> S["Surfaces<br/>SLOPE, ASPECT, HILLSHADE, PROFC, PLANC"]
-    T3 --> SOL["Solar<br/>Mina_DEM_SOLAR.tif (kWh/m2)"]
+    T3 --> SOL["Area_DEM_SOLAR.tif<br/>(kWh/m2)"]
     S --> T4["Tool 4<br/>Reclassify Slope and Aspect"]
-    T4 --> R["Ordinal factors<br/>Mina_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
-    R --> EXT["External, not in this toolbox:<br/>weighted overlay, REN/RAN/PDM exclusions"]
+    T4 --> RCL["Ordinal factors<br/>Area_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
+    RCL --> EXT["External, not in this toolbox<br/>weighted overlay, REN/RAN/PDM exclusions"]
+    SOL --> EXT
+
+    classDef tool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff;
+    classDef data fill:#eaf2ff,stroke:#1f6feb,color:#0b2a5b;
+    classDef ext fill:#f5f5f5,stroke:#999999,color:#333333,stroke-dasharray:4 3;
+    class T1,T2,T3,T4 tool;
+    class AOI,LID,M,S,SOL,RCL data;
+    class EXT ext;
 ```
 
 - The DGT LiDAR arrives pre-split into one download folder per area of interest, where the folder name ends in the AOI feature FID and holds the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. The 5 km buffer selection was already applied at download time.
-- **Tool 1** groups AOI features by mina name (the folder number equals the feature FID), merges each mina's MDT and MDS tiles across all of its folders into one DEM and one DSM mosaic, and deduplicates tiles by name. It optionally verifies, per folder, that the tile extent contains the AOI polygon centroid (a guard against a wrong FID mapping).
+- **Tool 1** groups AOI features by area name (the folder number equals the feature FID), merges each area's MDT and MDS tiles across all of its folders into one DEM and one DSM mosaic, and deduplicates tiles by name. It optionally verifies, per folder, that the tile extent contains the AOI polygon centroid (a guard against a wrong FID mapping).
 - **Tool 2** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
 - **Tool 3** computes annual global solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated). The DEM is resampled to a coarser solar cell size first (default 10 m) because annual insolation is a smooth field, which keeps the heavy whole year run tractable.
-- **Tool 3** reclassifies slope and aspect into ordinal integer classes using `[min, max)` semantics (the last class inclusive at the top), implemented in numpy for deterministic boundaries. The value table validation fails loud on gaps and on overlaps between different class ids before anything is written.
+- **Tool 4** reclassifies slope and aspect into ordinal integer classes using `[min, max)` semantics (the last class inclusive at the top), implemented in numpy for deterministic boundaries. The value table validation fails loud on gaps and on overlaps between different class ids before anything is written.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent check.
 
 ---
@@ -69,7 +80,7 @@ flowchart LR
 
 ## Installation
 
-1. In *Catalog*, right-click a folder, choose **Add Toolbox**, and select `MiningTerrainToolbox.pyt`.
+1. In *Catalog*, right-click a folder, choose **Add Toolbox**, and select `LidarTerrainToolbox.pyt`.
 2. The tools appear at the root of the **LiDAR Terrain Toolbox**, with numbered labels (01, 02, ...) so they run in pipeline order.
 
 No installation beyond *Add Toolbox*: the script runs on the Python bundled with ArcGIS Pro. To remove it, right-click the toolbox in *Catalog* and choose *Remove*.
@@ -82,21 +93,21 @@ Run the tools in order. Each tool takes its input from the previous tool's outpu
 
 ### Tool 1, Build Mosaics By Polygon
 
-One DEM and one DSM mosaic per mina, merging all of that mina's download folders.
+One DEM and one DSM mosaic per area, merging all of that area's download folders.
 
 | Parameter | Description |
 | --- | --- |
-| AOI layer | Polygon layer whose FID numbers the download folders. Carries the `Mina` name field. |
-| Mina name field | Field that names the output (sanitized: accents and special characters removed). |
+| AOI layer | Polygon layer whose FID numbers the download folders. Carries the `Area` name field. |
+| Area name field | Field that names the output (sanitized: accents and special characters removed). |
 | LiDAR root folder | Folder that contains the `..._<FID>` download folders. |
 | Output folder | Where the mosaics are written. |
-| Output structure | `per_mina_subfolder` (default) or `flat`. |
+| Output structure | `per_area_subfolder` (default) or `flat`. |
 | Products | `BOTH` (default), `DEM`, or `DSM`. |
 | Pixel type | Default `32_BIT_FLOAT` (DGT LiDAR is float). |
 | Mosaic method | For overlaps; `FIRST` recommended for contiguous tiles. |
 | Overwrite existing outputs | Off skips existing mosaics. |
-| Skip minas with missing folders | On (default) skips minas whose folders are not all present yet. |
-| Verify folder extent against AOI polygon | On (default) checks each folder maps to the right mina. |
+| Skip areas with missing folders | On (default) skips areas whose folders are not all present yet. |
+| Verify folder extent against AOI polygon | On (default) checks each folder maps to the right area. |
 | Folder name prefix | Optional. Leave blank to auto-detect the prefix from the data folders. |
 
 ### Tool 2, Generate Surfaces
@@ -106,9 +117,9 @@ Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox 
 | Parameter | Description |
 | --- | --- |
 | Input mosaics folder | The Tool 1 output. |
-| Recurse subfolders | On (default) finds the `per_mina_subfolder` layout. |
-| Output structure | `same_as_input` (default; each surface is written next to its input mosaic), `per_mina_subfolder`, or `flat`. |
-| Output folder | Only for `per_mina_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
+| Recurse subfolders | On (default) finds the `per_area_subfolder` layout. |
+| Output structure | `same_as_input` (default; each surface is written next to its input mosaic), `per_area_subfolder`, or `flat`. |
+| Output folder | Only for `per_area_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
 | Source | `BOTH` (default), `DEM`, or `DSM`. |
 | Slope, Aspect, Hillshade, Profile curvature, Plan curvature | One checkbox each. |
 | Z factor | Default 1 (project is metric). |
@@ -118,7 +129,7 @@ Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox 
 
 ### Tool 3, Solar Radiation
 
-Annual incoming solar radiation (global, kWh/m2) per mina, with `RasterSolarRadiation` (GPU when available). This is the heavy tool; expect long run times. The DEM is resampled to a coarser solar cell size first, since annual insolation is a smooth field.
+Annual incoming solar radiation (global, kWh/m2) per area, with `RasterSolarRadiation` (GPU when available). This is the heavy tool; expect long run times. The DEM is resampled to a coarser solar cell size first, since annual insolation is a smooth field.
 
 | Parameter | Description |
 | --- | --- |
@@ -144,8 +155,8 @@ Ordinal classes for slope and aspect, from a value table.
 | Factor to process | `BOTH` (default), `SLOPE`, or `ASPECT`. |
 | Slope classes, Aspect classes | Value tables of `class_id`, `min`, `max`. `[min, max)`, last class inclusive at the top. |
 | Flat class value | Optional. Class for the Aspect Flat (-1). |
-| Output structure | `same_as_input` (default; each reclassified raster is written next to its input), `per_mina_subfolder`, or `flat`. |
-| Output folder | Only for `per_mina_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
+| Output structure | `same_as_input` (default; each reclassified raster is written next to its input), `per_area_subfolder`, or `flat`. |
+| Output folder | Only for `per_area_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
 | Unmapped values to NoData | On (default). Off makes any cell outside all classes a fail loud error. |
 | Overwrite existing outputs | Off skips existing reclassified rasters. |
 
@@ -157,11 +168,11 @@ The value table allows the **same `class_id` on multiple rows**, which supports 
 
 A single convention links the three tools:
 
-- Mosaic: `{Mina}_{SOURCE}` where SOURCE is `DEM` or `DSM`.
-- Surface: `{Mina}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE`, `ASPECT`, `HILLSHADE`, `PROFC`, `PLANC` or `SOLAR`.
+- Mosaic: `{Area}_{SOURCE}` where SOURCE is `DEM` or `DSM`.
+- Surface: `{Area}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE`, `ASPECT`, `HILLSHADE`, `PROFC`, `PLANC` or `SOLAR`.
 - Reclassified: the surface name plus `_RCL`.
 
-The `.tif` extension is added on write. Mina names are sanitized for ArcGIS and the file system (accents and c cedilla folded to ASCII, separators to underscore). If two different minas sanitize to the same name they get a numeric suffix; several AOI polygons of the **same** mina are merged into one output.
+The `.tif` extension is added on write. Area names are sanitized for ArcGIS and the file system (accents and c cedilla folded to ASCII, separators to underscore). If two different areas sanitize to the same name they get a numeric suffix; several AOI polygons of the **same** area are merged into one output.
 
 | Stage | Example output |
 | --- | --- |
@@ -173,21 +184,21 @@ The `.tif` extension is added on write. Mina names are sanitized for ArcGIS and 
 
 ## Example
 
-A real Tool 1 run over 22 selected AOI features (the AOI layer was in EPSG:102164 and was projected only for the extent check; the mosaics inherit the tiles CRS, EPSG:3763). The 22 features resolved to 21 minas, because one mina (`Cortes Pereira`) has two AOI polygons that were merged into a single output.
+A real Tool 1 run over 22 selected AOI features (the AOI layer was in EPSG:102164 and was projected only for the extent check; the mosaics inherit the tiles CRS, EPSG:3763). The 22 features resolved to 21 areas, because one area (`Cortes Pereira`) has two AOI polygons that were merged into a single output.
 
 Abbreviated geoprocessing log:
 
 ```text
 AOI layer CRS: EPSG:102164.
 AOI layer is EPSG:102164, not the project EPSG:3763. Polygons are projected for the extent check only.
-Sanitized mina name 'Defesa das Mercês' to 'Defesa_das_Merces'.
-Sanitized mina name 'Preguiça' to 'Preguica'.
-Mina 'Alcaria_Queimada' (DEM): mosaicked 112 tiles from 1 folder(s) -> Alcaria_Queimada_DEM.tif
-Mina 'Alcaria_Queimada' (DSM): mosaicked 112 tiles from 1 folder(s) -> Alcaria_Queimada_DSM.tif
-Mina 'Cortes_Pereira' (DEM): mosaicked 95 tiles from 2 folder(s) -> Cortes_Pereira_DEM.tif
-Mina 'Cortes_Pereira' (DSM): mosaicked 95 tiles from 2 folder(s) -> Cortes_Pereira_DSM.tif
+Sanitized area name 'Defesa das Mercês' to 'Defesa_das_Merces'.
+Sanitized area name 'Preguiça' to 'Preguica'.
+Area 'Alcaria_Queimada' (DEM): mosaicked 112 tiles from 1 folder(s) -> Alcaria_Queimada_DEM.tif
+Area 'Alcaria_Queimada' (DSM): mosaicked 112 tiles from 1 folder(s) -> Alcaria_Queimada_DSM.tif
+Area 'Cortes_Pereira' (DEM): mosaicked 95 tiles from 2 folder(s) -> Cortes_Pereira_DEM.tif
+Area 'Cortes_Pereira' (DSM): mosaicked 95 tiles from 2 folder(s) -> Cortes_Pereira_DSM.tif
 ...
-Done. Minas: 21. Built now: 21. Already present: 0. Mosaics created: 42. Skipped (no data: 0, incomplete: 0, no tiles: 0, extent mismatch: 0).
+Done. Areas: 21. Built now: 21. Already present: 0. Mosaics created: 42. Skipped (no data: 0, incomplete: 0, no tiles: 0, extent mismatch: 0).
 ```
 
 You then point Tool 2 at this output folder to derive the surfaces, and Tool 3 at the Tool 2 output to reclassify slope and aspect.
@@ -199,10 +210,10 @@ You then point Tool 2 at this output folder to derive the surfaces, and Tool 3 a
 The shared helpers have pure unit tests inside the toolbox file, runnable outside ArcGIS:
 
 ```text
-python MiningTerrainToolbox.pyt
+python LidarTerrainToolbox.pyt
 ```
 
-This exercises name sanitization and collision handling, the output name build and parse round trip, the value table validation (gaps, overlaps, repeated class id), the mina grouping, the folder prefix auto-detection, the VRT extent parsing, and the numpy reclassification logic (the numpy tests are skipped if numpy is not installed in the Python being used). Under ArcGIS Pro the test block does not run; ArcGIS imports the module, it does not execute it as a script.
+This exercises name sanitization and collision handling, the output name build and parse round trip, the value table validation (gaps, overlaps, repeated class id), the area grouping, the folder prefix auto-detection, the VRT extent parsing, and the numpy reclassification logic (the numpy tests are skipped if numpy is not installed in the Python being used). Under ArcGIS Pro the test block does not run; ArcGIS imports the module, it does not execute it as a script.
 
 ---
 
@@ -212,8 +223,8 @@ This exercises name sanitization and collision handling, the output name build a
 | --- | --- | --- |
 | `No LiDAR data folders ... found` | LiDAR root does not contain folders with `MDT*`/`MDS*` | Point at the folder that contains the `..._<FID>` download folders. |
 | `Cannot auto-detect a folder prefix ...` | Folder names are inconsistent or have no trailing FID number | Set the folder prefix explicitly. |
-| `... missing folders for FIDs ...` (skipped) | A mina's download folders are not all present yet | Re-run after the download finishes (keep Skip incomplete on). |
-| `... does not contain its AOI polygon centroid` | A folder likely maps to the wrong mina | Check the FID to folder mapping, or turn the extent check off to isolate. |
+| `... missing folders for FIDs ...` (skipped) | An area's download folders are not all present yet | Re-run after the download finishes (keep Skip incomplete on). |
+| `... does not contain its AOI polygon centroid` | A folder likely maps to the wrong area | Check the FID to folder mapping, or turn the extent check off to isolate. |
 | `Spatial Analyst extension is not available` | Tool 2 has no Spatial Analyst license | Enable Spatial Analyst in *Project > Licensing*. |
 | `Multidirectional hillshade needs the Image Analyst extension` | Tool 2 multidirectional without Image Analyst | Enable Image Analyst, or choose Traditional, or turn hillshade off. |
 | `Gap in coverage between ...` / `Overlap between different classes ...` | Tool 3 value table is not a clean tiling | Fix the class intervals so they tile the range with no holes or cross class overlaps. |
@@ -226,7 +237,7 @@ This exercises name sanitization and collision handling, the output name build a
 - **The ordinal scale is not harmonized between factors.** You define arbitrary intervals per factor; only slope and aspect are reclassified. Harmonizing the classes for a weighted overlay is the downstream MCDA step, outside this toolbox. *Document this for whoever consumes the outputs, to avoid misuse.*
 - **Weighted overlay and the REN/RAN/PDM exclusions are external** and are not part of this toolbox.
 - **Folder layout assumption (Tool 1):** the download folder number must equal the AOI feature FID (0 based shapefile FID). Loading the AOI as a geodatabase feature class (1 based OBJECTID) can shift the mapping; the tool warns when the OID field is not `FID`.
-- **Memory (Tool 3):** each factor raster is read into memory for the numpy reclassification. The per mina extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
+- **Memory (Tool 3):** each factor raster is read into memory for the numpy reclassification. The per area extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
 - **Datum reprojection:** `projectAs` uses the default transformation. Where no default geographic transformation exists between datums it may need to be specified; unlikely in mainland Portugal.
 - **Aspect Flat:** aspect uses -1 for flat. In Tool 3 the optional flat class wins over any class interval that happens to contain -1.
 

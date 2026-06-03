@@ -33,7 +33,7 @@ removes the fragile sys.path import of a separate helpers module):
   - pure unit tests in the __main__ block
 
 Run the pure tests outside ArcGIS with:
-    python MiningTerrainToolbox.pyt
+    python LidarTerrainToolbox.pyt
 Under ArcGIS the __main__ block never runs (ArcGIS imports the module, it does not
 execute it as a script).
 """
@@ -88,7 +88,7 @@ def _err(text):
 # ===========================================================================
 
 def sanitize_name(raw_name):
-    """Convert a Mina attribute value into a name safe for ArcGIS and the file system.
+    """Convert an Area attribute value into a name safe for ArcGIS and the file system.
 
     Steps (per spec 3.1):
       1. NFD normalize and drop combining marks (handles accents; c cedilha becomes c).
@@ -104,7 +104,7 @@ def sanitize_name(raw_name):
     Raises ValueError (fail loud) if the result is empty.
     """
     if raw_name is None:
-        raise ValueError("Mina name is None. Cannot build an output name.")
+        raise ValueError("Area name is None. Cannot build an output name.")
     original = str(raw_name)
 
     s = unicodedata.normalize("NFD", original)
@@ -114,7 +114,7 @@ def sanitize_name(raw_name):
     s = re.sub(r"_+", "_", s).strip("_")             # collapse and trim underscores
 
     if not s:
-        msg = "Mina name '{}' sanitizes to an empty string. Provide a usable name.".format(original)
+        msg = "Area name '{}' sanitizes to an empty string. Provide a usable name.".format(original)
         _err(msg)
         raise ValueError(msg)
 
@@ -124,7 +124,7 @@ def sanitize_name(raw_name):
         s = s[:MAX_NAME_LEN].strip("_")
 
     if s != original:
-        _msg("Sanitized mina name '{}' to '{}'.".format(original, s))
+        _msg("Sanitized area name '{}' to '{}'.".format(original, s))
     return s
 
 
@@ -142,12 +142,12 @@ def dedupe_name(base, used):
     return "{}_{}".format(base, i)
 
 
-def build_output_name(mina, source, product=None, reclass=False):
-    """Centralize the naming convention (spec 3.4). `mina` must already be sanitized.
+def build_output_name(area, source, product=None, reclass=False):
+    """Centralize the naming convention (spec 3.4). `area` must already be sanitized.
 
-    Mosaic:        {Mina}_{SOURCE}                  e.g. MinaA_DEM
-    Surface:       {Mina}_{SOURCE}_{PRODUCT}        e.g. MinaA_DEM_SLOPE
-    Reclassified:  {Mina}_{SOURCE}_{PRODUCT}_RCL    e.g. MinaA_DEM_SLOPE_RCL
+    Mosaic:        {Area}_{SOURCE}                  e.g. AreaA_DEM
+    Surface:       {Area}_{SOURCE}_{PRODUCT}        e.g. AreaA_DEM_SLOPE
+    Reclassified:  {Area}_{SOURCE}_{PRODUCT}_RCL    e.g. AreaA_DEM_SLOPE_RCL
 
     The .tif extension is added on write, not here.
     """
@@ -155,7 +155,7 @@ def build_output_name(mina, source, product=None, reclass=False):
     if source not in SOURCES:
         raise ValueError("Unknown source '{}'. Expected one of {}.".format(source, SOURCES))
 
-    parts = [mina, source]
+    parts = [area, source]
     if product is not None:
         product = product.upper()
         if product not in PRODUCTS:
@@ -172,10 +172,10 @@ def build_output_name(mina, source, product=None, reclass=False):
 
 def parse_source_and_product(filename):
     """Inverse of build_output_name (spec 3.5). Returns a dict with keys
-    mina, source, product, reclass.
+    area, source, product, reclass.
 
     Parses right to left against the closed SOURCES and PRODUCTS sets. This is
-    deliberate: sanitize_name collapses spaces into underscores, so a mina name
+    deliberate: sanitize_name collapses spaces into underscores, so an area name
     can itself contain underscores (for example Sao_Domingos). A left to right
     split would be ambiguous; anchoring on the rightmost known tokens is robust,
     because build_output_name always appends the real source last.
@@ -183,7 +183,7 @@ def parse_source_and_product(filename):
     Matching is case sensitive (canonical), since build_output_name emits uppercase
     tokens. For a name that does not follow the convention, source comes back as
     None. Callers decide conformance on source is None (a valid mosaic or surface
-    always has a source), not on mina.
+    always has a source), not on area.
     """
     base = os.path.basename(filename)
     stem = base[:-4] if base.lower().endswith(".tif") else base
@@ -191,7 +191,7 @@ def parse_source_and_product(filename):
 
     # Canonical, case sensitive matching. build_output_name only ever emits
     # uppercase SOURCE/PRODUCT/RCL tokens, so exact matching keeps the round trip
-    # exact and stops a mina name that merely ends in a lower or mixed case word
+    # exact and stops an area name that merely ends in a lower or mixed case word
     # (for example "Vale_Dem") from being mistaken for a real token.
     reclass = False
     if tokens and tokens[-1] == RECLASS_SUFFIX:
@@ -208,10 +208,10 @@ def parse_source_and_product(filename):
         source = tokens[-1]
         tokens = tokens[:-1]
 
-    mina = "_".join(tokens) if tokens else None
-    if not mina:
-        mina = None                                  # normalize "" (junk input) to None
-    return {"mina": mina, "source": source, "product": product, "reclass": reclass}
+    area = "_".join(tokens) if tokens else None
+    if not area:
+        area = None                                  # normalize "" (junk input) to None
+    return {"area": area, "source": source, "product": product, "reclass": reclass}
 
 
 def _as_class_id(value):
@@ -291,18 +291,18 @@ def validate_value_table(rows):
     return ordered
 
 
-def build_mina_groups(rows):
-    """Group AOI features by mina so each mina yields one output.
+def build_area_groups(rows):
+    """Group AOI features by area so each area yields one output.
 
-    `rows` is an iterable of (fid, raw_mina). A mina can have several AOI polygons,
-    and therefore several download folders, so features sharing the same raw `Mina`
+    `rows` is an iterable of (fid, raw_area). An area can have several AOI polygons,
+    and therefore several download folders, so features sharing the same raw `Area`
     value are merged into one group that keeps every fid. The caller then gathers
-    tiles from all of that mina's folders into a single mosaic.
+    tiles from all of that area's folders into a single mosaic.
 
     Returns a list of (final_name, [fids]) ordered by the group's smallest fid. Two
     DIFFERENT raw names that sanitize to the same safe name get a numeric suffix via
     dedupe_name (a genuine collision, not a merge). Raises ValueError (via
-    sanitize_name) on an empty mina value.
+    sanitize_name) on an empty area value.
     """
     groups = {}
     for fid, raw in rows:
@@ -315,7 +315,7 @@ def build_mina_groups(rows):
         try:
             base = sanitize_name(raw)
         except ValueError as exc:
-            raise ValueError("AOI feature(s) with FID {} have an unusable Mina value '{}': {}".format(
+            raise ValueError("AOI feature(s) with FID {} have an unusable Area value '{}': {}".format(
                 sorted(groups[raw]), raw, exc))
         final = dedupe_name(base, used)
         used.add(final)
@@ -454,15 +454,15 @@ def _is_data_folder(folder):
 
 
 def _gather_product_tiles(folders, product_prefix):
-    """Collect the .tif tiles for one product across a mina's download folders.
+    """Collect the .tif tiles for one product across an area's download folders.
 
     product_prefix is "MDT" (DEM) or "MDS" (DSM). Recurses each folder, keeps files
     whose name starts with product_prefix (case insensitive), and dedups by file name
-    (adjacent AOIs of the same mina share tiles, the tile code identifies them).
+    (adjacent AOIs of the same area share tiles, the tile code identifies them).
     Returns (paths, tile_sr). Returns ([], None) if no tile matches.
 
     CRS is validated once per folder (tiles within a DGT download are homogeneous):
-    fail loud on a geographic, undefined, or mixed CRS across the mina's folders.
+    fail loud on a geographic, undefined, or mixed CRS across the area's folders.
     """
     seen = set()
     paths = []
@@ -495,7 +495,7 @@ def _gather_product_tiles(folders, product_prefix):
                                 sr.factoryCode, sr.name, PROJECT_EPSG))
                     elif not _same_crs(ref_sr, sr):
                         msg = ("Tile '{}' CRS ({}) differs from the others ({}). All tiles of a "
-                               "mina must share one projected CRS.").format(
+                               "area must share one projected CRS.").format(
                                    path, _crs_label(sr), _crs_label(ref_sr))
                         _err(msg)
                         raise ValueError(msg)
@@ -510,7 +510,7 @@ def _folder_extent_polygon(folder, sr):
     """Coverage extent of a download folder as a Polygon in `sr`, read from the
     folder's .vrt (one cheap XML read). Returns None if the folder has no .vrt.
 
-    Used only as a spatial sanity check that a folder maps to the right mina. `sr` must
+    Used only as a spatial sanity check that a folder maps to the right area. `sr` must
     be the tiles CRS, since the VRT coordinates are in the tiles CRS. The caller projects
     the AOI geometry into that CRS before comparing.
     """
@@ -532,10 +532,10 @@ def _folder_extent_polygon(folder, sr):
 class BuildMosaicsByPolygon(object):
     def __init__(self):
         self.label = "01 - Build Mosaics by Polygon"
-        self.description = ("Build one DEM and one DSM mosaic per mina from the DGT LiDAR "
+        self.description = ("Build one DEM and one DSM mosaic per area from the DGT LiDAR "
                             "download folders. Each folder 02_DGT_LiDAR_Data_<FID> holds the "
-                            "tiles of one AOI; folders are matched to minas by FID and merged "
-                            "per mina. The spatial selection was already done at download time "
+                            "tiles of one AOI; folders are matched to areas by FID and merged "
+                            "per area. The spatial selection was already done at download time "
                             "(5 km buffer per AOI), so no buffering or tile intersection is needed.")
         self.canRunInBackground = False
 
@@ -546,7 +546,7 @@ class BuildMosaicsByPolygon(object):
         p_aoi.filter.list = ["Polygon"]
 
         p_field = arcpy.Parameter(
-            displayName="Mina name field", name="mina_field",
+            displayName="Area name field", name="area_field",
             datatype="Field", parameterType="Required", direction="Input")
         p_field.parameterDependencies = [p_aoi.name]
         p_field.filter.list = ["Text", "Short", "Long"]
@@ -563,8 +563,8 @@ class BuildMosaicsByPolygon(object):
             displayName="Output structure", name="output_structure",
             datatype="GPString", parameterType="Required", direction="Input")
         p_struct.filter.type = "ValueList"
-        p_struct.filter.list = ["per_mina_subfolder", "flat"]
-        p_struct.value = "per_mina_subfolder"
+        p_struct.filter.list = ["per_area_subfolder", "flat"]
+        p_struct.value = "per_area_subfolder"
 
         p_products = arcpy.Parameter(
             displayName="Products", name="products",
@@ -594,7 +594,7 @@ class BuildMosaicsByPolygon(object):
         p_overwrite.value = False
 
         p_skip = arcpy.Parameter(
-            displayName="Skip minas with missing folders", name="skip_incomplete",
+            displayName="Skip areas with missing folders", name="skip_incomplete",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_skip.value = True
 
@@ -622,7 +622,7 @@ class BuildMosaicsByPolygon(object):
 
     def execute(self, parameters, messages):
         in_aoi = parameters[0].valueAsText
-        mina_field = parameters[1].valueAsText
+        area_field = parameters[1].valueAsText
         lidar_root = parameters[2].valueAsText
         out_folder = parameters[3].valueAsText
         output_structure = parameters[4].valueAsText
@@ -662,24 +662,24 @@ class BuildMosaicsByPolygon(object):
         oid_field = getattr(aoi_desc, "OIDFieldName", "") or ""
         if oid_field.upper() != "FID":
             _warn("AOI OID field is '{}', not 'FID'. Folders were numbered by the original "
-                  "shapefile FID. If this layer is not that shapefile, the folder to mina "
+                  "shapefile FID. If this layer is not that shapefile, the folder to area "
                   "mapping may be wrong.".format(oid_field))
 
         # Read fid -> (raw name, geometry).
-        fid_to_mina = {}
+        fid_to_area = {}
         fid_to_geom = {}
-        with arcpy.da.SearchCursor(in_aoi, ["OID@", "SHAPE@", mina_field]) as cursor:
+        with arcpy.da.SearchCursor(in_aoi, ["OID@", "SHAPE@", area_field]) as cursor:
             for oid, shape, raw in cursor:
-                fid_to_mina[int(oid)] = raw
+                fid_to_area[int(oid)] = raw
                 fid_to_geom[int(oid)] = shape
 
-        if not fid_to_mina:
+        if not fid_to_area:
             msg = "AOI layer '{}' has no features.".format(in_aoi)
             _err(msg)
             raise ValueError(msg)
 
-        # One output per mina. Features sharing a Mina value are merged.
-        groups = build_mina_groups([(fid, fid_to_mina[fid]) for fid in fid_to_mina])
+        # One output per area. Features sharing an Area value are merged.
+        groups = build_area_groups([(fid, fid_to_area[fid]) for fid in fid_to_area])
 
         # Find data folders (immediate subdirs that hold MDT/MDS tiles), resolve the name
         # prefix (explicit parameter, or auto-detected from those folder names), and map each
@@ -719,29 +719,29 @@ class BuildMosaicsByPolygon(object):
             fid_to_folder[fid] = full
 
         total = len(groups)
-        built_minas = 0
-        present_minas = 0
+        built_areas = 0
+        present_areas = 0
         created_count = 0
         skipped_no_data = []
         skipped_incomplete = []
         skipped_no_tiles = []
         skipped_mismatch = []
 
-        arcpy.SetProgressor("step", "Building one mosaic per mina...", 0, total, 1)
-        for final_mina, fids in groups:
+        arcpy.SetProgressor("step", "Building one mosaic per area...", 0, total, 1)
+        for final_area, fids in groups:
             arcpy.SetProgressorPosition()
             present = [f for f in fids if f in fid_to_folder]
             missing = [f for f in fids if f not in fid_to_folder]
 
             if not present:
-                _warn("Mina '{}': no download folders present yet (FIDs {}). Skipping.".format(
-                    final_mina, fids))
-                skipped_no_data.append(final_mina)
+                _warn("Area '{}': no download folders present yet (FIDs {}). Skipping.".format(
+                    final_area, fids))
+                skipped_no_data.append(final_area)
                 continue
             if missing and skip_incomplete:
-                _warn("Mina '{}': missing folders for FIDs {}. Skipping (incomplete). Re-run "
-                      "when the download finishes.".format(final_mina, missing))
-                skipped_incomplete.append(final_mina)
+                _warn("Area '{}': missing folders for FIDs {}. Skipping (incomplete). Re-run "
+                      "when the download finishes.".format(final_area, missing))
+                skipped_incomplete.append(final_area)
                 continue
 
             present_folders = [fid_to_folder[f] for f in present]
@@ -757,8 +757,8 @@ class BuildMosaicsByPolygon(object):
                     if ref_tile_sr is None:
                         ref_tile_sr = sr
             if not gathered:
-                _warn("Mina '{}': folders present but no DEM/DSM tiles found. Skipping.".format(final_mina))
-                skipped_no_tiles.append(final_mina)
+                _warn("Area '{}': folders present but no DEM/DSM tiles found. Skipping.".format(final_area))
+                skipped_no_tiles.append(final_area)
                 continue
 
             # Spatial sanity check: each folder's VRT extent must contain its FID's AOI
@@ -769,8 +769,8 @@ class BuildMosaicsByPolygon(object):
                 for f in present:
                     folder_poly = _folder_extent_polygon(fid_to_folder[f], ref_tile_sr)
                     if folder_poly is None:
-                        _warn("Mina '{}': folder for FID {} has no .vrt, cannot verify extent.".format(
-                            final_mina, f))
+                        _warn("Area '{}': folder for FID {} has no .vrt, cannot verify extent.".format(
+                            final_area, f))
                         continue
                     geom = fid_to_geom[f]
                     if geom is None:
@@ -778,38 +778,38 @@ class BuildMosaicsByPolygon(object):
                     geom_t = geom if _same_crs(aoi_sr, ref_tile_sr) else geom.projectAs(ref_tile_sr)
                     centroid = arcpy.PointGeometry(geom_t.centroid, ref_tile_sr)
                     if not folder_poly.contains(centroid):
-                        _warn("Mina '{}': folder for FID {} does not contain its AOI polygon "
-                              "centroid. Possible wrong FID mapping. Skipping this mina.".format(
-                                  final_mina, f))
+                        _warn("Area '{}': folder for FID {} does not contain its AOI polygon "
+                              "centroid. Possible wrong FID mapping. Skipping this area.".format(
+                                  final_area, f))
                         mismatch = True
                         break
                 if mismatch:
-                    skipped_mismatch.append(final_mina)
+                    skipped_mismatch.append(final_area)
                     continue
 
             if missing:
-                _warn("Mina '{}': building a PARTIAL mosaic, missing FIDs {}. Re-run with "
+                _warn("Area '{}': building a PARTIAL mosaic, missing FIDs {}. Re-run with "
                       "overwrite enabled after the download finishes to refresh it.".format(
-                          final_mina, missing))
+                          final_area, missing))
 
             created_here = 0
             existing_here = 0
             for source, (tiles, sr) in gathered.items():
-                out_name = build_output_name(final_mina, source) + ".tif"
+                out_name = build_output_name(final_area, source) + ".tif"
                 location = out_folder
-                if output_structure == "per_mina_subfolder":
-                    location = os.path.join(out_folder, final_mina)
+                if output_structure == "per_area_subfolder":
+                    location = os.path.join(out_folder, final_area)
                 if not os.path.isdir(location):
                     os.makedirs(location)
                 out_path = os.path.join(location, out_name)
 
                 if os.path.exists(out_path) and not overwrite_existing:
-                    _msg("Mina '{}' ({}): output exists, skipping ({}).".format(
-                        final_mina, source, out_name))
+                    _msg("Area '{}' ({}): output exists, skipping ({}).".format(
+                        final_area, source, out_name))
                     existing_here += 1
                     continue
                 if os.path.exists(out_path) and overwrite_existing:
-                    _msg("Mina '{}' ({}): overwriting existing {}.".format(final_mina, source, out_name))
+                    _msg("Area '{}' ({}): overwriting existing {}.".format(final_area, source, out_name))
 
                 arcpy.management.MosaicToNewRaster(
                     input_rasters=tiles,
@@ -820,21 +820,21 @@ class BuildMosaicsByPolygon(object):
                     number_of_bands=1,
                     mosaic_method=mosaic_method,
                 )
-                _msg("Mina '{}' ({}): mosaicked {} tiles from {} folder(s) -> {}".format(
-                    final_mina, source, len(tiles), len(present_folders), out_name))
+                _msg("Area '{}' ({}): mosaicked {} tiles from {} folder(s) -> {}".format(
+                    final_area, source, len(tiles), len(present_folders), out_name))
                 created_here += 1
 
             created_count += created_here
             if created_here:
-                built_minas += 1
+                built_areas += 1
             elif existing_here:
-                present_minas += 1
+                present_areas += 1
 
         arcpy.ResetProgressor()
 
-        _msg("Done. Minas: {}. Built now: {}. Already present: {}. Mosaics created: {}. Skipped "
+        _msg("Done. Areas: {}. Built now: {}. Already present: {}. Mosaics created: {}. Skipped "
              "(no data: {}, incomplete: {}, no tiles: {}, extent mismatch: {}).".format(
-                 total, built_minas, present_minas, created_count,
+                 total, built_areas, present_areas, created_count,
                  len(skipped_no_data), len(skipped_incomplete),
                  len(skipped_no_tiles), len(skipped_mismatch)))
         if skipped_incomplete:
@@ -868,7 +868,7 @@ class DeriveSurfaces(object):
     def __init__(self):
         self.label = "02 - Generate Surfaces"
         self.description = ("Derive topographic surfaces (slope, aspect, hillshade, profile "
-                            "and plan curvature) in batch from the per mina DEM and DSM mosaics "
+                            "and plan curvature) in batch from the per area DEM and DSM mosaics "
                             "produced by Build Mosaics By Polygon. Each surface has its own "
                             "checkbox. Only slope and aspect feed the reclassification tool.")
         self.canRunInBackground = False
@@ -884,14 +884,14 @@ class DeriveSurfaces(object):
         p_recurse.value = True
 
         p_out = arcpy.Parameter(
-            displayName="Output folder (per_mina_subfolder or flat only)", name="out_folder",
+            displayName="Output folder (per_area_subfolder or flat only)", name="out_folder",
             datatype="DEFolder", parameterType="Optional", direction="Output")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
             datatype="GPString", parameterType="Required", direction="Input")
         p_struct.filter.type = "ValueList"
-        p_struct.filter.list = ["same_as_input", "per_mina_subfolder", "flat"]
+        p_struct.filter.list = ["same_as_input", "per_area_subfolder", "flat"]
         p_struct.value = "same_as_input"
 
         p_source = arcpy.Parameter(
@@ -965,7 +965,7 @@ class DeriveSurfaces(object):
             return False
 
     def updateParameters(self, parameters):
-        # Output folder is only needed for per_mina_subfolder or flat output.
+        # Output folder is only needed for per_area_subfolder or flat output.
         parameters[2].enabled = parameters[3].valueAsText != "same_as_input"
         # Azimuth/altitude only matter for a Traditional hillshade.
         traditional = bool(parameters[7].value) and parameters[11].valueAsText == "Traditional"
@@ -1051,11 +1051,11 @@ class DeriveSurfaces(object):
                     if not fn.lower().endswith(".tif"):
                         continue
                     info = parse_source_and_product(fn)
-                    if info["source"] is None or info["product"] is not None or info["mina"] is None:
+                    if info["source"] is None or info["product"] is not None or info["area"] is None:
                         continue                          # not a base mosaic, skip
                     if info["source"] not in allowed_sources:
                         continue
-                    mosaics.append((os.path.join(dirpath, fn), info["mina"], info["source"]))
+                    mosaics.append((os.path.join(dirpath, fn), info["area"], info["source"]))
 
             if not mosaics:
                 msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), in_folder)
@@ -1065,14 +1065,14 @@ class DeriveSurfaces(object):
             total = len(mosaics)
             created = 0
             arcpy.SetProgressor("step", "Deriving surfaces...", 0, total, 1)
-            for path, mina, source in mosaics:
+            for path, area, source in mosaics:
                 arcpy.SetProgressorPosition()
                 _assert_projected_raster(path)
 
                 if output_structure == "same_as_input":
                     location = os.path.dirname(path)
-                elif output_structure == "per_mina_subfolder":
-                    location = os.path.join(out_folder, mina)
+                elif output_structure == "per_area_subfolder":
+                    location = os.path.join(out_folder, area)
                 else:
                     location = out_folder
                 if not os.path.isdir(location):
@@ -1082,10 +1082,10 @@ class DeriveSurfaces(object):
                 targets = {}
                 todo = {}
                 for product in wanted:
-                    target = os.path.join(location, build_output_name(mina, source, product) + ".tif")
+                    target = os.path.join(location, build_output_name(area, source, product) + ".tif")
                     targets[product] = target
                     if os.path.exists(target) and not overwrite_existing:
-                        _msg("{} ({}): {} exists, skipping.".format(mina, source, os.path.basename(target)))
+                        _msg("{} ({}): {} exists, skipping.".format(area, source, os.path.basename(target)))
                         todo[product] = False
                     else:
                         todo[product] = True
@@ -1120,7 +1120,7 @@ class DeriveSurfaces(object):
                                        targets["PLANC"] if want_planc else "#")
                     created += (1 if want_profc else 0) + (1 if want_planc else 0)
 
-                _msg("{} ({}): surfaces done.".format(mina, source))
+                _msg("{} ({}): surfaces done.".format(area, source))
 
             arcpy.ResetProgressor()
             _msg("Done. Mosaics processed: {}. Surfaces created: {}.".format(total, created))
@@ -1173,14 +1173,14 @@ class ReclassifyFactor(object):
             datatype="GPLong", parameterType="Optional", direction="Input")
 
         p_out = arcpy.Parameter(
-            displayName="Output folder (per_mina_subfolder or flat only)", name="out_folder",
+            displayName="Output folder (per_area_subfolder or flat only)", name="out_folder",
             datatype="DEFolder", parameterType="Optional", direction="Output")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
             datatype="GPString", parameterType="Required", direction="Input")
         p_struct.filter.type = "ValueList"
-        p_struct.filter.list = ["same_as_input", "per_mina_subfolder", "flat"]
+        p_struct.filter.list = ["same_as_input", "per_area_subfolder", "flat"]
         p_struct.value = "same_as_input"
 
         p_nodata = arcpy.Parameter(
@@ -1207,7 +1207,7 @@ class ReclassifyFactor(object):
         parameters[3].enabled = inc_slope
         parameters[4].enabled = inc_aspect
         parameters[5].enabled = inc_aspect
-        # Output folder is only needed for per_mina_subfolder or flat output.
+        # Output folder is only needed for per_area_subfolder or flat output.
         parameters[6].enabled = parameters[7].valueAsText != "same_as_input"
         return
 
@@ -1303,10 +1303,10 @@ class ReclassifyFactor(object):
                 if not fn.lower().endswith(".tif"):
                     continue
                 info = parse_source_and_product(fn)
-                if (info["product"] not in wanted_products or info["mina"] is None
+                if (info["product"] not in wanted_products or info["area"] is None
                         or info["source"] is None or info["reclass"]):
                     continue
-                rasters.append((os.path.join(dirpath, fn), info["mina"], info["source"], info["product"]))
+                rasters.append((os.path.join(dirpath, fn), info["area"], info["source"], info["product"]))
 
         if not rasters:
             msg = "No {} factor rasters found in '{}'.".format("/".join(wanted_products), in_folder)
@@ -1317,13 +1317,13 @@ class ReclassifyFactor(object):
         created = 0
         skipped_existing = 0
         arcpy.SetProgressor("step", "Reclassifying factors...", 0, total, 1)
-        for path, mina, source, product in rasters:
+        for path, area, source, product in rasters:
             arcpy.SetProgressorPosition()
-            out_name = build_output_name(mina, source, product, reclass=True) + ".tif"
+            out_name = build_output_name(area, source, product, reclass=True) + ".tif"
             if output_structure == "same_as_input":
                 location = os.path.dirname(path)
-            elif output_structure == "per_mina_subfolder":
-                location = os.path.join(out_folder, mina)
+            elif output_structure == "per_area_subfolder":
+                location = os.path.join(out_folder, area)
             else:
                 location = out_folder
             if not os.path.isdir(location):
@@ -1331,7 +1331,7 @@ class ReclassifyFactor(object):
             out_path = os.path.join(location, out_name)
 
             if os.path.exists(out_path) and not overwrite_existing:
-                _msg("{} ({}): {} exists, skipping.".format(mina, source, out_name))
+                _msg("{} ({}): {} exists, skipping.".format(area, source, out_name))
                 skipped_existing += 1
                 continue
 
@@ -1339,7 +1339,7 @@ class ReclassifyFactor(object):
             sr = src.spatialReference
             if sr is None or sr.name in (None, "", "Unknown"):
                 _warn("{} ({}): input {} has an undefined CRS; the output CRS will be undefined "
-                      "too.".format(mina, source, product))
+                      "too.".format(area, source, product))
             lower_left = arcpy.Point(src.extent.XMin, src.extent.YMin)
             cell_w = src.meanCellWidth
             cell_h = src.meanCellHeight
@@ -1350,7 +1350,7 @@ class ReclassifyFactor(object):
                 arr = arcpy.RasterToNumPyArray(path).astype("float32")
             except MemoryError:
                 msg = ("{} ({}) {} is too large to load into memory for reclassification. Reduce "
-                       "the AOI extent or process fewer rasters at a time.").format(mina, source, product)
+                       "the AOI extent or process fewer rasters at a time.").format(area, source, product)
                 _err(msg)
                 raise
             nodata_val = src.noDataValue
@@ -1374,7 +1374,7 @@ class ReclassifyFactor(object):
                 if n_unmapped:
                     msg = ("{} ({}) {}: {} cells fall outside all classes and 'Unmapped values to "
                            "NoData' is off. Extend the class table to cover the full value range, "
-                           "or turn the option on.").format(mina, source, product, n_unmapped)
+                           "or turn the option on.").format(area, source, product, n_unmapped)
                     _err(msg)
                     raise ValueError(msg)
 
@@ -1383,7 +1383,7 @@ class ReclassifyFactor(object):
             out_raster.save(out_path)
             arcpy.management.DefineProjection(out_path, sr)        # NumPyArrayToRaster leaves CRS undefined
             _msg("{} ({}): reclassified {} ({}) -> {}".format(
-                mina, source, product, _crs_label(sr), out_name))
+                area, source, product, _crs_label(sr), out_name))
             created += 1
 
         arcpy.ResetProgressor()
@@ -1395,7 +1395,7 @@ class ReclassifyFactor(object):
 class SolarRadiation(object):
     def __init__(self):
         self.label = "03 - Solar Radiation"
-        self.description = ("Compute annual incoming solar radiation (global, kWh/m2) per mina from the "
+        self.description = ("Compute annual incoming solar radiation (global, kWh/m2) per area from the "
                             "DEM mosaics, in batch, with arcpy.sa.RasterSolarRadiation (GPU accelerated). "
                             "The DEM is resampled to a coarser solar cell size first, because annual "
                             "insolation is a smooth field, to keep the heavy whole year computation "
@@ -1413,14 +1413,14 @@ class SolarRadiation(object):
         p_recurse.value = True
 
         p_out = arcpy.Parameter(
-            displayName="Output folder (per_mina_subfolder or flat only)", name="out_folder",
+            displayName="Output folder (per_area_subfolder or flat only)", name="out_folder",
             datatype="DEFolder", parameterType="Optional", direction="Output")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
             datatype="GPString", parameterType="Required", direction="Input")
         p_struct.filter.type = "ValueList"
-        p_struct.filter.list = ["same_as_input", "per_mina_subfolder", "flat"]
+        p_struct.filter.list = ["same_as_input", "per_area_subfolder", "flat"]
         p_struct.value = "same_as_input"
 
         p_source = arcpy.Parameter(
@@ -1534,11 +1534,11 @@ class SolarRadiation(object):
                 if not fn.lower().endswith(".tif"):
                     continue
                 info = parse_source_and_product(fn)
-                if info["source"] is None or info["product"] is not None or info["mina"] is None:
+                if info["source"] is None or info["product"] is not None or info["area"] is None:
                     continue
                 if info["source"] not in allowed_sources:
                     continue
-                mosaics.append((os.path.join(dirpath, fn), info["mina"], info["source"]))
+                mosaics.append((os.path.join(dirpath, fn), info["area"], info["source"]))
 
         if not mosaics:
             msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), in_folder)
@@ -1547,7 +1547,7 @@ class SolarRadiation(object):
 
         total = len(mosaics)
         _warn("Solar radiation is a heavy whole year computation. {} mosaic(s) at a {} solar cell size "
-              "may take a long time; benchmark one mina first.".format(
+              "may take a long time; benchmark one area first.".format(
                   total, "{} m".format(solar_cell_size) if solar_cell_size > 0 else "native"))
 
         arcpy.CheckOutExtension("Spatial")
@@ -1556,24 +1556,24 @@ class SolarRadiation(object):
         failed = []
         try:
             arcpy.SetProgressor("step", "Computing solar radiation...", 0, total, 1)
-            for path, mina, source in mosaics:
+            for path, area, source in mosaics:
                 arcpy.SetProgressorPosition()
                 if source == "DSM":
                     _warn("{}: solar is computed on the DSM (canopy and building surface), not the "
-                          "bare ground a PV plant would sit on.".format(mina))
+                          "bare ground a PV plant would sit on.".format(area))
 
-                out_name = build_output_name(mina, source, "SOLAR") + ".tif"
+                out_name = build_output_name(area, source, "SOLAR") + ".tif"
                 location = out_folder
                 if output_structure == "same_as_input":
                     location = os.path.dirname(path)
-                elif output_structure == "per_mina_subfolder":
-                    location = os.path.join(out_folder, mina)
+                elif output_structure == "per_area_subfolder":
+                    location = os.path.join(out_folder, area)
                 if not os.path.isdir(location):
                     os.makedirs(location)
                 out_path = os.path.join(location, out_name)
 
                 if os.path.exists(out_path) and not overwrite_existing:
-                    _msg("{} ({}): {} exists, skipping.".format(mina, source, out_name))
+                    _msg("{} ({}): {} exists, skipping.".format(area, source, out_name))
                     skipped_existing += 1
                     continue
 
@@ -1583,7 +1583,7 @@ class SolarRadiation(object):
                     native = arcpy.Raster(path).meanCellWidth
                     surface = path
                     if solar_cell_size and solar_cell_size > native:
-                        resampled = os.path.join(arcpy.env.scratchFolder, "solar_{}.tif".format(mina))
+                        resampled = os.path.join(arcpy.env.scratchFolder, "solar_{}.tif".format(area))
                         arcpy.management.Resample(
                             path, resampled, "{0} {0}".format(solar_cell_size), resample_method)
                         surface = resampled
@@ -1602,11 +1602,11 @@ class SolarRadiation(object):
                     )
                     rad.save(out_path)
                     _msg("{} ({}): solar radiation (kWh/m2, {}) -> {}".format(
-                        mina, source, _crs_label(sr), out_name))
+                        area, source, _crs_label(sr), out_name))
                     created += 1
                 except Exception as exc:
-                    _warn("{} ({}): solar radiation failed: {}".format(mina, source, exc))
-                    failed.append(mina)
+                    _warn("{} ({}): solar radiation failed: {}".format(area, source, exc))
+                    failed.append(area)
                 finally:
                     if resampled and arcpy.Exists(resampled):
                         arcpy.management.Delete(resampled)
@@ -1615,7 +1615,7 @@ class SolarRadiation(object):
             _msg("Done. Mosaics: {}. Solar rasters created: {}. Skipped existing: {}. Failed: {}.".format(
                 total, created, skipped_existing, len(failed)))
             if failed:
-                _warn("Failed minas: " + ", ".join(failed))
+                _warn("Failed areas: " + ", ".join(failed))
         finally:
             arcpy.CheckInExtension("Spatial")
         return
@@ -1623,7 +1623,7 @@ class SolarRadiation(object):
 
 # ===========================================================================
 # Self tests (pure functions; numpy tests run only if numpy is importable).
-# Run: python MiningTerrainToolbox.pyt
+# Run: python LidarTerrainToolbox.pyt
 # ===========================================================================
 
 def _run_self_tests():
@@ -1647,44 +1647,44 @@ def _run_self_tests():
     check("accents removed", sanitize_name("Sao Joao") == "Sao_Joao")
     check("accents removed (with diacritics)", sanitize_name("São João") == "Sao_Joao")
     check("c cedilha to c", sanitize_name("Mação") == "Macao")
-    check("spaces to underscore", sanitize_name("Mina Norte") == "Mina_Norte")
+    check("spaces to underscore", sanitize_name("Area Norte") == "Area_Norte")
     check("hyphen separator to underscore", sanitize_name("Sao-Chico") == "Sao_Chico")
-    check("leading digit prefixed", sanitize_name("2 Minas").startswith("M_"))
-    check("collapses repeated underscores", "__" not in sanitize_name("Mina   Norte"))
+    check("leading digit prefixed", sanitize_name("2 Areas").startswith("M_"))
+    check("collapses repeated underscores", "__" not in sanitize_name("Area   Norte"))
     check("truncated to limit", len(sanitize_name("A" * 100)) <= MAX_NAME_LEN)
     check_raises("empty result raises", lambda: sanitize_name("***"))
     check_raises("None raises", lambda: sanitize_name(None))
 
     print("dedupe_name")
-    used = {"MinaA", "MinaA_2"}
-    check("collision appends next free suffix", dedupe_name("MinaA", used) == "MinaA_3")
-    check("no collision unchanged", dedupe_name("MinaB", used) == "MinaB")
+    used = {"AreaA", "AreaA_2"}
+    check("collision appends next free suffix", dedupe_name("AreaA", used) == "AreaA_3")
+    check("no collision unchanged", dedupe_name("AreaB", used) == "AreaB")
 
     print("build_output_name / parse_source_and_product round trip")
     cases = [
         ("Sao_Domingos", "DEM", "SLOPE", False),
         ("Sao_Domingos", "DEM", "SLOPE", True),
-        ("Mina_Norte", "DSM", "ASPECT", False),
-        ("MinaA", "DEM", None, False),               # base mosaic
-        ("MinaA", "DEM", "SOLAR", False),
+        ("Area_Norte", "DSM", "ASPECT", False),
+        ("AreaA", "DEM", None, False),               # base mosaic
+        ("AreaA", "DEM", "SOLAR", False),
     ]
-    for mina, source, product, reclass in cases:
-        name = build_output_name(mina, source, product, reclass)
+    for area, source, product, reclass in cases:
+        name = build_output_name(area, source, product, reclass)
         p = parse_source_and_product(name + ".tif")
         check("round trip {}".format(name),
-              p["mina"] == mina and p["source"] == source
+              p["area"] == area and p["source"] == source
               and p["product"] == product and p["reclass"] == reclass)
 
-    check("mina with underscore not misparsed",
-          parse_source_and_product("Sao_Domingos_DEM_SLOPE.tif")["mina"] == "Sao_Domingos")
+    check("area with underscore not misparsed",
+          parse_source_and_product("Sao_Domingos_DEM_SLOPE.tif")["area"] == "Sao_Domingos")
     check("unknown name yields source None",
           parse_source_and_product("random_file.tif")["source"] is None)
-    check("mina ending in mixed case token kept (case sensitive parse)",
-          parse_source_and_product("Vale_Dem.tif")["mina"] == "Vale_Dem"
+    check("area ending in mixed case token kept (case sensitive parse)",
+          parse_source_and_product("Vale_Dem.tif")["area"] == "Vale_Dem"
           and parse_source_and_product("Vale_Dem.tif")["source"] is None)
     check("lowercase tokens not recognized",
-          parse_source_and_product("MinaA_dem_slope.tif")["source"] is None)
-    check("empty name yields mina None", parse_source_and_product("")["mina"] is None)
+          parse_source_and_product("AreaA_dem_slope.tif")["source"] is None)
+    check("empty name yields area None", parse_source_and_product("")["area"] is None)
     check("build rejects unknown source", _raises(lambda: build_output_name("X", "DTM")))
     check("build rejects reclass without product", _raises(lambda: build_output_name("X", "DEM", None, True)))
 
@@ -1704,12 +1704,12 @@ def _run_self_tests():
     check("whole number float class_id accepted",
           validate_value_table([(1.0, 0, 10), (2.0, 10, 20)]) is not None)
 
-    print("build_mina_groups")
-    groups = build_mina_groups([(3, "Cortes Pereira"), (4, "Cortes Pereira"), (0, "Alcaria Queimada")])
-    check("merges same mina across fids",
+    print("build_area_groups")
+    groups = build_area_groups([(3, "Cortes Pereira"), (4, "Cortes Pereira"), (0, "Alcaria Queimada")])
+    check("merges same area across fids",
           ("Cortes_Pereira", [3, 4]) in groups and ("Alcaria_Queimada", [0]) in groups)
     check("ordered by smallest fid", groups[0][0] == "Alcaria_Queimada")
-    g2 = build_mina_groups([(0, "São João"), (1, "Sao Joao")])
+    g2 = build_area_groups([(0, "São João"), (1, "Sao Joao")])
     check("different names that collide get deduped",
           [n for n, _ in g2] == ["Sao_Joao", "Sao_Joao_2"])
     check("each colliding group keeps its own fid", g2[0][1] == [0] and g2[1][1] == [1])
