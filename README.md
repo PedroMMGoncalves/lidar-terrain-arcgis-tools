@@ -217,21 +217,26 @@ The `.tif` extension is added on write. Area names are sanitized for ArcGIS and 
 
 ## Example
 
-A real Tool 1 run over 22 selected AOI features (the AOI layer was in EPSG:102164 and was projected only for the extent check; the mosaics inherit the tiles CRS, EPSG:3763). The 22 features resolved to 21 areas, because one area (`Cortes Pereira`) has two AOI polygons that were merged into a single output.
-
-Abbreviated geoprocessing log:
+A real run over 38 areas. The AOI layer was in EPSG:102164, projected only for the extent check; the mosaics inherit the tiles CRS, EPSG:3763. One area (`Cortes Pereira`) has two AOI polygons that were merged into a single output. Abbreviated geoprocessing log for the whole pipeline:
 
 ```text
-AOI layer CRS: EPSG:102164.
-AOI layer is EPSG:102164, not the project EPSG:3763. Polygons are projected for the extent check only.
-Sanitized area name 'Defesa das Mercês' to 'Defesa_das_Merces'.
-Sanitized area name 'Preguiça' to 'Preguica'.
-Area 'Alcaria_Queimada' (DEM): mosaicked 112 tiles from 1 folder(s) -> Alcaria_Queimada_DEM.tif
-Area 'Alcaria_Queimada' (DSM): mosaicked 112 tiles from 1 folder(s) -> Alcaria_Queimada_DSM.tif
-Area 'Cortes_Pereira' (DEM): mosaicked 95 tiles from 2 folder(s) -> Cortes_Pereira_DEM.tif
-Area 'Cortes_Pereira' (DSM): mosaicked 95 tiles from 2 folder(s) -> Cortes_Pereira_DSM.tif
-...
-Done. Areas: 21. Built now: 21. Already present: 0. Mosaics created: 42. Skipped (no data: 0, incomplete: 0, no tiles: 0, extent mismatch: 0).
+# Tool 1, Build Mosaics by Polygon
+Auto-detected folder prefix: '02_DGT_LiDAR_Data_'.
+Area 'Alcaria_Queimada' (DEM): mosaicked 112 tiles (2m, 2 m) from 1 folder(s) -> Alcaria_Queimada_DEM.tif
+Area 'Cortes_Pereira' (DEM): mosaicked 95 tiles (2m, 2 m) from 2 folder(s) -> Cortes_Pereira_DEM.tif
+Done. Areas: 38. Built now: 38. Mosaics created: 76. Skipped (no data: 0, incomplete: 0, no tiles: 0, extent mismatch: 0).
+
+# Tool 2, Generate Surfaces
+Done. Mosaics processed: 76. Surfaces created: 380.
+
+# Tool 3, Solar Radiation
+Alcaria_Queimada (DEM): solar radiation (kWh/m2, EPSG:3763) -> Alcaria_Queimada_DEM_SOLAR.tif
+Done. Mosaics: 38. Solar rasters created: 38. Skipped existing: 0. Failed: 0.
+
+# Tool 5, Resample (to 10 m)
+Alcaria_Queimada (SLOPE): resampled 2 m -> 10 m (BILINEAR, EPSG:3763) -> Alcaria_Queimada_DEM_SLOPE.tif
+Alcaria_Queimada (SOLAR): already at 10 m, copied -> Alcaria_Queimada_DEM_SOLAR.tif
+Done. Selected rasters: 494. Resampled: 456. Copied (already at target): 38. Skipped existing: 0. Failed: 0.
 ```
 
 You then point Tool 2 at this output folder to derive the surfaces, and Tool 4 at the Tool 2 output to reclassify slope and aspect.
