@@ -404,24 +404,19 @@ def reclassify_array(arr, classes, nodata_out, flat_value=None, flat_class=None)
 
 class Toolbox(object):
     def __init__(self):
-        self.label = "Mining Terrain Factor Toolbox"
-        self.alias = "MiningTerrain"
-        # Tools are registered incrementally as each is built and validated:
-        #   BuildMosaicsByPolygon  (category "Mosaicking")        -> implemented
-        #   DeriveSurfaces         (category "Surfaces")           -> implemented
-        #   ReclassifyFactor       (category "Reclassification")   -> implemented
-        # A future fifth tool for solar irradiation (Area Solar Radiation) would be
-        # registered here too. Out of scope now, no functional stub.
+        self.label = "LiDAR Terrain Toolbox"
+        self.alias = "LidarTerrain"
+        # Tool labels are numbered so they sort in pipeline order at the toolbox root
+        # (no toolset categories): 01 Build Mosaics by Polygon, 02 Generate Surfaces,
+        # 03 Solar Radiation (to be added), 04 Reclassify Slope and Aspect.
         self.tools = [BuildMosaicsByPolygon, DeriveSurfaces, ReclassifyFactor]
 
 
 # ===========================================================================
 # Tools
 # ===========================================================================
-#   BuildMosaicsByPolygon  (Mosaicking)        -> implemented below
-#   DeriveSurfaces         (Surfaces)          -> implemented below
-#   ReclassifyFactor       (Reclassification)  -> implemented below (imports numpy lazily)
-# A future fifth tool for solar irradiation (Area Solar Radiation) would go here.
+#   01 BuildMosaicsByPolygon, 02 DeriveSurfaces, 04 ReclassifyFactor (imports numpy lazily).
+#   03 Solar Radiation (AreaSolarRadiation) to be added between 02 and 04.
 
 
 def _crs_label(sr):
@@ -536,13 +531,12 @@ def _folder_extent_polygon(folder, sr):
 
 class BuildMosaicsByPolygon(object):
     def __init__(self):
-        self.label = "Build Mosaics By Polygon"
+        self.label = "01 - Build Mosaics by Polygon"
         self.description = ("Build one DEM and one DSM mosaic per mina from the DGT LiDAR "
                             "download folders. Each folder 02_DGT_LiDAR_Data_<FID> holds the "
                             "tiles of one AOI; folders are matched to minas by FID and merged "
                             "per mina. The spatial selection was already done at download time "
                             "(5 km buffer per AOI), so no buffering or tile intersection is needed.")
-        self.category = "Mosaicking"
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -872,12 +866,11 @@ def _assert_projected_raster(path):
 
 class DeriveSurfaces(object):
     def __init__(self):
-        self.label = "Derive Surfaces"
+        self.label = "02 - Generate Surfaces"
         self.description = ("Derive topographic surfaces (slope, aspect, hillshade, profile "
                             "and plan curvature) in batch from the per mina DEM and DSM mosaics "
                             "produced by Build Mosaics By Polygon. Each surface has its own "
                             "checkbox. Only slope and aspect feed the reclassification tool.")
-        self.category = "Surfaces"
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -1140,13 +1133,12 @@ class DeriveSurfaces(object):
 
 class ReclassifyFactor(object):
     def __init__(self):
-        self.label = "Reclassify Factor"
+        self.label = "04 - Reclassify Slope and Aspect"
         self.description = ("Reclassify Slope and Aspect factor rasters into ordinal integer "
                             "classes defined in a value table, in batch, with [min, max) "
                             "semantics (the last class inclusive at the top). Uses numpy for "
                             "deterministic boundaries. Curvature and hillshade are not "
                             "reclassified.")
-        self.category = "Reclassification"
         self.canRunInBackground = False
 
     def getParameterInfo(self):

@@ -23,9 +23,9 @@ This toolbox is the **factor engine only**. The weighted overlay and the REN/RAN
 
 Three tools form a pipeline, run in order, with the input and output folders always chosen explicitly by the user:
 
-1. **Build Mosaics By Polygon** (Mosaicking): one DEM and one DSM mosaic per mining area, from the DGT LiDAR download folders.
-2. **Derive Surfaces** (Surfaces): slope, aspect, hillshade and curvature (profile and plan) from each mosaic.
-3. **Reclassify Factor** (Reclassification): ordinal integer classes for slope and aspect, defined in a value table.
+1. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per mining area, from the DGT LiDAR download folders.
+2. **Generate Surfaces**: slope, aspect, hillshade and curvature (profile and plan) from each mosaic.
+3. **Reclassify Slope and Aspect**: ordinal integer classes for slope and aspect, defined in a value table.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -38,9 +38,9 @@ flowchart LR
     AOI["AOI polygons<br/>Mina name + FID"] --> T1["Tool 1<br/>Build Mosaics By Polygon"]
     LID["DGT LiDAR folders<br/>..._&lt;FID&gt; with MDT (DEM) and MDS (DSM)"] --> T1
     T1 --> M["Per mina mosaics<br/>Mina_DEM.tif / Mina_DSM.tif"]
-    M --> T2["Tool 2<br/>Derive Surfaces"]
+    M --> T2["Tool 2<br/>Generate Surfaces"]
     T2 --> S["Surfaces<br/>SLOPE, ASPECT, HILLSHADE, PROFC, PLANC"]
-    S --> T3["Tool 3<br/>Reclassify Factor"]
+    S --> T3["Tool 3<br/>Reclassify Slope and Aspect"]
     T3 --> R["Ordinal factors<br/>Mina_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
     R --> EXT["External, not in this toolbox:<br/>weighted overlay, REN/RAN/PDM exclusions"]
 ```
@@ -66,7 +66,7 @@ flowchart LR
 ## Installation
 
 1. In *Catalog*, right-click a folder, choose **Add Toolbox**, and select `MiningTerrainToolbox.pyt`.
-2. The three tools appear under the **Mining Terrain Factor Toolbox**, in the toolsets **Mosaicking**, **Surfaces** and **Reclassification**.
+2. The tools appear at the root of the **LiDAR Terrain Toolbox**, with numbered labels (01, 02, ...) so they run in pipeline order.
 
 No installation beyond *Add Toolbox*: the script runs on the Python bundled with ArcGIS Pro. To remove it, right-click the toolbox in *Catalog* and choose *Remove*.
 
@@ -95,7 +95,7 @@ One DEM and one DSM mosaic per mina, merging all of that mina's download folders
 | Verify folder extent against AOI polygon | On (default) checks each folder maps to the right mina. |
 | Folder name prefix | Optional. Leave blank to auto-detect the prefix from the data folders. |
 
-### Tool 2, Derive Surfaces
+### Tool 2, Generate Surfaces
 
 Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox (all on by default).
 
@@ -112,7 +112,7 @@ Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox 
 | Hillshade azimuth, altitude | Traditional hillshade only. |
 | Overwrite existing outputs | Off skips existing surfaces. |
 
-### Tool 3, Reclassify Factor
+### Tool 3, Reclassify Slope and Aspect
 
 Ordinal classes for slope and aspect, from a value table.
 
