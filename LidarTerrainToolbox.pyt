@@ -649,7 +649,7 @@ class BuildMosaicsByPolygon(object):
 
         p_out = arcpy.Parameter(
             displayName="Output folder", name="out_folder",
-            datatype="DEFolder", parameterType="Required", direction="Output")
+            datatype="DEFolder", parameterType="Required", direction="Input")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
@@ -984,7 +984,7 @@ class DeriveSurfaces(object):
 
         p_out = arcpy.Parameter(
             displayName="Output folder (per_area_subfolder or flat only)", name="out_folder",
-            datatype="DEFolder", parameterType="Optional", direction="Output")
+            datatype="DEFolder", parameterType="Optional", direction="Input")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
@@ -1273,7 +1273,7 @@ class ReclassifyFactor(object):
 
         p_out = arcpy.Parameter(
             displayName="Output folder (per_area_subfolder or flat only)", name="out_folder",
-            datatype="DEFolder", parameterType="Optional", direction="Output")
+            datatype="DEFolder", parameterType="Optional", direction="Input")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
@@ -1513,7 +1513,7 @@ class SolarRadiation(object):
 
         p_out = arcpy.Parameter(
             displayName="Output folder (per_area_subfolder or flat only)", name="out_folder",
-            datatype="DEFolder", parameterType="Optional", direction="Output")
+            datatype="DEFolder", parameterType="Optional", direction="Input")
 
         p_struct = arcpy.Parameter(
             displayName="Output structure", name="output_structure",
