@@ -43,12 +43,14 @@ flowchart TD
     LID --> T1
     T1["Tool 1<br/>Build Mosaics by Polygon"]
     T1 --> M["Per area mosaics<br/>Area_DEM.tif / Area_DSM.tif"]
+    T1 -.-> CL["Clusters (optional)<br/>clusters/Cluster_NNN/<br/>contiguous areas merged"]
     M --> T2["Tool 2<br/>Generate Surfaces"]
     M --> T3["Tool 3<br/>Solar Radiation"]
     M -.-> T5["Tool 5 (optional)<br/>Resample"]
-    T2 --> S["Surfaces<br/>SLOPE, ASPECT, HILLSHADE, PROFC, PLANC"]
-    T3 --> SOL["Area_DEM_SOLARUNI.tif<br/>(kWh/m2)"]
-    T5 -.-> RS["Resample folder<br/>coarser cell size (e.g. 2 m to 10 m)<br/>grouped by area"]
+    CL -.-> T2
+    T2 --> S["Surfaces<br/>SLOPE, SLOPEP, ASPECT, HILLSHADE, PROFC, PLANC"]
+    T3 --> SOL["Solar<br/>Area_SOURCE_SOLARUNI / SOLAROVC<br/>(+ optional direct, diffuse, duration)"]
+    T5 -.-> RS["Resample folder<br/>coarser cell size (e.g. 2 m to 5 m)<br/>grouped by area"]
     S --> T4["Tool 4<br/>Reclassify Slope and Aspect"]
     T4 --> RCL["Ordinal factors<br/>Area_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
     RCL --> EXT["Analysis<br/>(external to this toolbox)"]
@@ -60,7 +62,7 @@ flowchart TD
     classDef ext fill:#f5f5f5,stroke:#999999,color:#333333,stroke-dasharray:4 3;
     class T1,T2,T3,T4 tool;
     class T5 opttool;
-    class AOI,LID,M,S,SOL,RCL,RS data;
+    class AOI,LID,M,S,SOL,RCL,RS,CL data;
     class EXT ext;
 ```
 
