@@ -58,7 +58,9 @@ except ImportError:
 
 PROJECT_EPSG = 3763                                  # ETRS89 / PT-TM06, meters
 SOURCES = ("DEM", "DSM")
-PRODUCTS = ("SLOPE", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLAR")
+PRODUCTS = ("SLOPE", "SLOPEP", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLAR",
+            "SOLARUNI", "SOLAROVC", "SOLARUNIDIR", "SOLARUNIDIF", "SOLARUNIDUR",
+            "SOLAROVCDIR", "SOLAROVCDIF", "SOLAROVCDUR")
 RECLASS_SUFFIX = "RCL"
 MAX_NAME_LEN = 40                                    # margin for suffixes like _DEM_ASPECT_RCL
 RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
@@ -966,8 +968,8 @@ def _assert_projected_raster(path):
 class DeriveSurfaces(object):
     def __init__(self):
         self.label = "02 - Generate Surfaces"
-        self.description = ("Derive topographic surfaces (slope, aspect, hillshade, profile "
-                            "and plan curvature) in batch from the per area DEM and DSM mosaics "
+        self.description = ("Derive topographic surfaces (slope in degrees and percent, aspect, "
+                            "hillshade, profile and plan curvature) in batch from the per area DEM and DSM mosaics "
                             "produced by Build Mosaics By Polygon. Each surface has its own "
                             "checkbox. Only slope and aspect feed the reclassification tool.")
         self.canRunInBackground = False
@@ -1004,6 +1006,11 @@ class DeriveSurfaces(object):
             displayName="Slope (degrees)", name="do_slope",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_slope.value = True
+
+        p_slopep = arcpy.Parameter(
+            displayName="Slope (percent)", name="do_slope_percent",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_slopep.value = False
 
         p_aspect = arcpy.Parameter(
             displayName="Aspect", name="do_aspect",
@@ -1052,7 +1059,7 @@ class DeriveSurfaces(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
-        return [p_in, p_recurse, p_out, p_struct, p_source, p_slope, p_aspect, p_hill,
+        return [p_in, p_recurse, p_out, p_struct, p_source, p_slope, p_slopep, p_aspect, p_hill,
                 p_profc, p_planc, p_z, p_htype, p_az, p_alt, p_overwrite]
 
     def isLicensed(self):
@@ -1067,9 +1074,9 @@ class DeriveSurfaces(object):
         # Output folder is only needed for per_area_subfolder or flat output.
         parameters[2].enabled = parameters[3].valueAsText != "same_as_input"
         # Azimuth/altitude only matter for a Traditional hillshade.
-        traditional = bool(parameters[7].value) and parameters[11].valueAsText == "Traditional"
-        parameters[12].enabled = traditional
+        traditional = bool(parameters[8].value) and parameters[12].valueAsText == "Traditional"
         parameters[13].enabled = traditional
+        parameters[14].enabled = traditional
         return
 
     def updateMessages(self, parameters):
@@ -1085,15 +1092,16 @@ class DeriveSurfaces(object):
         output_structure = parameters[3].valueAsText
         source_filter = parameters[4].valueAsText
         do_slope = bool(parameters[5].value)
-        do_aspect = bool(parameters[6].value)
-        do_hillshade = bool(parameters[7].value)
-        do_profc = bool(parameters[8].value)
-        do_planc = bool(parameters[9].value)
-        z_factor = float(parameters[10].value)
-        hillshade_type = parameters[11].valueAsText
-        azimuth = float(parameters[12].value) if parameters[12].value is not None else 315.0
-        altitude = float(parameters[13].value) if parameters[13].value is not None else 45.0
-        overwrite_existing = bool(parameters[14].value)
+        do_slope_percent = bool(parameters[6].value)
+        do_aspect = bool(parameters[7].value)
+        do_hillshade = bool(parameters[8].value)
+        do_profc = bool(parameters[9].value)
+        do_planc = bool(parameters[10].value)
+        z_factor = float(parameters[11].value)
+        hillshade_type = parameters[12].valueAsText
+        azimuth = float(parameters[13].value) if parameters[13].value is not None else 315.0
+        altitude = float(parameters[14].value) if parameters[14].value is not None else 45.0
+        overwrite_existing = bool(parameters[15].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
         multidirectional = do_hillshade and hillshade_type == "Multidirectional"
@@ -1106,6 +1114,8 @@ class DeriveSurfaces(object):
         wanted = []
         if do_slope:
             wanted.append("SLOPE")
+        if do_slope_percent:
+            wanted.append("SLOPEP")
         if do_aspect:
             wanted.append("ASPECT")
         if do_hillshade:
@@ -1191,6 +1201,9 @@ class DeriveSurfaces(object):
 
                 if todo.get("SLOPE"):
                     arcpy.sa.Slope(path, "DEGREE", z_factor).save(targets["SLOPE"])
+                    created += 1
+                if todo.get("SLOPEP"):
+                    arcpy.sa.Slope(path, "PERCENT_RISE", z_factor).save(targets["SLOPEP"])
                     created += 1
                 if todo.get("ASPECT"):
                     # Aspect takes no z_factor (it is direction only); z_factor applies to
@@ -1496,9 +1509,10 @@ class SolarRadiation(object):
         self.label = "03 - Solar Radiation"
         self.description = ("Compute annual incoming solar radiation (global, kWh/m2) per area from the "
                             "DEM mosaics, in batch, with arcpy.sa.RasterSolarRadiation (GPU accelerated). "
-                            "The DEM is resampled to a coarser solar cell size first, because annual "
-                            "insolation is a smooth field, to keep the heavy whole year computation "
-                            "tractable. This is the heavy tool; expect long run times.")
+                            "Choose the diffuse model (uniform, overcast, or both), and optionally output "
+                            "the direct, diffuse and direct duration rasters. Baseline runs at the native "
+                            "2 m cell size; a coarser solar cell size resamples first. This is the heavy "
+                            "tool; expect long run times.")
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -1532,7 +1546,7 @@ class SolarRadiation(object):
         p_cell = arcpy.Parameter(
             displayName="Solar cell size in meters (0 = native)", name="solar_cell_size",
             datatype="GPDouble", parameterType="Required", direction="Input")
-        p_cell.value = 10
+        p_cell.value = 0
 
         p_method = arcpy.Parameter(
             displayName="Resample method", name="resample_method",
@@ -1561,13 +1575,41 @@ class SolarRadiation(object):
             datatype="GPDouble", parameterType="Required", direction="Input")
         p_diff.value = 0.3
 
+        p_diffuse_model = arcpy.Parameter(
+            displayName="Diffuse model type", name="diffuse_model_type",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_diffuse_model.filter.type = "ValueList"
+        p_diffuse_model.filter.list = ["UNIFORM_SKY", "STANDARD_OVERCAST_SKY", "BOTH"]
+        p_diffuse_model.value = "UNIFORM_SKY"
+
         p_overwrite = arcpy.Parameter(
             displayName="Overwrite existing outputs", name="overwrite_existing",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
+        p_out_direct = arcpy.Parameter(
+            displayName="Output Direct Radiation raster", name="out_direct",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_out_direct.value = True
+
+        p_out_diffuse = arcpy.Parameter(
+            displayName="Output Diffuse Radiation raster", name="out_diffuse",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_out_diffuse.value = True
+
+        p_out_duration = arcpy.Parameter(
+            displayName="Output Direct Duration raster (hours)", name="out_duration",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_out_duration.value = True
+
+        p_reuse = arcpy.Parameter(
+            displayName="Reuse Tool 2 slope and aspect (native runs only)", name="reuse_surfaces",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_reuse.value = False
+
         return [p_in, p_recurse, p_out, p_struct, p_source, p_cell, p_method,
-                p_year, p_neigh, p_trans, p_diff, p_overwrite]
+                p_year, p_neigh, p_trans, p_diff, p_diffuse_model, p_overwrite,
+                p_out_direct, p_out_diffuse, p_out_duration, p_reuse]
 
     def isLicensed(self):
         try:
@@ -1585,6 +1627,34 @@ class SolarRadiation(object):
                                           "same_as_input.")
         return
 
+    def _reuse_slope_aspect(self, mosaic_path, area, source, native, sr):
+        """Find the Tool 02 SLOPE and ASPECT rasters next to the mosaic, to pass as
+        in_slope_raster / in_aspect_raster. Returns (slope, aspect) or (None, None).
+
+        Only returned when both exist and match the DEM cell size and CRS, since
+        RasterSolarRadiation silently resamples a mismatched grid. The slope/aspect units
+        RasterSolarRadiation expects are not documented by Esri, so reuse is off by default;
+        validate with an A/B run (internal vs reused, both native) before trusting it.
+        """
+        folder = os.path.dirname(mosaic_path)
+        slope = os.path.join(folder, build_output_name(area, source, "SLOPE") + ".tif")
+        aspect = os.path.join(folder, build_output_name(area, source, "ASPECT") + ".tif")
+        if not (os.path.exists(slope) and os.path.exists(aspect)):
+            _warn("{} ({}): reuse requested but SLOPE/ASPECT not found next to the mosaic; "
+                  "computing them internally.".format(area, source))
+            return None, None
+        for p in (slope, aspect):
+            r = arcpy.Raster(p)
+            if abs(r.meanCellWidth - native) > 1e-6:
+                _warn("{} ({}): {} cell size differs from the DEM; computing internally to avoid "
+                      "silent resampling.".format(area, source, os.path.basename(p)))
+                return None, None
+            if not _same_crs(r.spatialReference, sr):
+                _warn("{} ({}): {} CRS differs from the DEM; computing internally.".format(
+                    area, source, os.path.basename(p)))
+                return None, None
+        return slope, aspect
+
     def execute(self, parameters, messages):
         in_folder = parameters[0].valueAsText
         recurse = bool(parameters[1].value)
@@ -1597,7 +1667,12 @@ class SolarRadiation(object):
         neighborhood = parameters[8].valueAsText
         transmittivity = float(parameters[9].value)
         diffuse_proportion = float(parameters[10].value)
-        overwrite_existing = bool(parameters[11].value)
+        diffuse_model = parameters[11].valueAsText
+        overwrite_existing = bool(parameters[12].value)
+        out_direct = bool(parameters[13].value)
+        out_diffuse = bool(parameters[14].value)
+        out_duration = bool(parameters[15].value)
+        reuse_surfaces = bool(parameters[16].value)
 
         # Idempotency is handled by an explicit os.path.exists skip below, so overwrite is
         # left on to let the scratch resample step overwrite a stale temp cleanly.
@@ -1615,6 +1690,14 @@ class SolarRadiation(object):
             msg = "Output folder is required unless output structure is same_as_input."
             _err(msg)
             raise ValueError(msg)
+
+        # Diffuse model(s) to run; each is (API value, name suffix). BOTH is two runs.
+        if diffuse_model == "BOTH":
+            models = [("UNIFORM_SKY", "UNI"), ("STANDARD_OVERCAST_SKY", "OVC")]
+        elif diffuse_model == "STANDARD_OVERCAST_SKY":
+            models = [("STANDARD_OVERCAST_SKY", "OVC")]
+        else:
+            models = [("UNIFORM_SKY", "UNI")]
 
         allowed_sources = SOURCES if source_filter == "BOTH" else (source_filter,)
         start_date = "1/1/{}".format(year)
@@ -1645,78 +1728,117 @@ class SolarRadiation(object):
             raise ValueError(msg)
 
         total = len(mosaics)
-        _warn("Solar radiation is a heavy whole year computation. {} mosaic(s) at a {} solar cell size "
-              "may take a long time; benchmark one area first.".format(
-                  total, "{} m".format(solar_cell_size) if solar_cell_size > 0 else "native"))
+        runs = total * len(models)
+        size_label = "{} m".format(solar_cell_size) if solar_cell_size > 0 else "native 2 m"
+        _warn("Solar radiation is a heavy whole year computation. {} run(s) ({} mosaic(s) x {} "
+              "diffuse model(s)) at a {} cell size may take a long time; benchmark one area "
+              "first.".format(runs, total, len(models), size_label))
 
         arcpy.CheckOutExtension("Spatial")
         created = 0
         skipped_existing = 0
         failed = []
         try:
-            arcpy.SetProgressor("step", "Computing solar radiation...", 0, total, 1)
+            arcpy.SetProgressor("step", "Computing solar radiation...", 0, runs, 1)
             for path, area, source in mosaics:
-                arcpy.SetProgressorPosition()
                 if source == "DSM":
                     _warn("{}: solar is computed on the DSM (canopy and building surface), not the "
                           "bare ground a PV plant would sit on.".format(area))
 
-                out_name = build_output_name(area, source, "SOLAR") + ".tif"
-                location = out_folder
                 if output_structure == "same_as_input":
                     location = os.path.dirname(path)
                 elif output_structure == "per_area_subfolder":
                     location = os.path.join(out_folder, area)
+                else:
+                    location = out_folder
                 if not os.path.isdir(location):
                     os.makedirs(location)
-                out_path = os.path.join(location, out_name)
 
-                if os.path.exists(out_path) and not overwrite_existing:
-                    _msg("{} ({}): {} exists, skipping.".format(area, source, out_name))
-                    skipped_existing += 1
-                    continue
+                for api_value, suffix in models:
+                    arcpy.SetProgressorPosition()
+                    token = "SOLAR" + suffix                  # SOLARUNI / SOLAROVC
+                    out_name = build_output_name(area, source, token) + ".tif"
+                    out_path = os.path.join(location, out_name)
 
-                resampled = None
-                try:
-                    sr = _assert_projected_raster(path)
-                    native = arcpy.Raster(path).meanCellWidth
-                    surface = path
-                    if solar_cell_size and solar_cell_size > native:
-                        resampled = os.path.join(arcpy.env.scratchFolder, "solar_{}.tif".format(area))
-                        arcpy.management.Resample(
-                            path, resampled, "{0} {0}".format(solar_cell_size), resample_method)
-                        surface = resampled
+                    if os.path.exists(out_path) and not overwrite_existing:
+                        _msg("{} ({}, {}): {} exists, skipping.".format(area, source, suffix, out_name))
+                        skipped_existing += 1
+                        continue
 
-                    rad = arcpy.sa.RasterSolarRadiation(
-                        in_surface_raster=surface,
-                        start_date_time=start_date,
-                        end_date_time=end_date,
-                        use_time_interval="NO_INTERVAL",
-                        neighborhood_distance=neighborhood,
-                        use_adaptive_neighborhood="ADAPTIVE_NEIGHBORHOOD",
-                        diffuse_model_type="UNIFORM_SKY",
-                        diffuse_proportion=diffuse_proportion,
-                        transmittivity=transmittivity,
-                        analysis_target_device="GPU_THEN_CPU",
-                    )
-                    rad.save(out_path)
-                    _msg("{} ({}): solar radiation (kWh/m2, {}) -> {}".format(
-                        area, source, _crs_label(sr), out_name))
-                    created += 1
-                except Exception as exc:
-                    _warn("{} ({}): solar radiation failed: {}".format(area, source, exc))
-                    failed.append(area)
-                finally:
-                    if resampled and arcpy.Exists(resampled):
-                        arcpy.management.Delete(resampled)
+                    resampled = None
+                    try:
+                        sr = _assert_projected_raster(path)
+                        native = arcpy.Raster(path).meanCellWidth
+                        surface = path
+                        did_resample = False
+                        if solar_cell_size and solar_cell_size > native:
+                            resampled = os.path.join(arcpy.env.scratchFolder,
+                                                     "solar_{}.tif".format(area))
+                            arcpy.management.Resample(
+                                path, resampled, "{0} {0}".format(solar_cell_size), resample_method)
+                            surface = resampled
+                            did_resample = True
+
+                        kwargs = dict(
+                            in_surface_raster=surface,
+                            start_date_time=start_date,
+                            end_date_time=end_date,
+                            use_time_interval="NO_INTERVAL",
+                            neighborhood_distance=neighborhood,
+                            use_adaptive_neighborhood="ADAPTIVE_NEIGHBORHOOD",
+                            diffuse_model_type=api_value,
+                            diffuse_proportion=diffuse_proportion,
+                            transmittivity=transmittivity,
+                            analysis_target_device="GPU_THEN_CPU",
+                        )
+
+                        # Reuse the Tool 02 slope/aspect only on a native run, so the grids
+                        # match; a resampled surface uses the tool's internal slope/aspect.
+                        in_slope = None
+                        if reuse_surfaces and not did_resample:
+                            in_slope, in_aspect = self._reuse_slope_aspect(path, area, source, native, sr)
+                            if in_slope:
+                                kwargs["in_slope_raster"] = in_slope
+                                kwargs["in_aspect_raster"] = in_aspect
+
+                        extras = []
+                        if out_direct:
+                            kwargs["out_direct_radiation_raster"] = os.path.join(
+                                location, build_output_name(area, source, token + "DIR") + ".tif")
+                            extras.append("direct")
+                        if out_diffuse:
+                            kwargs["out_diffuse_radiation_raster"] = os.path.join(
+                                location, build_output_name(area, source, token + "DIF") + ".tif")
+                            extras.append("diffuse")
+                        if out_duration:
+                            kwargs["out_duration_raster"] = os.path.join(
+                                location, build_output_name(area, source, token + "DUR") + ".tif")
+                            extras.append("duration")
+
+                        rad = arcpy.sa.RasterSolarRadiation(**kwargs)
+                        rad.save(out_path)
+                        note = " reusing slope/aspect" if in_slope else ""
+                        note += (" + " + ", ".join(extras)) if extras else ""
+                        _msg("{} ({}, {}): solar radiation (kWh/m2, {}){} -> {}".format(
+                            area, source, suffix, _crs_label(sr), note, out_name))
+                        created += 1
+                    except Exception as exc:
+                        _err("{} ({}, {}): solar radiation failed: {}".format(area, source, suffix, exc))
+                        failed.append("{} ({}, {})".format(area, source, suffix))
+                    finally:
+                        if resampled and arcpy.Exists(resampled):
+                            arcpy.management.Delete(resampled)
 
             arcpy.ResetProgressor()
-            _msg("Done. Mosaics: {}. Solar rasters created: {}. Skipped existing: {}. Failed: {}.".format(
-                total, created, skipped_existing, len(failed)))
-            if failed:
-                _warn("Failed areas: " + ", ".join(failed))
+            _msg("Done. Mosaics: {}. Diffuse model(s): {}. Solar runs created: {}. Skipped existing: "
+                 "{}. Failed: {}.".format(total, len(models), created, skipped_existing, len(failed)))
         finally:
             arcpy.CheckInExtension("Spatial")
+        # Fail loud: if any run failed, the tool result must be a failure, not SUCCESS.
+        if failed:
+            msg = "Solar radiation failed for: " + ", ".join(failed)
+            _err(msg)
+            raise RuntimeError(msg)
         return
 
 
@@ -1744,14 +1866,16 @@ class Resample(object):
             displayName="Data types to resample", name="types",
             datatype="GPString", parameterType="Required", direction="Input", multiValue=True)
         p_types.filter.type = "ValueList"
-        p_types.filter.list = ["DEM", "DSM", "SLOPE", "ASPECT", "HILLSHADE", "PROFC",
-                               "PLANC", "SOLAR", "SLOPE_RCL", "ASPECT_RCL"]
+        # Derived from the tuples so new products (slope percent, solar variants) appear
+        # automatically; the _RCL variants are the products Tool 04 reclassifies.
+        p_types.filter.list = (list(SOURCES) + list(PRODUCTS)
+                               + [p + "_" + RECLASS_SUFFIX for p in ("SLOPE", "ASPECT")])
         p_types.value = ["DEM", "DSM"]
 
         p_cell = arcpy.Parameter(
             displayName="Target cell size (meters)", name="target_cell_size",
             datatype="GPDouble", parameterType="Required", direction="Input")
-        p_cell.value = 10
+        p_cell.value = 5
 
         p_overwrite = arcpy.Parameter(
             displayName="Overwrite existing outputs", name="overwrite_existing",
@@ -1919,6 +2043,9 @@ def _run_self_tests():
         ("Area_Norte", "DSM", "ASPECT", False),
         ("AreaA", "DEM", None, False),               # base mosaic
         ("AreaA", "DEM", "SOLAR", False),
+        ("AreaA", "DEM", "SLOPEP", False),           # slope percent
+        ("AreaA", "DEM", "SOLARUNI", False),         # solar, uniform sky model
+        ("AreaA", "DSM", "SOLAROVCDIR", False),      # solar, overcast model, direct aux
     ]
     for area, source, product, reclass in cases:
         name = build_output_name(area, source, product, reclass)
