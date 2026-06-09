@@ -24,10 +24,10 @@ This toolbox is the **factor engine only**. Any downstream analysis (suitability
 Four tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. A fifth tool, Resample, is an optional utility you can run on any of the outputs:
 
 1. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
-2. **Generate Surfaces**: slope, aspect, hillshade and curvature (profile and plan) from each mosaic.
-3. **Solar Radiation**: annual incoming solar radiation (global, kWh/m2) per area, computed on the DEM with RasterSolarRadiation (GPU).
+2. **Generate Surfaces**: slope (degrees and percent), aspect, hillshade and curvature (profile and plan) from each mosaic.
+3. **Solar Radiation**: annual solar radiation (global, kWh/m2) per area on the DEM with RasterSolarRadiation (GPU), with a choice of diffuse model (uniform, overcast, or both) and optional direct, diffuse and duration outputs, at the native 2 m baseline.
 4. **Reclassify Slope and Aspect**: ordinal integer classes for slope and aspect, defined in a value table.
-5. **Resample** (optional): resample the named rasters to a coarser cell size, for example 2 m to 10 m, into a `Resample` folder grouped by area.
+5. **Resample** (optional): resample the named rasters to a coarser cell size, for example 2 m to 5 m, into a `Resample` folder grouped by area.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -47,7 +47,7 @@ flowchart TD
     M --> T3["Tool 3<br/>Solar Radiation"]
     M -.-> T5["Tool 5 (optional)<br/>Resample"]
     T2 --> S["Surfaces<br/>SLOPE, ASPECT, HILLSHADE, PROFC, PLANC"]
-    T3 --> SOL["Area_DEM_SOLAR.tif<br/>(kWh/m2)"]
+    T3 --> SOL["Area_DEM_SOLARUNI.tif<br/>(kWh/m2)"]
     T5 -.-> RS["Resample folder<br/>coarser cell size (e.g. 2 m to 10 m)<br/>grouped by area"]
     S --> T4["Tool 4<br/>Reclassify Slope and Aspect"]
     T4 --> RCL["Ordinal factors<br/>Area_SOURCE_SLOPE_RCL.tif / _ASPECT_RCL.tif"]
@@ -66,10 +66,10 @@ flowchart TD
 
 - The DGT LiDAR arrives pre-split into one download folder per area of interest, where the folder name ends in the AOI feature FID and holds the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. The 5 km buffer selection was already applied at download time.
 - **Tool 1** groups AOI features by area name (the folder number equals the feature FID), merges each area's MDT and MDS tiles across all of its folders into one DEM and one DSM mosaic, and deduplicates tiles by name. It optionally verifies, per folder, that the tile extent contains the AOI polygon centroid (a guard against a wrong FID mapping).
-- **Tool 2** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
-- **Tool 3** computes annual global solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated). The DEM is resampled to a coarser solar cell size first (default 10 m) because annual insolation is a smooth field, which keeps the heavy whole year run tractable.
+- **Tool 2** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees, and optionally percent; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
+- **Tool 3** computes annual solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated), at the native 2 m baseline. You pick the diffuse model (uniform, overcast, or both) and can also output the direct, diffuse and direct duration rasters; the output names carry the model (`SOLARUNI`, `SOLAROVC`). A coarser solar cell size resamples the DEM first.
 - **Tool 4** reclassifies slope and aspect into ordinal integer classes using `[min, max)` semantics (the last class inclusive at the top), implemented in numpy for deterministic boundaries. The value table validation fails loud on gaps and on overlaps between different class ids before anything is written.
-- **Tool 5** (optional) resamples the selected data types to a target cell size with core Resample, writing to a `Resample` folder grouped by area; continuous rasters use bilinear, reclassified (`_RCL`) rasters use nearest. Typical use is 2 m to 10 m to lighten the later steps.
+- **Tool 5** (optional) resamples the selected data types to a target cell size with core Resample, writing to a `Resample` folder grouped by area; continuous rasters use bilinear, reclassified (`_RCL`) rasters use nearest. Typical use is 2 m to 5 m to lighten the later steps.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent check.
 
 ---
@@ -140,7 +140,7 @@ Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox 
 | Output structure | `same_as_input` (default; each surface is written next to its input mosaic), `per_area_subfolder`, or `flat`. |
 | Output folder | Only for `per_area_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
 | Source | `BOTH` (default), `DEM`, or `DSM`. |
-| Slope, Aspect, Hillshade, Profile curvature, Plan curvature | One checkbox each. |
+| Slope (degrees), Slope (percent), Aspect, Hillshade, Profile curvature, Plan curvature | One checkbox each; slope percent is off by default. |
 | Z factor | Default 1 (project is metric). |
 | Hillshade type | `Multidirectional` (default, Image Analyst) or `Traditional`. |
 | Hillshade azimuth, altitude | Traditional hillshade only. |
@@ -148,7 +148,7 @@ Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox 
 
 ### Tool 3, Solar Radiation
 
-Annual incoming solar radiation (global, kWh/m2) per area, with `RasterSolarRadiation` (GPU when available). This is the heavy tool; expect long run times. The DEM is resampled to a coarser solar cell size first, since annual insolation is a smooth field.
+Annual solar radiation (global, kWh/m2) per area, with `RasterSolarRadiation` (GPU when available). Choose the diffuse model and which rasters to output. The baseline runs at the native 2 m cell size; a coarser solar cell size resamples the DEM first. This is the heavy tool; expect long run times.
 
 | Parameter | Description |
 | --- | --- |
@@ -156,12 +156,17 @@ Annual incoming solar radiation (global, kWh/m2) per area, with `RasterSolarRadi
 | Recurse subfolders | On (default). |
 | Output structure, Output folder | `same_as_input` default, as in the other tools. |
 | Source | `DEM` (default, the terrain resource for ground PV), `DSM`, or `BOTH`. |
-| Solar cell size | Meters to resample the DEM to before the run; default 10 (0 = native 2 m). |
+| Solar cell size | Meters to resample the DEM to before the run; default `0` (native 2 m baseline). A value above the native size resamples first. |
 | Resample method | `BILINEAR` (default). |
 | Year | Whole year; the year only sets the leap year. |
 | Shadow neighborhood distance | How far to look for terrain shadows; default `1000 Meters`, adaptive. |
 | Transmittivity, Diffuse proportion | Atmosphere; defaults 0.6 and 0.3 (clear-sky conditions). |
+| Diffuse model type | `UNIFORM_SKY` (default), `STANDARD_OVERCAST_SKY`, or `BOTH`. `BOTH` runs both and writes `SOLARUNI` and `SOLAROVC`. |
+| Output Direct, Diffuse, Direct Duration | One checkbox each, on by default; written as `..._SOLARUNIDIR`, `_SOLARUNIDIF`, `_SOLARUNIDUR` (and the `_SOLAROVC` equivalents). Duration is in hours, the rest in kWh/m2. |
+| Reuse Tool 2 slope and aspect | Off by default. On native runs only, passes the existing SLOPE and ASPECT rasters so they are not recomputed; guarded on cell size and CRS. Validate with an A/B run first. |
 | Overwrite | Off skips existing outputs. |
+
+Running at the native 2 m with the default 1000 m shadow neighborhood is the heaviest combination (about 25 million cells per area, with a 500 cell shadow radius), so each area takes much longer than at a coarser cell size. Benchmark one area first.
 
 ### Tool 4, Reclassify Slope and Aspect
 
@@ -183,14 +188,14 @@ The value table allows the **same `class_id` on multiple rows**, which supports 
 
 ### Tool 5, Resample
 
-Resample the named rasters to a coarser cell size (for example 2 m to 10 m), in batch. An optional utility; point it at any folder of mosaics or surfaces. Outputs go to a `Resample` folder inside the results root, grouped by area, with the file names unchanged, so the other tools read them the same way.
+Resample the named rasters to a coarser cell size (for example 2 m to 5 m), in batch. An optional utility; point it at any folder of mosaics or surfaces. Outputs go to a `Resample` folder inside the results root, grouped by area, with the file names unchanged, so the other tools read them the same way.
 
 | Parameter | Description |
 | --- | --- |
 | Results folder | The results root; a `Resample` subfolder is created inside it. |
 | Recurse subfolders | On (default) finds the `per_area_subfolder` layout. |
-| Data types to resample | Multi-select: `DEM`, `DSM`, `SLOPE`, `ASPECT`, `HILLSHADE`, `PROFC`, `PLANC`, `SOLAR`, `SLOPE_RCL`, `ASPECT_RCL`. Default `DEM`, `DSM`. |
-| Target cell size (meters) | Default 10. |
+| Data types to resample | Multi-select of the sources (`DEM`, `DSM`), the surfaces (`SLOPE`, `SLOPEP`, `ASPECT`, ...), the solar variants, and the `_RCL` factors. The list is derived from the naming convention, so new products appear automatically. Default `DEM`, `DSM`. |
+| Target cell size (meters) | Default 5. |
 | Overwrite existing outputs | Off skips existing resampled rasters. |
 
 The method is automatic per type: bilinear for continuous rasters, nearest for reclassified (`_RCL`) so the ordinal classes are preserved. A raster already at the target cell size is copied through unchanged, so the `Resample` folder stays a complete set; a target finer than the native cell size warns, since upsampling adds no real detail.
@@ -202,7 +207,8 @@ The method is automatic per type: bilinear for continuous rasters, nearest for r
 A single convention links the tools:
 
 - Mosaic: `{Area}_{SOURCE}` where SOURCE is `DEM` or `DSM`.
-- Surface: `{Area}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE`, `ASPECT`, `HILLSHADE`, `PROFC`, `PLANC` or `SOLAR`.
+- Surface: `{Area}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE` (degrees), `SLOPEP` (percent), `ASPECT`, `HILLSHADE`, `PROFC` or `PLANC`.
+- Solar: `{Area}_{SOURCE}_SOLARUNI` or `_SOLAROVC` (global, by diffuse model), with `_SOLARUNIDIR` / `_SOLARUNIDIF` / `_SOLARUNIDUR` (and the `_SOLAROVC` equivalents) for the optional direct, diffuse and duration rasters.
 - Reclassified: the surface name plus `_RCL`.
 
 The `.tif` extension is added on write. Area names are sanitized for ArcGIS and the file system (accents and c cedilla folded to ASCII, separators to underscore). If two different areas sanitize to the same name they get a numeric suffix; several AOI polygons of the **same** area are merged into one output.
