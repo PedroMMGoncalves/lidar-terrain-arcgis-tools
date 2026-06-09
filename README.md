@@ -48,7 +48,10 @@ flowchart TD
     M --> T3["Tool 3<br/>Solar Radiation"]
     M -.-> T5["Tool 5 (optional)<br/>Resample"]
     CL -.-> T2
+    CL -.-> T3
+    CL -.-> T5
     T2 --> S["Surfaces<br/>SLOPE, SLOPEP, ASPECT, HILLSHADE, PROFC, PLANC"]
+    S -.->|reuse slope, aspect| T3
     T3 --> SOL["Solar<br/>Area_SOURCE_SOLARUNI / SOLAROVC<br/>(+ optional direct, diffuse, duration)"]
     T5 -.-> RS["Resample folder<br/>coarser cell size (e.g. 2 m to 5 m)<br/>grouped by area"]
     S --> T4["Tool 4<br/>Reclassify Slope and Aspect"]
