@@ -366,6 +366,36 @@ def _parse_vrt_extent(xml_text):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def build_clusters(keys, pairs):
+    """Connected components by union-find. `keys` is an iterable of hashable node ids;
+    `pairs` is an iterable of (a, b) tuples meaning a and b belong to the same cluster.
+    Returns a list of clusters, each a sorted list of keys, the clusters themselves ordered
+    by their smallest key. A key that appears in no pair is its own one member cluster.
+    """
+    parent = {k: k for k in keys}
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:                          # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    for a, b in pairs:
+        if a in parent and b in parent:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+    groups = {}
+    for k in parent:
+        groups.setdefault(find(k), []).append(k)
+    comps = [sorted(g) for g in groups.values()]
+    comps.sort(key=lambda g: g[0])
+    return comps
+
+
 def detect_folder_prefix(names):
     """Infer the common folder name prefix that precedes the trailing FID integer.
 
@@ -705,18 +735,156 @@ class BuildMosaicsByPolygon(object):
             displayName="Tile resolution (leave blank to auto-detect, e.g. 2m or 50cm)", name="tile_resolution",
             datatype="GPString", parameterType="Optional", direction="Input")
 
+        p_clusters = arcpy.Parameter(
+            displayName="Also build overlap clusters", name="build_clusters",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_clusters.value = False
+
+        p_dry_run = arcpy.Parameter(
+            displayName="Report clusters only (no build)", name="cluster_dry_run",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_dry_run.value = False
+
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
-                p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res]
+                p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res,
+                p_clusters, p_dry_run]
 
     def isLicensed(self):
         # Uses core Mosaic To New Raster, no Spatial Analyst needed.
         return True
 
     def updateParameters(self, parameters):
+        # The cluster dry-run only applies when clustering is on.
+        parameters[14].enabled = bool(parameters[13].value)
         return
 
     def updateMessages(self, parameters):
         return
+
+    def _build_clusters(self, groups, fid_to_geom, fid_to_folder, products,
+                        out_folder, pixel_type, mosaic_method, tile_resolution,
+                        skip_incomplete, overwrite_existing, dry_run):
+        """Aggregate areas whose AOI polygons are contiguous (touch or overlap) into one
+        mosaic per cluster, in parallel to the per area output.
+
+        Every area is placed in exactly one cluster (a non overlapping area is its own one
+        member cluster), since the per area and cluster outputs serve different uses. Clusters
+        go to a 'clusters' subfolder of the output folder, named Cluster_NNN by the smallest
+        member FID, each with a Cluster_NNN_members.txt manifest (the authority on the
+        cluster's content; the ids depend on the AOI and renumber if it is edited).
+        """
+        # Reserve the Cluster_ prefix so a real area cannot collide with a generated id.
+        for area, _fids in groups:
+            if area.startswith("Cluster_") and area[len("Cluster_"):].isdigit():
+                msg = ("Area '{}' collides with the reserved cluster name prefix 'Cluster_'. "
+                       "Rename it before building clusters.").format(area)
+                _err(msg)
+                raise ValueError(msg)
+
+        # One node per area group, keyed by its smallest FID; union its polygons once.
+        nodes = []                        # (min_fid, area, fids, union_geom, extent)
+        for area, fids in groups:
+            geoms = [fid_to_geom[f] for f in fids if fid_to_geom.get(f) is not None]
+            if not geoms:
+                continue
+            union = geoms[0]
+            for g in geoms[1:]:
+                union = union.union(g)
+            nodes.append((min(fids), area, fids, union, union.extent))
+        if not nodes:
+            _warn("Clusters requested but no AOI geometry is available; skipping clustering.")
+            return
+
+        # Contiguity edges: polygons that are not disjoint (touch or overlap). The bounding
+        # box check is a cheap pre filter before the full, slower geometry test.
+        by_key = {n[0]: n for n in nodes}
+        pairs = []
+        for i in range(len(nodes)):
+            ki, _ai, _fi, gi, ei = nodes[i]
+            for j in range(i + 1, len(nodes)):
+                kj, _aj, _fj, gj, ej = nodes[j]
+                if (ei.XMax < ej.XMin or ej.XMax < ei.XMin
+                        or ei.YMax < ej.YMin or ej.YMax < ei.YMin):
+                    continue
+                if not gi.disjoint(gj):
+                    pairs.append((ki, kj))
+
+        clusters = build_clusters(list(by_key.keys()), pairs)
+        _msg("Clustering: {} area(s) form {} cluster(s) by contiguity.".format(
+            len(nodes), len(clusters)))
+
+        cluster_root = os.path.join(out_folder, "clusters")
+        built = 0
+        skipped = 0
+        arcpy.SetProgressor("step", "Building clusters...", 0, len(clusters), 1)
+        for idx, member_keys in enumerate(clusters, start=1):
+            arcpy.SetProgressorPosition()
+            cluster_id = "Cluster_{:03d}".format(idx)
+            members = [by_key[k] for k in member_keys]
+            member_areas = sorted(m[1] for m in members)
+            all_fids = sorted(f for m in members for f in m[2])
+            present = [f for f in all_fids if f in fid_to_folder]
+            missing = [f for f in all_fids if f not in fid_to_folder]
+
+            if dry_run:
+                _msg("{}: {} area(s) [{}]; FIDs present {}/{}.".format(
+                    cluster_id, len(member_areas), ", ".join(member_areas),
+                    len(present), len(all_fids)))
+                continue
+
+            if not present:
+                _warn("{}: no download folders present for any member; skipping.".format(cluster_id))
+                skipped += 1
+                continue
+            if missing and skip_incomplete:
+                _warn("{}: members not fully downloaded (FIDs {}); skipping (incomplete). "
+                      "Re-run when the download finishes.".format(cluster_id, missing))
+                skipped += 1
+                continue
+
+            present_folders = [fid_to_folder[f] for f in present]
+            location = os.path.join(cluster_root, cluster_id)
+            if not os.path.isdir(location):
+                os.makedirs(location)
+
+            made = 0
+            for source, product_prefix in products:
+                out_name = build_output_name(cluster_id, source) + ".tif"
+                out_path = os.path.join(location, out_name)
+                if os.path.exists(out_path) and not overwrite_existing:
+                    _msg("{} ({}): exists, skipping ({}).".format(cluster_id, source, out_name))
+                    continue
+                tiles, sr, cell, res_used = _gather_product_tiles(
+                    present_folders, product_prefix, tile_resolution)
+                if not tiles:
+                    continue
+                arcpy.management.MosaicToNewRaster(
+                    input_rasters=tiles,
+                    output_location=location,
+                    raster_dataset_name_with_extension=out_name,
+                    coordinate_system_for_the_raster=sr,
+                    pixel_type=pixel_type,
+                    number_of_bands=1,
+                    mosaic_method=mosaic_method,
+                )
+                size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
+                _msg("{} ({}): mosaicked {} tiles ({}) from {} member area(s) -> {}".format(
+                    cluster_id, source, len(tiles), size_label, len(member_areas), out_name))
+                made += 1
+
+            with open(os.path.join(location, cluster_id + "_members.txt"), "w", encoding="utf-8") as fh:
+                fh.write("{}\n".format(cluster_id))
+                fh.write("Member areas ({}):\n".format(len(member_areas)))
+                for a in member_areas:
+                    fh.write("  {}\n".format(a))
+                fh.write("FIDs: {}\n".format(", ".join(str(f) for f in all_fids)))
+            if made:
+                built += 1
+
+        arcpy.ResetProgressor()
+        if not dry_run:
+            _msg("Clusters done. Built: {}. Skipped: {}. Output in '{}'.".format(
+                built, skipped, cluster_root))
 
     def execute(self, parameters, messages):
         in_aoi = parameters[0].valueAsText
@@ -732,6 +900,8 @@ class BuildMosaicsByPolygon(object):
         verify_extent = bool(parameters[10].value)
         folder_prefix = parameters[11].valueAsText
         tile_resolution = (parameters[12].valueAsText or "").strip() or None
+        build_cluster_mosaics = bool(parameters[13].value)
+        cluster_dry_run = bool(parameters[14].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -944,6 +1114,12 @@ class BuildMosaicsByPolygon(object):
             _warn("Folders present but no tiles found: " + ", ".join(skipped_no_tiles))
         if skipped_mismatch:
             _warn("Extent mismatch, check FID mapping: " + ", ".join(skipped_mismatch))
+
+        if build_cluster_mosaics:
+            self._build_clusters(
+                groups, fid_to_geom, fid_to_folder, products, out_folder, pixel_type,
+                mosaic_method, tile_resolution, skip_incomplete, overwrite_existing,
+                cluster_dry_run)
         return
 
 
@@ -2113,6 +2289,18 @@ def _run_self_tests():
                  lambda: detect_folder_prefix(["a_7", "b_8"]))
     check_raises("no trailing number raises",
                  lambda: detect_folder_prefix(["nodigits", "also_none"]))
+
+    print("build_clusters")
+    check("two overlapping merge, third separate",
+          build_clusters([1, 2, 3], [(1, 2)]) == [[1, 2], [3]])
+    check("transitive chain merges",
+          build_clusters([1, 2, 3, 4], [(1, 2), (2, 3)]) == [[1, 2, 3], [4]])
+    check("no pairs all singletons",
+          build_clusters([3, 1, 2], []) == [[1], [2], [3]])
+    check("ordered by smallest key",
+          build_clusters([5, 9, 2], [(5, 9)]) == [[2], [5, 9]])
+    check("pair with unknown key ignored",
+          build_clusters([1, 2], [(1, 99)]) == [[1], [2]])
 
     print("_parse_tile_resolution")
     check("2m token from a DGT name",
