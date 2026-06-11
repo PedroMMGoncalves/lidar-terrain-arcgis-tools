@@ -745,9 +745,16 @@ class BuildMosaicsByPolygon(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_dry_run.value = False
 
+        p_mapping = arcpy.Parameter(
+            displayName="Folder to area mapping", name="folder_mapping",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_mapping.filter.type = "ValueList"
+        p_mapping.filter.list = ["by geometry", "by FID number"]
+        p_mapping.value = "by geometry"
+
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
                 p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res,
-                p_clusters, p_dry_run]
+                p_clusters, p_dry_run, p_mapping]
 
     def isLicensed(self):
         # Uses core Mosaic To New Raster, no Spatial Analyst needed.
@@ -886,6 +893,57 @@ class BuildMosaicsByPolygon(object):
             _msg("Clusters done. Built: {}. Skipped: {}. Output in '{}'.".format(
                 built, skipped, cluster_root))
 
+    def _map_folders_by_geometry(self, data_folders, fid_to_geom, aoi_sr):
+        """Map each AOI feature to its download folder by geometry, not by the FID number in
+        the folder name. For each feature, pick the folder whose tile extent (from the .vrt)
+        contains the feature centroid and whose extent center is nearest that centroid (the
+        folder downloaded for that feature). Immune to a shapefile whose FID order no longer
+        matches the folder numbering used at download time. Tiles are EPSG:3763, so the AOI
+        centroid is projected to that CRS to compare.
+        """
+        tile_sr = arcpy.SpatialReference(PROJECT_EPSG)
+        folders = []                       # (full, extent_polygon, extent_center)
+        for name, full in data_folders:
+            ext = _folder_extent_polygon(full, tile_sr)
+            if ext is None:
+                _warn("Folder '{}' has no .vrt; cannot map it by geometry. Skipping it.".format(name))
+                continue
+            folders.append((full, ext, ext.centroid))
+        if not folders:
+            msg = ("No data folder has a .vrt extent, so the geometry mapping has nothing to "
+                   "match against. Switch 'Folder to area mapping' to 'by FID number'.")
+            _err(msg)
+            raise ValueError(msg)
+
+        fid_to_folder = {}
+        unmatched = 0
+        for fid, geom in fid_to_geom.items():
+            if geom is None:
+                continue
+            projected = geom if _same_crs(aoi_sr, tile_sr) else geom.projectAs(tile_sr)
+            c = projected.centroid
+            pt = arcpy.PointGeometry(c, tile_sr)
+            best_full = None
+            best_d = None
+            for full, ext, center in folders:
+                if not ext.contains(pt):
+                    continue
+                d = (c.X - center.X) ** 2 + (c.Y - center.Y) ** 2
+                if best_d is None or d < best_d:
+                    best_full, best_d = full, d
+            if best_full is None:
+                unmatched += 1
+                continue
+            fid_to_folder[fid] = best_full
+
+        present = sum(1 for g in fid_to_geom.values() if g is not None)
+        _msg("Mapped {} of {} AOI feature(s) to a folder by geometry.".format(
+            len(fid_to_folder), present))
+        if unmatched:
+            _warn("{} AOI feature(s) had no folder whose extent contains their centroid "
+                  "(not downloaded yet, or outside the tile coverage).".format(unmatched))
+        return fid_to_folder
+
     def execute(self, parameters, messages):
         in_aoi = parameters[0].valueAsText
         area_field = parameters[1].valueAsText
@@ -902,6 +960,7 @@ class BuildMosaicsByPolygon(object):
         tile_resolution = (parameters[12].valueAsText or "").strip() or None
         build_cluster_mosaics = bool(parameters[13].value)
         cluster_dry_run = bool(parameters[14].value)
+        mapping_mode = parameters[15].valueAsText
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -963,29 +1022,32 @@ class BuildMosaicsByPolygon(object):
             _err(msg)
             raise ValueError(msg)
 
-        if folder_prefix:
-            prefix = folder_prefix
+        if mapping_mode == "by geometry":
+            fid_to_folder = self._map_folders_by_geometry(data_folders, fid_to_geom, aoi_sr)
         else:
-            prefix = detect_folder_prefix([name for name, _ in data_folders])
-            _msg("Auto-detected folder prefix: '{}'.".format(prefix))
+            if folder_prefix:
+                prefix = folder_prefix
+            else:
+                prefix = detect_folder_prefix([name for name, _ in data_folders])
+                _msg("Auto-detected folder prefix: '{}'.".format(prefix))
 
-        fid_to_folder = {}
-        for name, full in data_folders:
-            if not name.startswith(prefix):
-                _warn("Data folder '{}' does not match prefix '{}'. Skipping it.".format(name, prefix))
-                continue
-            suffix = name[len(prefix):]
-            if not suffix.isdigit():
-                _warn("Data folder '{}' has no FID number after the prefix. Skipping it.".format(name))
-                continue
-            fid = int(suffix)
-            if fid in fid_to_folder:
-                msg = ("Two data folders map to FID {}: '{}' and '{}'. Ambiguous mapping; set "
-                       "an explicit folder prefix.").format(
-                           fid, os.path.basename(fid_to_folder[fid]), name)
-                _err(msg)
-                raise ValueError(msg)
-            fid_to_folder[fid] = full
+            fid_to_folder = {}
+            for name, full in data_folders:
+                if not name.startswith(prefix):
+                    _warn("Data folder '{}' does not match prefix '{}'. Skipping it.".format(name, prefix))
+                    continue
+                suffix = name[len(prefix):]
+                if not suffix.isdigit():
+                    _warn("Data folder '{}' has no FID number after the prefix. Skipping it.".format(name))
+                    continue
+                fid = int(suffix)
+                if fid in fid_to_folder:
+                    msg = ("Two data folders map to FID {}: '{}' and '{}'. Ambiguous mapping; set "
+                           "an explicit folder prefix.").format(
+                               fid, os.path.basename(fid_to_folder[fid]), name)
+                    _err(msg)
+                    raise ValueError(msg)
+                fid_to_folder[fid] = full
 
         total = len(groups)
         built_areas = 0
@@ -1034,7 +1096,7 @@ class BuildMosaicsByPolygon(object):
             # Spatial sanity check: each folder's VRT extent must contain its FID's AOI
             # polygon centroid. Catches a wrong FID to folder mapping (disjoint was too weak,
             # an adjacent folder still overlaps).
-            if verify_extent:
+            if verify_extent and mapping_mode != "by geometry":
                 mismatch = False
                 for f in present:
                     folder_poly = _folder_extent_polygon(fid_to_folder[f], ref_tile_sr)
