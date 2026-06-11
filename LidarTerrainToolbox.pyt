@@ -653,6 +653,40 @@ def _folder_extent_polygon(folder, sr):
     return arcpy.Polygon(corners, sr)
 
 
+def _folder_extent_resolved(folder, sr):
+    """Coverage extent of a download folder as a Polygon in `sr`, with a fallback chain: the
+    folder's .vrt first (one cheap XML read), else the union of the MDT/MDS tile extents (more
+    I/O, one header read per tile). Returns None only when there is neither a readable .vrt nor
+    any readable tile. `sr` must be the tiles CRS.
+    """
+    ext = _folder_extent_polygon(folder, sr)
+    if ext is not None:
+        return ext
+    xmin = ymin = xmax = ymax = None
+    for dirpath, _dirs, files in os.walk(folder):
+        for fn in files:
+            if not fn.lower().endswith(".tif"):
+                continue
+            if not (fn.startswith("MDT") or fn.startswith("MDS")):
+                continue
+            try:
+                e = arcpy.Describe(os.path.join(dirpath, fn)).extent
+            except Exception:
+                continue
+            if e is None:
+                continue
+            xmin = e.XMin if xmin is None else min(xmin, e.XMin)
+            ymin = e.YMin if ymin is None else min(ymin, e.YMin)
+            xmax = e.XMax if xmax is None else max(xmax, e.XMax)
+            ymax = e.YMax if ymax is None else max(ymax, e.YMax)
+    if xmin is None:
+        return None
+    corners = arcpy.Array([arcpy.Point(xmin, ymin), arcpy.Point(xmin, ymax),
+                           arcpy.Point(xmax, ymax), arcpy.Point(xmax, ymin),
+                           arcpy.Point(xmin, ymin)])
+    return arcpy.Polygon(corners, sr)
+
+
 class BuildMosaicsByPolygon(object):
     def __init__(self):
         self.label = "01 - Build Mosaics by Polygon"
@@ -893,55 +927,97 @@ class BuildMosaicsByPolygon(object):
             _msg("Clusters done. Built: {}. Skipped: {}. Output in '{}'.".format(
                 built, skipped, cluster_root))
 
-    def _map_folders_by_geometry(self, data_folders, fid_to_geom, aoi_sr):
+    def _map_folders_by_geometry(self, data_folders, fid_to_geom, fid_to_area, aoi_sr, folder_prefix):
         """Map each AOI feature to its download folder by geometry, not by the FID number in
-        the folder name. For each feature, pick the folder whose tile extent (from the .vrt)
-        contains the feature centroid and whose extent center is nearest that centroid (the
-        folder downloaded for that feature). Immune to a shapefile whose FID order no longer
-        matches the folder numbering used at download time. Tiles are EPSG:3763, so the AOI
-        centroid is projected to that CRS to compare.
+        the folder name. For each feature, pick the folder whose tile extent center is nearest
+        the feature bounding box center, among folders whose extent contains that center. Each
+        download is the feature buffered symmetrically, so the folder extent center matches the
+        feature box center; this holds even for areas a few hundred meters apart, and is immune
+        to a shapefile whose FID order no longer matches the folder numbering. Folder extent
+        comes from the .vrt, else the union of the tile extents. A feature with no folder extent
+        around it falls back to the FID number folder, with a warning, since that step is only
+        right when the FID order matches the download. Tiles are EPSG:3763.
         """
         tile_sr = arcpy.SpatialReference(PROJECT_EPSG)
-        folders = []                       # (full, extent_polygon, extent_center)
+
+        folders = []                       # (full, extent_polygon, center_x, center_y)
         for name, full in data_folders:
-            ext = _folder_extent_polygon(full, tile_sr)
+            ext = _folder_extent_resolved(full, tile_sr)
             if ext is None:
-                _warn("Folder '{}' has no .vrt; cannot map it by geometry. Skipping it.".format(name))
+                _warn("Folder '{}' has no .vrt and no readable tiles; cannot place it by "
+                      "geometry.".format(name))
                 continue
-            folders.append((full, ext, ext.centroid))
+            ce = ext.extent
+            folders.append((full, ext, (ce.XMin + ce.XMax) / 2.0, (ce.YMin + ce.YMax) / 2.0))
         if not folders:
-            msg = ("No data folder has a .vrt extent, so the geometry mapping has nothing to "
-                   "match against. Switch 'Folder to area mapping' to 'by FID number'.")
+            msg = ("No data folder yielded a tile extent (.vrt or tiles), so the geometry "
+                   "mapping has nothing to match. Switch 'Folder to area mapping' to "
+                   "'by FID number'.")
             _err(msg)
             raise ValueError(msg)
 
+        # Lenient FID number map, used only for the last resort fallback below.
+        prefix = folder_prefix
+        if not prefix:
+            try:
+                prefix = detect_folder_prefix([name for name, _ in data_folders])
+            except Exception:
+                prefix = None
+        fid_num_to_folder = {}
+        if prefix:
+            for name, full in data_folders:
+                suffix = name[len(prefix):] if name.startswith(prefix) else ""
+                if suffix.isdigit():
+                    fid_num_to_folder.setdefault(int(suffix), full)
+
+        tie_tolerance = 500.0              # meters; flag near ties for the user to verify
         fid_to_folder = {}
-        unmatched = 0
+        ambiguous = []
+        fallback = []
+        unmatched = []
         for fid, geom in fid_to_geom.items():
             if geom is None:
                 continue
             projected = geom if _same_crs(aoi_sr, tile_sr) else geom.projectAs(tile_sr)
-            c = projected.centroid
-            pt = arcpy.PointGeometry(c, tile_sr)
+            fe = projected.extent
+            fx = (fe.XMin + fe.XMax) / 2.0
+            fy = (fe.YMin + fe.YMax) / 2.0
+            pt = arcpy.PointGeometry(arcpy.Point(fx, fy), tile_sr)
             best_full = None
             best_d = None
-            for full, ext, center in folders:
+            second_d = None
+            for full, ext, cx, cy in folders:
                 if not ext.contains(pt):
                     continue
-                d = (c.X - center.X) ** 2 + (c.Y - center.Y) ** 2
+                d = (fx - cx) ** 2 + (fy - cy) ** 2
                 if best_d is None or d < best_d:
+                    second_d = best_d
                     best_full, best_d = full, d
-            if best_full is None:
-                unmatched += 1
-                continue
-            fid_to_folder[fid] = best_full
+                elif second_d is None or d < second_d:
+                    second_d = d
+            if best_full is not None:
+                fid_to_folder[fid] = best_full
+                if second_d is not None and (second_d ** 0.5 - best_d ** 0.5) < tie_tolerance:
+                    ambiguous.append(fid)
+            elif fid in fid_num_to_folder:
+                fid_to_folder[fid] = fid_num_to_folder[fid]
+                fallback.append(fid)
+            else:
+                unmatched.append(fid)
 
         present = sum(1 for g in fid_to_geom.values() if g is not None)
         _msg("Mapped {} of {} AOI feature(s) to a folder by geometry.".format(
             len(fid_to_folder), present))
+        for fid in ambiguous:
+            _warn("Area '{}' (FID {}): two folders were nearly equidistant; geometry picked the "
+                  "nearest, verify it.".format(fid_to_area.get(fid, "?"), fid))
+        for fid in fallback:
+            _warn("Area '{}' (FID {}): no folder extent around it; mapped by FID number as a "
+                  "fallback, verify it (wrong if the FID order does not match the "
+                  "download).".format(fid_to_area.get(fid, "?"), fid))
         if unmatched:
-            _warn("{} AOI feature(s) had no folder whose extent contains their centroid "
-                  "(not downloaded yet, or outside the tile coverage).".format(unmatched))
+            _warn("{} AOI feature(s) could not be mapped to any folder (not downloaded yet): "
+                  "FID {}.".format(len(unmatched), ", ".join(str(f) for f in sorted(unmatched))))
         return fid_to_folder
 
     def execute(self, parameters, messages):
@@ -1023,7 +1099,8 @@ class BuildMosaicsByPolygon(object):
             raise ValueError(msg)
 
         if mapping_mode == "by geometry":
-            fid_to_folder = self._map_folders_by_geometry(data_folders, fid_to_geom, aoi_sr)
+            fid_to_folder = self._map_folders_by_geometry(
+                data_folders, fid_to_geom, fid_to_area, aoi_sr, folder_prefix)
         else:
             if folder_prefix:
                 prefix = folder_prefix
