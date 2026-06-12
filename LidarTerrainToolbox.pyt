@@ -927,7 +927,7 @@ class BuildMosaicsByPolygon(object):
             _msg("Clusters done. Built: {}. Skipped: {}. Output in '{}'.".format(
                 built, skipped, cluster_root))
 
-    def _map_folders_by_geometry(self, data_folders, fid_to_geom, fid_to_area, aoi_sr, folder_prefix):
+    def _map_folders_by_geometry(self, data_folders, fid_to_geom, fid_to_area, aoi_sr):
         """Map each AOI feature to its download folder by geometry, not by the FID number in
         the folder name. For each feature, pick the folder whose tile extent center is nearest
         the feature bounding box center, among folders whose extent contains that center. Each
@@ -935,8 +935,8 @@ class BuildMosaicsByPolygon(object):
         feature box center; this holds even for areas a few hundred meters apart, and is immune
         to a shapefile whose FID order no longer matches the folder numbering. Folder extent
         comes from the .vrt, else the union of the tile extents. A feature with no folder extent
-        around it falls back to the FID number folder, with a warning, since that step is only
-        right when the FID order matches the download. Tiles are EPSG:3763.
+        around it is left unmapped and its area is skipped, since a downloaded folder always has
+        a resolvable extent, so no match means the data is not there. Tiles are EPSG:3763.
         """
         tile_sr = arcpy.SpatialReference(PROJECT_EPSG)
 
@@ -956,24 +956,9 @@ class BuildMosaicsByPolygon(object):
             _err(msg)
             raise ValueError(msg)
 
-        # Lenient FID number map, used only for the last resort fallback below.
-        prefix = folder_prefix
-        if not prefix:
-            try:
-                prefix = detect_folder_prefix([name for name, _ in data_folders])
-            except Exception:
-                prefix = None
-        fid_num_to_folder = {}
-        if prefix:
-            for name, full in data_folders:
-                suffix = name[len(prefix):] if name.startswith(prefix) else ""
-                if suffix.isdigit():
-                    fid_num_to_folder.setdefault(int(suffix), full)
-
         tie_tolerance = 500.0              # meters; flag near ties for the user to verify
         fid_to_folder = {}
         ambiguous = []
-        fallback = []
         unmatched = []
         for fid, geom in fid_to_geom.items():
             if geom is None:
@@ -999,9 +984,6 @@ class BuildMosaicsByPolygon(object):
                 fid_to_folder[fid] = best_full
                 if second_d is not None and (second_d ** 0.5 - best_d ** 0.5) < tie_tolerance:
                     ambiguous.append(fid)
-            elif fid in fid_num_to_folder:
-                fid_to_folder[fid] = fid_num_to_folder[fid]
-                fallback.append(fid)
             else:
                 unmatched.append(fid)
 
@@ -1011,13 +993,10 @@ class BuildMosaicsByPolygon(object):
         for fid in ambiguous:
             _warn("Area '{}' (FID {}): two folders were nearly equidistant; geometry picked the "
                   "nearest, verify it.".format(fid_to_area.get(fid, "?"), fid))
-        for fid in fallback:
-            _warn("Area '{}' (FID {}): no folder extent around it; mapped by FID number as a "
-                  "fallback, verify it (wrong if the FID order does not match the "
-                  "download).".format(fid_to_area.get(fid, "?"), fid))
         if unmatched:
-            _warn("{} AOI feature(s) could not be mapped to any folder (not downloaded yet): "
-                  "FID {}.".format(len(unmatched), ", ".join(str(f) for f in sorted(unmatched))))
+            _warn("{} AOI feature(s) had no folder extent around them and were left unmapped "
+                  "(not downloaded yet): FID {}.".format(
+                      len(unmatched), ", ".join(str(f) for f in sorted(unmatched))))
         return fid_to_folder
 
     def execute(self, parameters, messages):
@@ -1100,7 +1079,7 @@ class BuildMosaicsByPolygon(object):
 
         if mapping_mode == "by geometry":
             fid_to_folder = self._map_folders_by_geometry(
-                data_folders, fid_to_geom, fid_to_area, aoi_sr, folder_prefix)
+                data_folders, fid_to_geom, fid_to_area, aoi_sr)
         else:
             if folder_prefix:
                 prefix = folder_prefix
