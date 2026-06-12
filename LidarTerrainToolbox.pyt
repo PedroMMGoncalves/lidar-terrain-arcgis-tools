@@ -1901,9 +1901,34 @@ class SolarRadiation(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_reuse.value = False
 
+        p_grid = arcpy.Parameter(
+            displayName="Sun map grid level (5 to 7; higher is more accurate and slower)",
+            name="sunmap_grid_level", datatype="GPLong", parameterType="Required", direction="Input")
+        p_grid.filter.type = "ValueList"
+        p_grid.filter.list = [5, 6, 7]
+        p_grid.value = 7
+
+        p_use_interval = arcpy.Parameter(
+            displayName="Calculate insolation from time intervals", name="use_time_interval",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_use_interval.value = False
+
+        p_interval_unit = arcpy.Parameter(
+            displayName="Time interval unit", name="interval_unit",
+            datatype="GPString", parameterType="Optional", direction="Input")
+        p_interval_unit.filter.type = "ValueList"
+        p_interval_unit.filter.list = ["MINUTE", "HOUR", "DAY", "WEEK"]
+        p_interval_unit.value = "DAY"
+
+        p_interval = arcpy.Parameter(
+            displayName="Time interval", name="interval",
+            datatype="GPLong", parameterType="Optional", direction="Input")
+        p_interval.value = 14
+
         return [p_in, p_recurse, p_out, p_struct, p_source, p_cell, p_method,
                 p_year, p_neigh, p_trans, p_diff, p_diffuse_model, p_overwrite,
-                p_out_direct, p_out_diffuse, p_out_duration, p_reuse]
+                p_out_direct, p_out_diffuse, p_out_duration, p_reuse,
+                p_grid, p_use_interval, p_interval_unit, p_interval]
 
     def isLicensed(self):
         try:
@@ -1913,6 +1938,9 @@ class SolarRadiation(object):
 
     def updateParameters(self, parameters):
         parameters[2].enabled = parameters[3].valueAsText != "same_as_input"
+        use_interval = bool(parameters[18].value)
+        parameters[19].enabled = use_interval
+        parameters[20].enabled = use_interval
         return
 
     def updateMessages(self, parameters):
@@ -1967,6 +1995,10 @@ class SolarRadiation(object):
         out_diffuse = bool(parameters[14].value)
         out_duration = bool(parameters[15].value)
         reuse_surfaces = bool(parameters[16].value)
+        grid_level = int(parameters[17].value)
+        interval_mode = "INTERVAL" if bool(parameters[18].value) else "NO_INTERVAL"
+        interval_unit = parameters[19].valueAsText
+        interval = int(parameters[20].value)
 
         # Idempotency is handled by an explicit os.path.exists skip below, so overwrite is
         # left on to let the scratch resample step overwrite a stale temp cleanly.
@@ -2077,14 +2109,18 @@ class SolarRadiation(object):
                             in_surface_raster=surface,
                             start_date_time=start_date,
                             end_date_time=end_date,
-                            use_time_interval="NO_INTERVAL",
+                            use_time_interval=interval_mode,
                             neighborhood_distance=neighborhood,
                             use_adaptive_neighborhood="ADAPTIVE_NEIGHBORHOOD",
                             diffuse_model_type=api_value,
                             diffuse_proportion=diffuse_proportion,
                             transmittivity=transmittivity,
                             analysis_target_device="GPU_THEN_CPU",
+                            sunmap_grid_level=grid_level,
                         )
+                        if interval_mode == "INTERVAL":
+                            kwargs["interval_unit"] = interval_unit
+                            kwargs["interval"] = interval
 
                         # Reuse the Tool 02 slope/aspect only on a native run, so the grids
                         # match; a resampled surface uses the tool's internal slope/aspect.
