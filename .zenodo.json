@@ -1,0 +1,26 @@
+{
+  "upload_type": "software",
+  "title": "lidar-terrain-arcgis-tools: ArcGIS Pro toolbox for LiDAR-derived topographic factors",
+  "description": "An ArcGIS Pro Python toolbox that derives topographic factors from DGT LiDAR elevation data (DEM and DSM) in batch, per area of interest: per area and per cluster mosaics, slope, aspect, hillshade and curvature, annual solar radiation (GPU RasterSolarRadiation), reclassification of aspect, slope and solar into suitability classes, and resampling. Project CRS EPSG:3763 (ETRS89 / PT-TM06).",
+  "license": "GPL-3.0-or-later",
+  "access_right": "open",
+  "creators": [
+    {
+      "name": "Gonçalves, Pedro",
+      "affiliation": "Laboratório Nacional de Energia e Geologia (LNEG)",
+      "orcid": "0000-0002-6556-6086"
+    }
+  ],
+  "keywords": [
+    "ArcGIS Pro",
+    "arcpy",
+    "LiDAR",
+    "digital elevation model",
+    "digital surface model",
+    "solar radiation",
+    "terrain analysis",
+    "slope",
+    "aspect",
+    "site suitability"
+  ]
+}

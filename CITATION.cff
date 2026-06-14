@@ -1,10 +1,31 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "lidar-terrain-arcgis-tools: ArcGIS Pro toolbox for LiDAR-derived topographic factors"
+abstract: >-
+  An ArcGIS Pro Python toolbox that derives topographic factors from DGT LiDAR elevation data
+  (DEM and DSM) in batch, per area of interest. It builds per area and per cluster mosaics,
+  derives slope, aspect, hillshade and curvature, computes annual solar radiation with the GPU
+  RasterSolarRadiation tool, reclassifies aspect, slope and solar into suitability classes, and
+  resamples the outputs. Project CRS EPSG:3763 (ETRS89 / PT-TM06).
 type: software
 authors:
   - given-names: Pedro
     family-names: Gonçalves
+    affiliation: "Laboratório Nacional de Energia e Geologia (LNEG)"
+    orcid: "https://orcid.org/0000-0002-6556-6086"
+version: 1.0.0
+date-released: 2026-06-15
 repository-code: "https://github.com/PedroMMGoncalves/lidar-terrain-arcgis-tools"
 license: GPL-3.0-or-later
+keywords:
+  - ArcGIS Pro
+  - arcpy
+  - LiDAR
+  - digital elevation model
+  - digital surface model
+  - solar radiation
+  - terrain analysis
+  - slope
+  - aspect
+  - site suitability
 # doi: add the Zenodo concept DOI here after the first GitHub release
