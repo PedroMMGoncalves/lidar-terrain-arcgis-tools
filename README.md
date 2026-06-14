@@ -9,7 +9,9 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)](https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview)
 [![CRS](https://img.shields.io/badge/CRS-EPSG%3A3763-blue.svg)](https://epsg.io/3763)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20694266.svg)](https://doi.org/10.5281/zenodo.20694266)
 [![Release](https://img.shields.io/github/v/release/PedroMMGoncalves/lidar-terrain-arcgis-tools)](https://github.com/PedroMMGoncalves/lidar-terrain-arcgis-tools/releases)
+[![tests](https://github.com/PedroMMGoncalves/lidar-terrain-arcgis-tools/actions/workflows/tests.yml/badge.svg)](https://github.com/PedroMMGoncalves/lidar-terrain-arcgis-tools/actions/workflows/tests.yml)
 
 A single ArcGIS Pro Python Toolbox (`.pyt`) that processes, in batch, LiDAR elevation data (DEM and DSM), per area of interest, to generate topographic factors: slope, aspect, hillshade, profile and plan curvature, and annual solar radiation. Every output follows one consistent naming convention so it can feed any downstream analysis.
 
@@ -338,7 +340,7 @@ Issues and pull requests are welcome. When reporting a problem, please include:
 
 ## Citation
 
-If you use this toolbox, please cite it via the metadata in [`CITATION.cff`](CITATION.cff) (GitHub renders this in the sidebar as "Cite this repository"). A versioned DOI is minted via Zenodo for each GitHub release.
+If you use this toolbox, please cite it via the metadata in [`CITATION.cff`](CITATION.cff) (GitHub renders this in the sidebar as "Cite this repository"). The concept DOI (all versions) is [10.5281/zenodo.20694266](https://doi.org/10.5281/zenodo.20694266); each GitHub release also gets its own version DOI via Zenodo.
 
 ---
 
