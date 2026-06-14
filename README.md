@@ -15,7 +15,7 @@ This toolbox is the **factor engine only**. Any downstream analysis (suitability
 
 ## Contents
 
-[Summary](#summary) - [Method](#method) - [Requirements](#requirements) - [Data source](#data-source) - [Installation](#installation) - [Usage](#usage) - [Naming convention](#naming-convention) - [Example](#example) - [Tests](#tests) - [Troubleshooting](#troubleshooting) - [Limitations and notes](#limitations-and-notes) - [Contributing](#contributing) - [Citation](#citation) - [License](#license)
+[Summary](#summary) - [Method](#method) - [Requirements](#requirements) - [Data source](#data-source) - [Installation](#installation) - [Usage](#usage) - [Naming convention](#naming-convention) - [Example](#example) - [Performance](#performance) - [Tests](#tests) - [Troubleshooting](#troubleshooting) - [Limitations and notes](#limitations-and-notes) - [Contributing](#contributing) - [Citation](#citation) - [License](#license)
 
 ---
 
@@ -54,6 +54,9 @@ flowchart TD
     S -.->|reuse slope, aspect| T3
     T3 --> SOL["Solar<br/>Area_SOURCE_SOLARUNI / SOLAROVC<br/>(+ optional direct, diffuse, duration)"]
     T5 -.-> RS["Resample folder<br/>coarser cell size (e.g. 2 m to 5 m)<br/>grouped by area"]
+    S -.-> T5
+    SOL -.-> T5
+    RCL -.-> T5
     S --> T4["Tool 4<br/>Reclassify Factors"]
     SOL --> T4
     T4 --> RCL["Reclass subfolder<br/>ASPECT_DIR, ASPECT_RCL,<br/>SLOPE_RCL, SOLARUNI_RCL<br/>(+ legenda)"]
@@ -266,7 +269,21 @@ Done. Selected rasters: 494. Resampled: 456. Copied (already at target): 38. Ski
 
 You then point Tool 2 at this output folder to derive the surfaces, Tool 3 for solar, and Tool 4 at the Tool 2 and Tool 3 outputs to reclassify aspect, slope and solar.
 
-**Processing time.** A full run over the dataset (273 areas grouped into 72 clusters), at the native 2 m: Tool 1 (mosaics, with clustering) about 2 h 21 m; Tool 2 (the six surfaces, DEM and DSM) 51 m; Tool 3 (solar on the GPU, native 2 m, sun map grid level 7, reusing the Tool 2 slope and aspect) 2 h 34 m; Tool 5 (resample to 5 m) 15 m. Roughly 6 hours of compute end to end, with Tool 1 and Tool 3 the heaviest.
+---
+
+## Performance
+
+A full run over the whole dataset (273 areas grouped into 72 clusters), at the native 2 m resolution. Tools 2, 3 and 5 ran on the 72 cluster mosaics.
+
+| Tool | Elapsed | What ran |
+| --- | --- | --- |
+| 1, Build Mosaics | ~2 h 21 m | 273 areas with overlap clustering (72 clusters), DEM and DSM |
+| 2, Generate Surfaces | ~51 m | 72 clusters, the six surfaces, DEM and DSM |
+| 3, Solar Radiation | ~2 h 34 m | 72 clusters, DEM, native 2 m, sun map grid level 7, reusing Tool 2 slope and aspect, with direct, diffuse and duration |
+| 4, Reclassify Factors | ~28 m | 72 clusters, aspect, slope and solar to suitability classes (two aspect rasters) |
+| 5, Resample | ~15 m | 72 clusters, all products to 5 m |
+
+About 6.5 hours of compute end to end for the whole pipeline (Tools 1 to 5), with Tool 1 and Tool 3 the heaviest. Times scale with cell size: a coarser solar cell size, or a lower sun map grid level, cuts Tool 3 sharply.
 
 ---
 
