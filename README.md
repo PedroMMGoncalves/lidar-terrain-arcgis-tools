@@ -25,13 +25,14 @@ This toolbox is the **factor engine only**. Any downstream analysis (suitability
 
 ## Summary
 
-Four tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. A fifth tool, Resample, is an optional utility you can run on any of the outputs:
+Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. A sixth tool, Resample, is an optional utility you can run on any of the outputs:
 
-1. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
-2. **Generate Surfaces**: slope (degrees and percent), aspect, hillshade and curvature (profile and plan) from each mosaic.
-3. **Solar Radiation**: annual solar radiation (global, kWh/m2) per area on the DEM with RasterSolarRadiation (GPU), with a choice of diffuse model (uniform, overcast, or both) and optional direct, diffuse and duration outputs, at the native 2 m baseline.
-4. **Reclassify Factors**: fixed suitability classes for aspect, slope and annual solar (aspect yields two rasters, quadrants and solar suitability), written to a `Reclass` subfolder with a legend.
-5. **Resample** (optional): resample the named rasters to a coarser cell size, for example 2 m to 5 m, into a `Resample` folder grouped by area.
+1. **Download DGT Data**: download the LiDAR tiles from the DGT CDD portal, one folder per AOI feature (cartogram sheet or buffered point/area), ready for the mosaic tool.
+2. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
+3. **Generate Surfaces**: slope (degrees and percent), aspect, hillshade and curvature (profile and plan) from each mosaic.
+4. **Solar Radiation**: annual solar radiation (global, kWh/m2) per area on the DEM with RasterSolarRadiation (GPU), with a choice of diffuse model (uniform, overcast, or both) and optional direct, diffuse and duration outputs, at the native 2 m baseline.
+5. **Reclassify Factors**: fixed suitability classes for aspect, slope and annual solar (aspect yields two rasters, quadrants and solar suitability), written to a `Reclass` subfolder with a legend.
+6. **Resample** (optional): resample the named rasters to a coarser cell size, for example 2 m to 5 m, into a `Resample` folder grouped by area.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -41,16 +42,17 @@ Every output is named by a single, consistent convention (see [Naming convention
 
 ```mermaid
 flowchart TD
-    AOI["AOI polygons<br/>Area name + FID"]
-    LID["DGT LiDAR folders<br/>..._&lt;FID&gt; with MDT (DEM) and MDS (DSM)"]
+    AOI["AOI polygons or points<br/>sheets or areas"]
+    AOI --> TDL["Tool 1<br/>Download DGT Data"]
+    TDL --> LID["DGT LiDAR folders<br/>one per feature, MDT (DEM) and MDS (DSM)"]
     AOI --> T1
     LID --> T1
-    T1["Tool 1<br/>Build Mosaics by Polygon"]
+    T1["Tool 2<br/>Build Mosaics by Polygon"]
     T1 --> M["Per area mosaics<br/>Area_DEM.tif / Area_DSM.tif"]
     T1 -.-> CL["Clusters (optional)<br/>clusters/Cluster_NNN/<br/>contiguous areas merged"]
-    M --> T2["Tool 2<br/>Generate Surfaces"]
-    M --> T3["Tool 3<br/>Solar Radiation"]
-    M -.-> T5["Tool 5 (optional)<br/>Resample"]
+    M --> T2["Tool 3<br/>Generate Surfaces"]
+    M --> T3["Tool 4<br/>Solar Radiation"]
+    M -.-> T5["Tool 6 (optional)<br/>Resample"]
     CL -.-> T2
     CL -.-> T3
     CL -.-> T5
@@ -61,7 +63,7 @@ flowchart TD
     S -.-> T5
     SOL -.-> T5
     RCL -.-> T5
-    S --> T4["Tool 4<br/>Reclassify Factors"]
+    S --> T4["Tool 5<br/>Reclassify Factors"]
     SOL --> T4
     T4 --> RCL["Reclass subfolder<br/>ASPECT_DIR, ASPECT_RCL,<br/>SLOPE_RCL, SOLARUNI_RCL<br/>(+ legenda)"]
     RCL --> EXT["Analysis<br/>(external to this toolbox)"]
@@ -71,18 +73,19 @@ flowchart TD
     classDef opttool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff,stroke-dasharray:5 3;
     classDef data fill:#eaf2ff,stroke:#1f6feb,color:#0b2a5b;
     classDef ext fill:#f5f5f5,stroke:#999999,color:#333333,stroke-dasharray:4 3;
-    class T1,T2,T3,T4 tool;
+    class TDL,T1,T2,T3,T4 tool;
     class T5 opttool;
     class AOI,LID,M,S,SOL,RCL,RS,CL data;
     class EXT ext;
 ```
 
-- The DGT LiDAR arrives pre-split into one download folder per area of interest, where the folder name ends in the AOI feature FID and holds the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. The 5 km buffer selection was already applied at download time.
-- **Tool 1** groups AOI features by area name, then maps each area to its download folder. By default it maps **by geometry** (the folder whose tile extent is centered on the area), which is robust to a shapefile whose FID order no longer matches the folder numbering done at download time; a **by FID number** option keeps the older folder-number mapping. It merges each area's MDT and MDS tiles across its folders into one DEM and one DSM mosaic, deduplicating tiles by name. An optional clustering mode also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, written to a `clusters` subfolder, each with a `Cluster_NNN_members.txt` manifest.
-- **Tool 2** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees, and optionally percent; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
-- **Tool 3** computes annual solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated), at the native 2 m baseline. You pick the diffuse model (uniform, overcast, or both) and can also output the direct, diffuse and direct duration rasters; the output names carry the model (`SOLARUNI`, `SOLAROVC`). A coarser solar cell size resamples the DEM first.
-- **Tool 4** reclassifies aspect, slope and the annual solar raster into fixed project suitability classes, in numpy with `[min, max)` semantics. Aspect yields two rasters: quadrants (`ASPECT_DIR`, N to NW plus flat) and solar suitability (`ASPECT_RCL`, south and flat best); slope and solar yield `SLOPE_RCL` and `SOLARUNI_RCL`. Each output, plus a legend (`RECLASS_legenda.txt`), goes to a `Reclass` subfolder next to the inputs.
-- **Tool 5** (optional) resamples the selected data types to a target cell size with core Resample, writing to a `Resample` folder grouped by area; continuous rasters use bilinear, reclassified (`_RCL`) rasters use nearest. Typical use is 2 m to 5 m to lighten the later steps.
+- **Tool 1** downloads the DGT LiDAR per AOI feature: it takes the feature envelope in WGS84 (a clean square for points), searches the CDD STAC API by that bounding box, and saves the tiles into one folder per feature, ready for Tool 2.
+- The DGT LiDAR is organized as one download folder per area of interest, where the folder name ends in the AOI feature FID and holds the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. The 5 km buffer selection was already applied at download time.
+- **Tool 2** groups AOI features by area name, then maps each area to its download folder. By default it maps **by geometry** (the folder whose tile extent is centered on the area), which is robust to a shapefile whose FID order no longer matches the folder numbering done at download time; a **by FID number** option keeps the older folder-number mapping. It merges each area's MDT and MDS tiles across its folders into one DEM and one DSM mosaic, deduplicating tiles by name. An optional clustering mode also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, written to a `clusters` subfolder, each with a `Cluster_NNN_members.txt` manifest.
+- **Tool 3** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees, and optionally percent; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
+- **Tool 4** computes annual solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated), at the native 2 m baseline. You pick the diffuse model (uniform, overcast, or both) and can also output the direct, diffuse and direct duration rasters; the output names carry the model (`SOLARUNI`, `SOLAROVC`). A coarser solar cell size resamples the DEM first.
+- **Tool 5** reclassifies aspect, slope and the annual solar raster into fixed project suitability classes, in numpy with `[min, max)` semantics. Aspect yields two rasters: quadrants (`ASPECT_DIR`, N to NW plus flat) and solar suitability (`ASPECT_RCL`, south and flat best); slope and solar yield `SLOPE_RCL` and `SOLARUNI_RCL`. Each output, plus a legend (`RECLASS_legenda.txt`), goes to a `Reclass` subfolder next to the inputs.
+- **Tool 6** (optional) resamples the selected data types to a target cell size with core Resample, writing to a `Resample` folder grouped by area; continuous rasters use bilinear, reclassified (`_RCL`) rasters use nearest. Typical use is 2 m to 5 m to lighten the later steps.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent check.
 
 ---
@@ -90,8 +93,9 @@ flowchart TD
 ## Requirements
 
 - ArcGIS Pro **3.7**, Windows (arcpy is Windows only on ArcGIS Pro 3.x). Uses the Python bundled with ArcGIS Pro and numpy from that environment; no extra packages.
-- **Spatial Analyst** extension for Tool 2 (slope, aspect, curvature, traditional hillshade) and Tool 3 (solar radiation). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
-- **Image Analyst** extension for Tool 2 only when the hillshade type is Multidirectional.
+- **Spatial Analyst** extension for Tool 3 (slope, aspect, curvature, traditional hillshade) and Tool 4 (solar radiation). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
+- **Image Analyst** extension for Tool 3 only when the hillshade type is Multidirectional.
+- **Network access, a free CDD account, and the `requests` library** (bundled with ArcGIS Pro) for Tool 1 (Download DGT Data).
 - Tools 1, 4 and 5 need no extension (mosaicking and resampling are core, and the reclassification is pure numpy).
 - Tiles in the project CRS, ETRS89 / PT-TM06 (EPSG:3763). The tools log the CRS and warn if it differs.
 
@@ -99,13 +103,13 @@ flowchart TD
 
 ## Data source
 
-The tools were built for the DGT LiDAR survey of mainland Portugal, *Levantamento LiDAR de Portugal Continental*, produced by the [Direção-Geral do Território (DGT)](https://www.dgterritorio.gov.pt/levantamento-lidar-de-portugal-continental-0). The survey provides a 10 points/m2 LAZ point cloud and the derived terrain model (MDT, the DEM) and surface model (MDS, the DSM) at 0.5 m and 2 m resolution as GeoTIFF, under an open data policy with no usage restrictions. This project used the 2 m models (`MDT-2m`, `MDS-2m`), but the tools are not tied to a resolution: Tool 1 mosaics any `MDT*` and `MDS*` tiles, so the 0.5 m models (`MDS-50cm-...`) work as well. When a download folder holds more than one resolution, set Tool 1's *Tile resolution* parameter (for example `2m` or `50cm`) to pick one; left blank it auto-detects a single resolution and fails loud on a mix, so a mosaic never blends cell sizes.
+The tools were built for the DGT LiDAR survey of mainland Portugal, *Levantamento LiDAR de Portugal Continental*, produced by the [Direção-Geral do Território (DGT)](https://www.dgterritorio.gov.pt/levantamento-lidar-de-portugal-continental-0). The survey provides a 10 points/m2 LAZ point cloud and the derived terrain model (MDT, the DEM) and surface model (MDS, the DSM) at 0.5 m and 2 m resolution as GeoTIFF, under an open data policy with no usage restrictions. This project used the 2 m models (`MDT-2m`, `MDS-2m`), but the tools are not tied to a resolution: Tool 2 mosaics any `MDT*` and `MDS*` tiles, so the 0.5 m models (`MDS-50cm-...`) work as well. When a download folder holds more than one resolution, set Tool 2's *Tile resolution* parameter (for example `2m` or `50cm`) to pick one; left blank it auto-detects a single resolution and fails loud on a mix, so a mosaic never blends cell sizes.
 
 The data is distributed through the DGT Data Center (CDD), which requires a free registration: <https://cdd.dgterritorio.gov.pt/dgt-fe>.
 
-The tiles used here were downloaded with the [DGT CDD Downloader](https://plugins.qgis.org/plugins/dgt_cdd_downloader/) plugin for QGIS (Duarte Carreira, Hugo Santos and Pedro Venâncio). It authenticates against the CDD portal, splits a large area into chunks, organizes the files per area, and can build a per folder VRT. That is the exact on disk layout Tool 1 expects: one download folder per area of interest, each with `MDT*` and `MDS*` subfolders and a per product `.vrt`.
+The tiles used here were downloaded with the [DGT CDD Downloader](https://plugins.qgis.org/plugins/dgt_cdd_downloader/) plugin for QGIS (Duarte Carreira, Hugo Santos and Pedro Venâncio). It authenticates against the CDD portal, splits a large area into chunks, organizes the files per area, and can build a per folder VRT. That is the exact on disk layout Tool 2 expects, and the layout this toolbox's Tool 1 (Download DGT Data) now produces directly: one download folder per area of interest, each with `MDT*` and `MDS*` subfolders (and an optional per product `.vrt`).
 
-> The factor tools (2 to 4) work on any DEM and DSM raster. Only Tool 1 (mosaicking) is tailored to the DGT download folder layout described above.
+> The factor tools (2 to 4) work on any DEM and DSM raster. Only Tool 2 (mosaicking) is tailored to the DGT download folder layout described above.
 
 ---
 
@@ -122,7 +126,29 @@ No installation beyond *Add Toolbox*: the script runs on the Python bundled with
 
 Run the tools in order. Each tool takes its input from the previous tool's output folder; nothing is inferred by hidden convention.
 
-### Tool 1, Build Mosaics By Polygon
+### Tool 1, Download DGT Data
+
+Download the DGT LiDAR for each AOI feature into one folder per feature, ready for Tool 2. Needs network access, a free CDD account, and the `requests` library (bundled with ArcGIS Pro). It is an independent client of the public CDD STAC API.
+
+| Parameter | Description |
+| --- | --- |
+| AOI layer | Polygon or point features; one download folder per feature. |
+| Folder name field | Names each folder (sanitized), for example the sheet or area name. |
+| Selected features only | On downloads only the selected features. |
+| Output root folder | Where the per feature folders are written. |
+| Point footprint size (meters) | Half side of the square downloaded around a point feature (ignored for polygons, which use their envelope). |
+| Collections (blank for all) | The CDD collections to fetch. Turn on "List collections only" once to discover the names. |
+| List collections only | Authenticate and print the available collections, no download. |
+| CDD username, password | Blank uses the saved config. Configure them on the first use. |
+| Save credentials to the config file | Writes the username and password once to `%LOCALAPPDATA%/LidarTerrainToolbox`, reused on later runs. Use a dedicated CDD account; the file is plain text in your profile. |
+| Delay between requests | Seconds between requests, to be gentle on the service. |
+| Overwrite existing tiles | Off skips tiles already downloaded (idempotent re-runs). |
+| Build a VRT per folder | Optional per product VRT (the mosaic tool prefers it). |
+| Dry run | Report the tile count per feature without downloading. |
+
+For each feature the tool takes the envelope in WGS84 (a clean square for points), splits it if large, searches the CDD STAC API by that bounding box, and downloads the tiles into `<name>/MDT` and `<name>/MDS`, with a `<name>_download.txt` manifest. Re-running skips existing tiles and retries failures.
+
+### Tool 2, Build Mosaics By Polygon
 
 One DEM and one DSM mosaic per area, merging all of that area's download folders.
 
@@ -145,15 +171,15 @@ One DEM and one DSM mosaic per area, merging all of that area's download folders
 | Report clusters only | Dry-run for clustering: lists the clusters and member counts without building any mosaic. |
 | Folder to area mapping | `by geometry` (default; maps each area to the folder whose tile extent is centered on it, robust to FID renumbering) or `by FID number` (the folder named with the area FID). |
 
-With **overlap clustering** on, Tool 1 also groups areas whose AOI polygons are contiguous (touch or overlap) into one mosaic per cluster, in parallel to the per area output, which is unchanged. Every area belongs to exactly one cluster (a non overlapping area is its own one member cluster). Clusters go to a `clusters` subfolder, named `Cluster_NNN` by the smallest member FID, each with a `Cluster_NNN_members.txt` manifest listing the member areas (the ids renumber if the AOI is edited, so the manifest is the authority). Tiles shared between areas are deduplicated by name. Run the dry-run first to see the clusters before the heavy build.
+With **overlap clustering** on, Tool 2 also groups areas whose AOI polygons are contiguous (touch or overlap) into one mosaic per cluster, in parallel to the per area output, which is unchanged. Every area belongs to exactly one cluster (a non overlapping area is its own one member cluster). Clusters go to a `clusters` subfolder, named `Cluster_NNN` by the smallest member FID, each with a `Cluster_NNN_members.txt` manifest listing the member areas (the ids renumber if the AOI is edited, so the manifest is the authority). Tiles shared between areas are deduplicated by name. Run the dry-run first to see the clusters before the heavy build.
 
-### Tool 2, Generate Surfaces
+### Tool 3, Generate Surfaces
 
-Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox (all on by default).
+Topographic surfaces from the Tool 2 mosaics. Each surface has its own checkbox (all on by default).
 
 | Parameter | Description |
 | --- | --- |
-| Input mosaics folder | The Tool 1 output. |
+| Input mosaics folder | The Tool 2 output. |
 | Recurse subfolders | On (default) finds the `per_area_subfolder` layout. |
 | Output structure | `same_as_input` (default; each surface is written next to its input mosaic), `per_area_subfolder`, or `flat`. |
 | Output folder | Only for `per_area_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
@@ -164,13 +190,13 @@ Topographic surfaces from the Tool 1 mosaics. Each surface has its own checkbox 
 | Hillshade azimuth, altitude | Traditional hillshade only. |
 | Overwrite existing outputs | Off skips existing surfaces. |
 
-### Tool 3, Solar Radiation
+### Tool 4, Solar Radiation
 
 Annual solar radiation (global, kWh/m2) per area, with `RasterSolarRadiation` (GPU when available). Choose the diffuse model and which rasters to output. The baseline runs at the native 2 m cell size; a coarser solar cell size resamples the DEM first. This is the heavy tool; expect long run times.
 
 | Parameter | Description |
 | --- | --- |
-| Input mosaics folder | The Tool 1 output. |
+| Input mosaics folder | The Tool 2 output. |
 | Recurse subfolders | On (default). |
 | Output structure, Output folder | `same_as_input` default, as in the other tools. |
 | Source | `DEM` (default, the terrain resource for ground PV), `DSM`, or `BOTH`. |
@@ -181,20 +207,20 @@ Annual solar radiation (global, kWh/m2) per area, with `RasterSolarRadiation` (G
 | Transmittivity, Diffuse proportion | Atmosphere; defaults 0.6 and 0.3 (clear-sky conditions). |
 | Diffuse model type | `UNIFORM_SKY` (default), `STANDARD_OVERCAST_SKY`, or `BOTH`. `BOTH` runs both and writes `SOLARUNI` and `SOLAROVC`. |
 | Output Direct, Diffuse, Direct Duration | One checkbox each, on by default; written as `..._SOLARUNIDIR`, `_SOLARUNIDIF`, `_SOLARUNIDUR` (and the `_SOLAROVC` equivalents). Duration is in hours, the rest in kWh/m2. |
-| Reuse Tool 2 slope and aspect | Off by default. On native runs only, passes the existing SLOPE and ASPECT rasters so they are not recomputed; guarded on cell size and CRS. Validate with an A/B run first. |
+| Reuse Tool 3 slope and aspect | Off by default. On native runs only, passes the existing SLOPE and ASPECT rasters so they are not recomputed; guarded on cell size and CRS. Validate with an A/B run first. |
 | Sun map grid level | Valid 5 to 7; default 7. The sun map (H3 grid) resolution that sets the accuracy of the annual total: higher is more accurate and slower. This, not the time interval, is the precision lever. |
 | Calculate insolation from time intervals | Off by default (a single annual total). On computes per-interval values and returns a multiband raster (one band per interval); set the interval unit (`MINUTE`, `HOUR`, `DAY`, `WEEK`) and value. Default `DAY` / 14. |
 | Overwrite | Off skips existing outputs. |
 
 Running at the native 2 m with the default 1000 m shadow neighborhood and sun map grid level 7 is the heaviest combination (about 25 million cells per area, with a 500 cell shadow radius), so each area takes much longer than at a coarser cell size. Benchmark one area first.
 
-### Tool 4, Reclassify Factors
+### Tool 5, Reclassify Factors
 
 Fixed project suitability classes for aspect, slope and the annual solar raster (`SOLARUNI`), in batch. The schemes are fixed in the code (one place to edit), so there is no value table to fill. Each output, plus a legend, goes to a `Reclass` subfolder next to the inputs.
 
 | Parameter | Description |
 | --- | --- |
-| Input results folder | The folder whose rasters to reclassify (Tool 2 and Tool 3 outputs, native or resampled). |
+| Input results folder | The folder whose rasters to reclassify (Tool 3 and Tool 4 outputs, native or resampled). |
 | Recurse subfolders | On (default); the `Reclass` subfolders are skipped on discovery. |
 | Factors to reclassify | Multi-select of `ASPECT`, `SLOPE`, `SOLAR`; default all. |
 | Overwrite existing outputs | Off skips existing reclassified rasters. |
@@ -210,7 +236,7 @@ Aspect yields **two** rasters; slope and solar one each. The boundaries are `[mi
 
 A `RECLASS_legenda.txt` in each `Reclass` subfolder lists the files written and this class matrix.
 
-### Tool 5, Resample
+### Tool 6, Resample
 
 Resample the named rasters to a coarser cell size (for example 2 m to 5 m), in batch. An optional utility; point it at any folder of mosaics or surfaces. Outputs go to a `Resample` folder inside the results root, grouped by area, with the file names unchanged, so the other tools read them the same way.
 
@@ -233,7 +259,7 @@ A single convention links the tools:
 - Mosaic: `{Area}_{SOURCE}` where SOURCE is `DEM` or `DSM`.
 - Surface: `{Area}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE` (degrees), `SLOPEP` (percent), `ASPECT`, `HILLSHADE`, `PROFC` or `PLANC`.
 - Solar: `{Area}_{SOURCE}_SOLARUNI` or `_SOLAROVC` (global, by diffuse model), with `_SOLARUNIDIR` / `_SOLARUNIDIF` / `_SOLARUNIDUR` (and the `_SOLAROVC` equivalents) for the optional direct, diffuse and duration rasters.
-- Reclassified (Tool 4): the suitability rasters go to a `Reclass` subfolder. The surface name plus `_RCL` (`SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`), and the aspect quadrants as `{Area}_{SOURCE}_ASPECT_DIR`.
+- Reclassified (Tool 5): the suitability rasters go to a `Reclass` subfolder. The surface name plus `_RCL` (`SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`), and the aspect quadrants as `{Area}_{SOURCE}_ASPECT_DIR`.
 - Cluster: `Cluster_NNN_{SOURCE}` (overlap clustering), numbered by the smallest member FID; a `Cluster_NNN_members.txt` lists the member areas.
 
 The `.tif` extension is added on write. Area names are sanitized for ArcGIS and the file system (accents and c cedilla folded to ASCII, separators to underscore). If two different areas sanitize to the same name they get a numeric suffix; several AOI polygons of the **same** area are merged into one output.
@@ -252,42 +278,42 @@ The `.tif` extension is added on write. Area names are sanitized for ArcGIS and 
 A real run over 38 areas. The AOI layer was in EPSG:102164, projected only for the extent check; the mosaics inherit the tiles CRS, EPSG:3763. One area (`Cortes Pereira`) has two AOI polygons that were merged into a single output. Abbreviated geoprocessing log for the whole pipeline:
 
 ```text
-# Tool 1, Build Mosaics by Polygon
+# Tool 2, Build Mosaics by Polygon
 Auto-detected folder prefix: '02_DGT_LiDAR_Data_'.
 Area 'Alcaria_Queimada' (DEM): mosaicked 112 tiles (2m, 2 m) from 1 folder(s) -> Alcaria_Queimada_DEM.tif
 Area 'Cortes_Pereira' (DEM): mosaicked 95 tiles (2m, 2 m) from 2 folder(s) -> Cortes_Pereira_DEM.tif
 Done. Areas: 38. Built now: 38. Mosaics created: 76. Skipped (no data: 0, incomplete: 0, no tiles: 0, extent mismatch: 0).
 
-# Tool 2, Generate Surfaces
+# Tool 3, Generate Surfaces
 Done. Mosaics processed: 76. Surfaces created: 380.
 
-# Tool 3, Solar Radiation
+# Tool 4, Solar Radiation
 Alcaria_Queimada (DEM): solar radiation (kWh/m2, EPSG:3763) -> Alcaria_Queimada_DEM_SOLARUNI.tif
 Done. Mosaics: 38. Solar rasters created: 38. Skipped existing: 0. Failed: 0.
 
-# Tool 5, Resample (to 10 m)
+# Tool 6, Resample (to 10 m)
 Alcaria_Queimada (SLOPE): resampled 2 m -> 10 m (BILINEAR, EPSG:3763) -> Alcaria_Queimada_DEM_SLOPE.tif
 Alcaria_Queimada (SOLARUNI): already at 10 m, copied -> Alcaria_Queimada_DEM_SOLARUNI.tif
 Done. Selected rasters: 494. Resampled: 456. Copied (already at target): 38. Skipped existing: 0. Failed: 0.
 ```
 
-You then point Tool 2 at this output folder to derive the surfaces, Tool 3 for solar, and Tool 4 at the Tool 2 and Tool 3 outputs to reclassify aspect, slope and solar.
+You then point Tool 3 at this output folder to derive the surfaces, Tool 4 for solar, and Tool 5 at the Tool 3 and Tool 4 outputs to reclassify aspect, slope and solar.
 
 ---
 
 ## Performance
 
-A full run over the whole dataset (273 areas grouped into 72 clusters), at the native 2 m resolution. Tools 2, 3 and 5 ran on the 72 cluster mosaics.
+A full run over the whole dataset (273 areas grouped into 72 clusters), at the native 2 m resolution. Tools 3, 4 and 6 ran on the 72 cluster mosaics. Tool 1 (Download) is newer and was not part of this run.
 
 | Tool | Elapsed | What ran |
 | --- | --- | --- |
-| 1, Build Mosaics | ~2 h 21 m | 273 areas with overlap clustering (72 clusters), DEM and DSM |
-| 2, Generate Surfaces | ~51 m | 72 clusters, the six surfaces, DEM and DSM |
-| 3, Solar Radiation | ~2 h 34 m | 72 clusters, DEM, native 2 m, sun map grid level 7, reusing Tool 2 slope and aspect, with direct, diffuse and duration |
-| 4, Reclassify Factors | ~28 m | 72 clusters, aspect, slope and solar to suitability classes (two aspect rasters) |
-| 5, Resample | ~15 m | 72 clusters, all products to 5 m |
+| 2, Build Mosaics | ~2 h 21 m | 273 areas with overlap clustering (72 clusters), DEM and DSM |
+| 3, Generate Surfaces | ~51 m | 72 clusters, the six surfaces, DEM and DSM |
+| 4, Solar Radiation | ~2 h 34 m | 72 clusters, DEM, native 2 m, sun map grid level 7, reusing Tool 3 slope and aspect, with direct, diffuse and duration |
+| 5, Reclassify Factors | ~28 m | 72 clusters, aspect, slope and solar to suitability classes (two aspect rasters) |
+| 6, Resample | ~15 m | 72 clusters, all products to 5 m |
 
-About 6.5 hours of compute end to end for the whole pipeline (Tools 1 to 5), with Tool 1 and Tool 3 the heaviest. Times scale with cell size: a coarser solar cell size, or a lower sun map grid level, cuts Tool 3 sharply.
+About 6.5 hours of compute end to end for the mosaics to resample stage (Tools 2 to 6), with Tool 2 and Tool 4 the heaviest. Times scale with cell size: a coarser solar cell size, or a lower sun map grid level, cuts Tool 4 sharply.
 
 ---
 
@@ -311,8 +337,8 @@ This exercises name sanitization and collision handling, the output name build a
 | `Cannot auto-detect a folder prefix ...` | Folder names are inconsistent or have no trailing FID number | Set the folder prefix explicitly. |
 | `... missing folders for FIDs ...` (skipped) | An area's download folders are not all present yet | Re-run after the download finishes (keep Skip incomplete on). |
 | `... does not contain its AOI polygon centroid` | Under by-FID mapping, a folder maps to the wrong area | Switch Folder to area mapping to `by geometry` (the default), or fix the FID to folder alignment. |
-| `Spatial Analyst extension is not available` | Tool 2 has no Spatial Analyst license | Enable Spatial Analyst in *Project > Licensing*. |
-| `Multidirectional hillshade needs the Image Analyst extension` | Tool 2 multidirectional without Image Analyst | Enable Image Analyst, or choose Traditional, or turn hillshade off. |
+| `Spatial Analyst extension is not available` | Tool 3 has no Spatial Analyst license | Enable Spatial Analyst in *Project > Licensing*. |
+| `Multidirectional hillshade needs the Image Analyst extension` | Tool 3 multidirectional without Image Analyst | Enable Image Analyst, or choose Traditional, or turn hillshade off. |
 
 ---
 
@@ -320,10 +346,10 @@ This exercises name sanitization and collision handling, the output name build a
 
 - **The ordinal scale is not harmonized between factors.** You define arbitrary intervals per factor; only slope and aspect are reclassified. Harmonizing the classes is a downstream analysis step, outside this toolbox. *Document this for whoever consumes the outputs, to avoid misuse.*
 - **The downstream analysis is external** and not part of this toolbox.
-- **Folder layout assumption (Tool 1):** the download folder number must equal the AOI feature FID (0 based shapefile FID). Loading the AOI as a geodatabase feature class (1 based OBJECTID) can shift the mapping; the tool warns when the OID field is not `FID`.
-- **Memory (Tool 4):** each factor raster is read into memory for the numpy reclassification. The per area extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
+- **Folder layout assumption (Tool 2):** the download folder number must equal the AOI feature FID (0 based shapefile FID). Loading the AOI as a geodatabase feature class (1 based OBJECTID) can shift the mapping; the tool warns when the OID field is not `FID`.
+- **Memory (Tool 5):** each factor raster is read into memory for the numpy reclassification. The per area extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
 - **Datum reprojection:** `projectAs` uses the default transformation. Where no default geographic transformation exists between the input and project datums, it may need to be specified explicitly.
-- **Aspect Flat:** aspect uses -1 for flat. In Tool 4 the optional flat class wins over any class interval that happens to contain -1.
+- **Aspect Flat:** aspect uses -1 for flat. In Tool 5 the optional flat class wins over any class interval that happens to contain -1.
 
 ---
 

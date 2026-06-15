@@ -41,8 +41,11 @@ execute it as a script).
 import os
 import math
 import re
+import json
+import urllib.parse
 import unicodedata
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 
 try:
     import arcpy
@@ -51,6 +54,13 @@ except ImportError:
     # arcpy is always importable. numpy is imported lazily inside ReclassifyFactor
     # (Tool 3) so this module loads without numpy when only the pure tests are run.
     arcpy = None
+
+try:
+    import requests
+except ImportError:
+    # Only the download tool (Tool 01) needs requests; guard it so the module and the pure
+    # tests load without it. The download tool fails loud if requests is missing.
+    requests = None
 
 
 # ===========================================================================
@@ -504,10 +514,10 @@ class Toolbox(object):
         self.label = "LiDAR Terrain Toolbox"
         self.alias = "LidarTerrain"
         # Tool labels are numbered so they sort in pipeline order at the toolbox root
-        # (no toolset categories): 01 Build Mosaics by Polygon, 02 Generate Surfaces,
-        # 03 Solar Radiation, 04 Reclassify Slope and Aspect.
-        self.tools = [BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation, ReclassifyFactor,
-                      Resample]
+        # (no toolset categories): 01 Download DGT Data, 02 Build Mosaics by Polygon,
+        # 03 Generate Surfaces, 04 Solar Radiation, 05 Reclassify Factors, 06 Resample.
+        self.tools = [DownloadDGTData, BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation,
+                      ReclassifyFactor, Resample]
 
 
 # ===========================================================================
@@ -736,9 +746,437 @@ def _folder_extent_resolved(folder, sr):
     return arcpy.Polygon(corners, sr)
 
 
+# ===========================================================================
+# Tool 01 - Download DGT Data (independent client of the public DGT CDD STAC API)
+# ===========================================================================
+
+DGT_CDD_BASE = "https://cdd.dgterritorio.gov.pt"
+DGT_CDD_SEARCH = DGT_CDD_BASE + "/dgt-be/v1/search"
+DGT_CDD_AUTH = "https://auth.cdd.dgterritorio.gov.pt/realms/dgterritorio/protocol/openid-connect"
+DGT_CDD_CLIENT_ID = "aai-oidc-dgt"
+DGT_CDD_REDIRECT = DGT_CDD_BASE + "/auth/callback"
+DGT_STAC_LIMIT = 1000
+DGT_MAX_CHUNK_KM2 = 200.0                 # split a WGS84 bbox larger than this before searching
+DGT_DOWNLOAD_RETRIES = 3
+DGT_CRED_DIRNAME = "LidarTerrainToolbox"
+DGT_CRED_FILENAME = "dgt_cdd_credentials.json"
+WGS84_EPSG = 4326
+DGT_ASSET_EXT = {                          # STAC asset MIME type (lowercased) to file extension
+    "image/tiff; application=geotiff": ".tif",
+    "image/tiff;application=geotiff": ".tif",
+    "image/tiff": ".tif",
+    "application/vnd.laszip": ".laz",
+    "application/vnd.las": ".las",
+}
+
+
+def _asset_extension(mime):
+    """File extension for a STAC asset MIME type (.bin if unknown)."""
+    if not mime:
+        return ".bin"
+    return DGT_ASSET_EXT.get(mime.strip().lower(), ".bin")
+
+
+def _square_bbox(xmin, ymin, xmax, ymax):
+    """Expand a bbox to a square (side is the larger dimension), keeping the center."""
+    cx = (xmin + xmax) / 2.0
+    cy = (ymin + ymax) / 2.0
+    half = max(xmax - xmin, ymax - ymin) / 2.0
+    return (cx - half, cy - half, cx + half, cy + half)
+
+
+def divide_bbox(bbox, max_km2=DGT_MAX_CHUNK_KM2):
+    """Split a WGS84 bbox (min_lon, min_lat, max_lon, max_lat) into a grid of sub bboxes, each
+    at most about max_km2, so a single search stays under the service area or item limit.
+    Returns the original bbox in a list when it is already small enough. Area is approximate
+    (degrees to km at the mean latitude), enough to bound the request size."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    mean_lat = (min_lat + max_lat) / 2.0
+    km_per_deg = 111.32
+    width_km = abs(max_lon - min_lon) * km_per_deg * math.cos(math.radians(mean_lat))
+    height_km = abs(max_lat - min_lat) * km_per_deg
+    if width_km <= 0 or height_km <= 0 or width_km * height_km <= max_km2:
+        return [(min_lon, min_lat, max_lon, max_lat)]
+    side = math.sqrt(max_km2)
+    ncols = max(1, int(math.ceil(width_km / side)))
+    nrows = max(1, int(math.ceil(height_km / side)))
+    dlon = (max_lon - min_lon) / ncols
+    dlat = (max_lat - min_lat) / nrows
+    cells = []
+    for row in range(nrows):
+        for col in range(ncols):
+            cells.append((min_lon + col * dlon, min_lat + row * dlat,
+                          min_lon + (col + 1) * dlon, min_lat + (row + 1) * dlat))
+    return cells
+
+
+def dgt_credentials_path():
+    """Path to the DGT CDD credentials config file in the user profile."""
+    base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+            or os.path.expanduser("~"))
+    return os.path.join(base, DGT_CRED_DIRNAME, DGT_CRED_FILENAME)
+
+
+def read_dgt_credentials(path):
+    """Return (username, password) from the JSON config, or (None, None) if absent/unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data.get("username"), data.get("password")
+    except (OSError, ValueError):
+        return None, None
+
+
+def write_dgt_credentials(path, username, password):
+    """Write the credentials JSON (creating the folder). Returns the path."""
+    folder = os.path.dirname(path)
+    if folder and not os.path.isdir(folder):
+        os.makedirs(folder)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"username": username, "password": password}, fh)
+    return path
+
+
+class _KeycloakFormParser(HTMLParser):
+    """Pull the login form action and input fields from a Keycloak login page. After feeding
+    the HTML, `action` is the form target URL and `fields` is the input name to value map (the
+    hidden fields plus the empty username/password inputs)."""
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.action = None
+        self.fields = {}
+        self._in_form = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form":
+            fid = (a.get("id") or "").lower()
+            action = a.get("action") or ""
+            if self.action is None or "login" in fid or "authenticate" in action.lower():
+                self.action = action or self.action
+                self._in_form = True
+        elif tag == "input" and self._in_form:
+            name = a.get("name")
+            if name:
+                self.fields[name] = a.get("value", "")
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self._in_form = False
+
+
+def parse_keycloak_login_form(html):
+    """Return (action_url, fields) for the Keycloak login form in `html`."""
+    parser = _KeycloakFormParser()
+    parser.feed(html or "")
+    return parser.action, parser.fields
+
+
+class DownloadDGTData(object):
+    def __init__(self):
+        self.label = "01 - Download DGT Data"
+        self.description = (
+            "Download DGT LiDAR data from the CDD portal, one folder per AOI feature (cartogram "
+            "sheet or buffered point/area), ready for the mosaic tool. For each feature it takes "
+            "the envelope (a clean square for points), searches the CDD STAC API by that bounding "
+            "box, and downloads the tiles. Credentials are configured once into a user profile "
+            "file. Needs network access and a CDD account; this is an independent client of the "
+            "public CDD API.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_aoi = arcpy.Parameter(
+            displayName="AOI layer (one folder per feature)", name="in_aoi",
+            datatype="GPFeatureLayer", parameterType="Required", direction="Input")
+        p_aoi.filter.list = ["Polygon", "Point"]
+
+        p_field = arcpy.Parameter(
+            displayName="Folder name field", name="name_field",
+            datatype="Field", parameterType="Required", direction="Input")
+        p_field.parameterDependencies = [p_aoi.name]
+        p_field.filter.list = ["Text", "Short", "Long"]
+
+        p_selected = arcpy.Parameter(
+            displayName="Selected features only", name="selected_only",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_selected.value = False
+
+        p_out = arcpy.Parameter(
+            displayName="Output root folder", name="out_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_point = arcpy.Parameter(
+            displayName="Point footprint size (meters, half side)", name="point_size",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_point.value = 5000
+
+        p_collections = arcpy.Parameter(
+            displayName="Collections (blank for all)", name="collections",
+            datatype="GPString", parameterType="Optional", direction="Input", multiValue=True)
+
+        p_list = arcpy.Parameter(
+            displayName="List collections only (no download)", name="list_only",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_list.value = False
+
+        p_user = arcpy.Parameter(
+            displayName="CDD username (blank uses the saved config)", name="username",
+            datatype="GPString", parameterType="Optional", direction="Input")
+
+        p_pass = arcpy.Parameter(
+            displayName="CDD password (blank uses the saved config)", name="password",
+            datatype="GPStringHidden", parameterType="Optional", direction="Input")
+
+        p_save = arcpy.Parameter(
+            displayName="Save credentials to the config file", name="save_creds",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_save.value = False
+
+        p_delay = arcpy.Parameter(
+            displayName="Delay between requests (seconds)", name="delay",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_delay.value = 1.0
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing tiles", name="overwrite",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        p_vrt = arcpy.Parameter(
+            displayName="Build a VRT per folder", name="build_vrt",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_vrt.value = False
+
+        p_dry = arcpy.Parameter(
+            displayName="Dry run (report tiles, no download)", name="dry_run",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_dry.value = False
+
+        return [p_aoi, p_field, p_selected, p_out, p_point, p_collections, p_list,
+                p_user, p_pass, p_save, p_delay, p_overwrite, p_vrt, p_dry]
+
+    def isLicensed(self):
+        return True
+
+    # --- network (not pure; the user validates live) ---
+
+    def _authenticate(self, session, username, password):
+        """Log in to the CDD via the Keycloak OpenID flow, leaving the session authenticated.
+        Returns True on success. Isolated so it is easy to fix if the login page changes."""
+        session.get(DGT_CDD_BASE, timeout=30)
+        params = urllib.parse.urlencode({
+            "client_id": DGT_CDD_CLIENT_ID, "response_type": "code",
+            "redirect_uri": DGT_CDD_REDIRECT, "scope": "openid profile email"})
+        page = session.get(DGT_CDD_AUTH + "/auth?" + params, timeout=30)
+        action, fields = parse_keycloak_login_form(page.text)
+        if not action:
+            _err("Could not find the CDD login form; the login page may have changed.")
+            return False
+        fields["username"] = username
+        fields["password"] = password
+        session.post(action, data=fields, timeout=30, allow_redirects=True)
+        try:
+            r = session.post(DGT_CDD_SEARCH, json={"bbox": [-9.2, 38.6, -9.1, 38.7], "limit": 1},
+                             timeout=30)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def _search(self, session, bbox, collections):
+        """STAC search for one bbox; returns the features list."""
+        payload = {"bbox": list(bbox), "limit": DGT_STAC_LIMIT}
+        if collections:
+            payload["collections"] = collections
+        r = session.post(DGT_CDD_SEARCH, json=payload, timeout=60)
+        r.raise_for_status()
+        return r.json().get("features", [])
+
+    def _download(self, session, url, dest, overwrite):
+        """Download one asset to dest (streamed), with retries. Returns ok / skip / fail."""
+        if os.path.exists(dest) and not overwrite:
+            return "skip"
+        for _attempt in range(DGT_DOWNLOAD_RETRIES):
+            try:
+                with session.get(url, stream=True, timeout=120) as r:
+                    r.raise_for_status()
+                    tmp = dest + ".part"
+                    with open(tmp, "wb") as fh:
+                        for chunk in r.iter_content(chunk_size=1 << 20):
+                            if chunk:
+                                fh.write(chunk)
+                    os.replace(tmp, dest)
+                return "ok"
+            except Exception:
+                continue
+        return "fail"
+
+    def _write_manifest(self, folder, area, bbox, collections, n):
+        with open(os.path.join(folder, area + "_download.txt"), "w", encoding="utf-8") as fh:
+            fh.write("Area: {}\n".format(area))
+            fh.write("Source: DGT CDD (cdd.dgterritorio.gov.pt)\n")
+            fh.write("WGS84 bbox: {}\n".format(", ".join("{:.6f}".format(v) for v in bbox)))
+            fh.write("Collections: {}\n".format(", ".join(collections) if collections else "(all)"))
+            fh.write("Tiles: {}\n".format(n))
+
+    def _build_vrt(self, folder):
+        """Build a per product VRT from the downloaded tiles, if gdal (osgeo) is available."""
+        try:
+            from osgeo import gdal
+        except ImportError:
+            _warn("VRT requested but gdal (osgeo) is not available; skipping the VRT.")
+            return
+        for prod in ("MDT", "MDS"):
+            sub = os.path.join(folder, prod)
+            if not os.path.isdir(sub):
+                continue
+            tifs = [os.path.join(sub, f) for f in os.listdir(sub) if f.lower().endswith(".tif")]
+            if tifs:
+                gdal.BuildVRT(os.path.join(folder, prod + ".vrt"), tifs)
+
+    def execute(self, parameters, messages):
+        import time
+        if requests is None:
+            msg = ("The 'requests' library is not available in this Python. Install it in the "
+                   "ArcGIS Pro environment to use the download tool.")
+            _err(msg)
+            raise ImportError(msg)
+
+        in_aoi = parameters[0].valueAsText
+        name_field = parameters[1].valueAsText
+        selected_only = bool(parameters[2].value)
+        out_folder = parameters[3].valueAsText
+        point_size = float(parameters[4].value or 0)
+        collections = list(parameters[5].values) if parameters[5].values else []
+        list_only = bool(parameters[6].value)
+        username = (parameters[7].valueAsText or "").strip()
+        password = parameters[8].valueAsText or ""
+        save_creds = bool(parameters[9].value)
+        delay = float(parameters[10].value or 0)
+        overwrite = bool(parameters[11].value)
+        build_vrt = bool(parameters[12].value)
+        dry_run = bool(parameters[13].value)
+
+        cred_path = dgt_credentials_path()
+        if username and password:
+            if save_creds:
+                write_dgt_credentials(cred_path, username, password)
+                _msg("Saved credentials to '{}'.".format(cred_path))
+        else:
+            username, password = read_dgt_credentials(cred_path)
+            if not (username and password):
+                msg = ("No CDD credentials. Configure them on first use: enter the username and "
+                       "password and turn on 'Save credentials to the config file'.")
+                _err(msg)
+                raise ValueError(msg)
+
+        session = requests.Session()
+        _msg("Authenticating with the CDD...")
+        if not self._authenticate(session, username, password):
+            msg = "CDD authentication failed; check the credentials and the service."
+            _err(msg)
+            raise RuntimeError(msg)
+        _msg("Authenticated.")
+
+        if list_only:
+            feats = self._search(session, (-9.6, 36.9, -6.1, 42.2), None)
+            found = sorted({f.get("collection") for f in feats if f.get("collection")})
+            _msg("Collections seen: {}".format(", ".join(found) if found else "(none)"))
+            return
+
+        wgs84 = arcpy.SpatialReference(WGS84_EPSG)
+        desc = arcpy.Describe(in_aoi)
+        aoi_sr = desc.spatialReference
+        if selected_only:
+            if not (getattr(desc, "FIDSet", "") or ""):
+                msg = "Selected features only is on, but no features are selected."
+                _err(msg)
+                raise ValueError(msg)
+            source = in_aoi                       # the layer cursor returns the selected features
+        else:
+            source = getattr(desc, "catalogPath", None) or in_aoi   # the data source, ignore any selection
+        total_ok = total_skip = total_fail = 0
+
+        with arcpy.da.SearchCursor(source, ["SHAPE@", name_field, "SHAPE@TYPE"]) as cursor:
+            for shape, raw_name, shp_type in cursor:
+                if shape is None or raw_name in (None, ""):
+                    _warn("Feature with no geometry or empty name; skipped.")
+                    continue
+                area = sanitize_name(str(raw_name))
+                if str(shp_type).lower() == "point":
+                    c = shape.centroid
+                    xmin, ymin = c.X - point_size, c.Y - point_size
+                    xmax, ymax = c.X + point_size, c.Y + point_size
+                else:
+                    e = shape.extent
+                    xmin, ymin, xmax, ymax = e.XMin, e.YMin, e.XMax, e.YMax
+                corners = arcpy.Array([arcpy.Point(xmin, ymin), arcpy.Point(xmin, ymax),
+                                       arcpy.Point(xmax, ymax), arcpy.Point(xmax, ymin),
+                                       arcpy.Point(xmin, ymin)])
+                poly = arcpy.Polygon(corners, aoi_sr)
+                ll = poly if _same_crs(aoi_sr, wgs84) else poly.projectAs(wgs84)
+                we = ll.extent
+                bbox = (we.XMin, we.YMin, we.XMax, we.YMax)
+
+                folder = os.path.join(out_folder, area)
+                chunks = divide_bbox(bbox)
+                assets = {}                       # item_id -> (url, extension)
+                for chunk in chunks:
+                    for feat in self._search(session, chunk, collections or None):
+                        item_id = feat.get("id") or ""
+                        for asset in (feat.get("assets") or {}).values():
+                            url = asset.get("href")
+                            if url:
+                                assets[item_id] = (url, _asset_extension(asset.get("type")))
+                    if delay:
+                        time.sleep(delay)
+
+                if dry_run:
+                    _msg("{}: {} tiles in {} chunk(s) (dry run, not downloaded).".format(
+                        area, len(assets), len(chunks)))
+                    continue
+                if not assets:
+                    _warn("{}: no tiles found for the footprint.".format(area))
+                    continue
+
+                if not os.path.isdir(folder):
+                    os.makedirs(folder)
+                ok = skip = fail = 0
+                for item_id, (url, ext) in assets.items():
+                    sub = "MDS" if item_id.upper().startswith("MDS") else "MDT"
+                    sub_dir = os.path.join(folder, sub)
+                    if not os.path.isdir(sub_dir):
+                        os.makedirs(sub_dir)
+                    dest = os.path.join(sub_dir, item_id + ext)
+                    result = self._download(session, url, dest, overwrite)
+                    if result == "ok":
+                        ok += 1
+                    elif result == "skip":
+                        skip += 1
+                    else:
+                        fail += 1
+                        _warn("{}: failed to download {}.".format(area, item_id))
+                    if delay:
+                        time.sleep(delay)
+
+                self._write_manifest(folder, area, bbox, collections, len(assets))
+                if build_vrt:
+                    self._build_vrt(folder)
+                total_ok += ok
+                total_skip += skip
+                total_fail += fail
+                _msg("{}: downloaded {}, skipped {}, failed {} -> {}".format(
+                    area, ok, skip, fail, folder))
+
+        _msg("Download done. Tiles downloaded {}, skipped {}, failed {}.".format(
+            total_ok, total_skip, total_fail))
+        if total_fail:
+            _warn("{} tile(s) failed. Re-run to retry; existing tiles are skipped.".format(total_fail))
+        return
+
+
 class BuildMosaicsByPolygon(object):
     def __init__(self):
-        self.label = "01 - Build Mosaics by Polygon"
+        self.label = "02 - Build Mosaics by Polygon"
         self.description = ("Build one DEM and one DSM mosaic per area from the DGT LiDAR "
                             "download folders. Each folder 02_DGT_LiDAR_Data_<FID> holds the "
                             "tiles of one AOI; folders are matched to areas by FID and merged "
@@ -1310,7 +1748,7 @@ def _assert_projected_raster(path):
 
 class DeriveSurfaces(object):
     def __init__(self):
-        self.label = "02 - Generate Surfaces"
+        self.label = "03 - Generate Surfaces"
         self.description = ("Derive topographic surfaces (slope in degrees and percent, aspect, "
                             "hillshade, profile and plan curvature) in batch from the per area DEM and DSM mosaics "
                             "produced by Build Mosaics By Polygon. Each surface has its own "
@@ -1588,7 +2026,7 @@ class DeriveSurfaces(object):
 
 class ReclassifyFactor(object):
     def __init__(self):
-        self.label = "04 - Reclassify Factors"
+        self.label = "05 - Reclassify Factors"
         self.description = ("Reclassify the Aspect, Slope and annual Solar rasters into the "
                             "project suitability classes (a fixed scheme), in batch. Aspect "
                             "yields two rasters: quadrants (ASPECT_DIR) and solar suitability "
@@ -1767,7 +2205,7 @@ class ReclassifyFactor(object):
 
 class SolarRadiation(object):
     def __init__(self):
-        self.label = "03 - Solar Radiation"
+        self.label = "04 - Solar Radiation"
         self.description = ("Compute annual incoming solar radiation (global, kWh/m2) per area from the "
                             "DEM mosaics, in batch, with arcpy.sa.RasterSolarRadiation (GPU accelerated). "
                             "Choose the diffuse model (uniform, overcast, or both), and optionally output "
@@ -2141,7 +2579,7 @@ class SolarRadiation(object):
 
 class Resample(object):
     def __init__(self):
-        self.label = "05 - Resample"
+        self.label = "06 - Resample"
         self.description = ("Resample the named factor rasters (mosaics and surfaces) to a target "
                             "cell size, in batch, selecting which data types to process. Outputs go "
                             "to a 'Resample' folder inside the results root, grouped by area, with the "
@@ -2491,6 +2929,30 @@ def _run_self_tests():
         check("solar_rcl scheme",
               reclassify_array(_np.array([[1000.0, 1300.0, 1500.0, 2100.0]]),
                                SOLAR_RCL_CLASSES, 9999).tolist() == [[1, 2, 3, 6]])
+
+    print("DGT download helpers")
+    check("asset extension geotiff",
+          _asset_extension("image/tiff; application=geotiff") == ".tif")
+    check("asset extension laz", _asset_extension("application/vnd.laszip") == ".laz")
+    check("asset extension unknown", _asset_extension("application/json") == ".bin")
+    check("square bbox from a rectangle",
+          _square_bbox(0.0, 0.0, 4.0, 2.0) == (0.0, -1.0, 4.0, 3.0))
+    check("small bbox is not split", len(divide_bbox((-8.0, 39.0, -7.99, 39.01))) == 1)
+    check("large bbox is split into a grid", len(divide_bbox((-8.0, 39.0, -7.0, 39.5))) > 1)
+    _action, _fields = parse_keycloak_login_form(
+        '<form id="kc-form-login" action="https://x/auth">'
+        '<input name="username" value=""><input type="hidden" name="tab_id" value="abc"></form>')
+    check("keycloak form action", _action == "https://x/auth")
+    check("keycloak form hidden field", _fields.get("tab_id") == "abc")
+    import tempfile
+    _cred = os.path.join(tempfile.gettempdir(), "lt_test_creds.json")
+    write_dgt_credentials(_cred, "user1", "pw1")
+    check("credentials round trip", read_dgt_credentials(_cred) == ("user1", "pw1"))
+    check("missing credentials file", read_dgt_credentials(_cred + ".nope") == (None, None))
+    try:
+        os.remove(_cred)
+    except OSError:
+        pass
 
     print("")
     if failures:
