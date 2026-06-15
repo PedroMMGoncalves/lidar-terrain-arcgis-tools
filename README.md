@@ -137,16 +137,17 @@ Download the DGT LiDAR for each AOI feature into one folder per feature, ready f
 | Selected features only | On downloads only the selected features. |
 | Output root folder | Where the per feature folders are written. |
 | Point footprint size (meters) | Half side of the square downloaded around a point feature (ignored for polygons, which use their envelope). |
-| Collections (blank for all) | The CDD collections to fetch. Turn on "List collections only" once to discover the names. |
+| Collections to download | A checklist of the DGT elevation products (MDT and MDS at 2 m or 50 cm, and LAZ); MDT-2m and MDS-2m are checked by default. Use "List collections only" to see every collection the portal has. |
 | List collections only | Authenticate and print the available collections, no download. |
 | CDD username, password | Blank uses the saved config. Configure them on the first use. |
 | Save credentials to the config file | Writes the username and password once to `%LOCALAPPDATA%/LidarTerrainToolbox`, reused on later runs. Use a dedicated CDD account; the file is plain text in your profile. |
 | Delay between requests | Seconds between requests, to be gentle on the service. |
 | Overwrite existing tiles | Off skips tiles already downloaded (idempotent re-runs). |
-| Build a VRT per folder | Optional per product VRT (the mosaic tool prefers it). |
+| Build a VRT per folder | Optional VRT per product subfolder (per area layout only). |
 | Dry run | Report the tile count per feature without downloading. |
+| Output layout | One folder per area with a product subfolder each (default), or a single flat folder with all tiles together. |
 
-For each feature the tool takes the envelope in WGS84 (a clean square for points), splits it if large, searches the CDD STAC API by that bounding box, and downloads the tiles into `<name>/MDT` and `<name>/MDS`, with a `<name>_download.txt` manifest. Re-running skips existing tiles and retries failures.
+For each feature the tool takes the envelope in WGS84 (a clean square for points), splits it if large, and searches the CDD STAC API by that bounding box. Tiles download one product at a time in a fixed order (MDT-50cm, MDS-50cm, MDT-2m, MDS-2m, LAZ), with each tile logged. In the per area layout they go to `<name>/<product>/` with a `<name>_download.txt` manifest; in the flat layout every tile lands in one folder. Re-running skips existing tiles and retries failures.
 
 ### Tool 2, Build Mosaics By Polygon
 

@@ -774,6 +774,24 @@ DGT_HEADERS = {                            # our client identity and the types w
     "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-PT,pt;q=0.8,en;q=0.6",
 }
+# Elevation products offered as a checklist in the tool. The orthophoto and Sentinel collections
+# the portal also has are not relevant to this terrain toolbox; "List collections only" shows all.
+DGT_ELEVATION_COLLECTIONS = ["LAZ", "MDT-2m", "MDS-2m", "MDT-50cm", "MDS-50cm"]
+# Order in which products are downloaded, so each folder fills one product at a time, not mixed.
+DGT_DOWNLOAD_ORDER = ["MDT-50cm", "MDS-50cm", "MDT-2m", "MDS-2m", "LAZ"]
+
+
+def _download_order_key(collection):
+    """Sort key so products download in the order above; any other collection goes last."""
+    try:
+        return (DGT_DOWNLOAD_ORDER.index(collection), collection)
+    except ValueError:
+        return (len(DGT_DOWNLOAD_ORDER), collection)
+
+
+# The two output layouts the tool offers.
+LAYOUT_PER_AREA = "One folder per area, products in subfolders"
+LAYOUT_FLAT = "Single flat folder, all tiles together"
 
 
 def _asset_extension(mime):
@@ -914,8 +932,11 @@ class DownloadDGTData(object):
         p_point.value = 5000
 
         p_collections = arcpy.Parameter(
-            displayName="Collections (blank for all)", name="collections",
+            displayName="Collections to download", name="collections",
             datatype="GPString", parameterType="Optional", direction="Input", multiValue=True)
+        p_collections.filter.type = "ValueList"
+        p_collections.filter.list = list(DGT_ELEVATION_COLLECTIONS)
+        p_collections.value = ["MDT-2m", "MDS-2m"]
 
         p_list = arcpy.Parameter(
             displayName="List collections only (no download)", name="list_only",
@@ -955,13 +976,15 @@ class DownloadDGTData(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_dry.value = False
 
-        p_per_feature = arcpy.Parameter(
-            displayName="Separate folder per feature (off downloads all into one folder)",
-            name="per_feature", datatype="GPBoolean", parameterType="Optional", direction="Input")
-        p_per_feature.value = True
+        p_layout = arcpy.Parameter(
+            displayName="Output layout", name="output_layout",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_layout.filter.type = "ValueList"
+        p_layout.filter.list = [LAYOUT_PER_AREA, LAYOUT_FLAT]
+        p_layout.value = LAYOUT_PER_AREA
 
         return [p_aoi, p_field, p_selected, p_out, p_point, p_collections, p_list,
-                p_user, p_pass, p_save, p_delay, p_overwrite, p_vrt, p_dry, p_per_feature]
+                p_user, p_pass, p_save, p_delay, p_overwrite, p_vrt, p_dry, p_layout]
 
     def isLicensed(self):
         return True
@@ -1075,27 +1098,43 @@ class DownloadDGTData(object):
                 time.sleep(delay)
         return assets
 
-    def _download_assets(self, session, assets, dest_root, overwrite, delay):
-        """Download an assets dict into dest_root/<collection>/. Returns (ok, skip, fail)."""
+    def _download_assets(self, session, assets, dest_root, overwrite, delay, flat=False):
+        """Download an assets dict into dest_root. With flat=False (the per area layout) each
+        product goes in its own subfolder, dest_root/<collection>/<tile>; with flat=True every
+        tile lands directly in dest_root. Tiles download grouped by product in a stable order
+        (DGT_DOWNLOAD_ORDER), not mixed, and each tile is logged. Returns (ok, skip, fail). The
+        subfolders mirror the DGT products (MDT-2m, MDS-2m, MDT-50cm, MDS-50cm, LAZ) and the
+        mosaic tool reads MDT*/MDS*."""
         import time
         if not os.path.isdir(dest_root):
             os.makedirs(dest_root)
-        ok = skip = fail = 0
+        by_col = {}
         for url, (col, item_id, ext) in assets.items():
-            sub_dir = os.path.join(dest_root, col)
-            if not os.path.isdir(sub_dir):
-                os.makedirs(sub_dir)
-            dest = os.path.join(sub_dir, item_id + ext)
-            result = self._download(session, url, dest, overwrite)
-            if result == "ok":
-                ok += 1
-            elif result == "skip":
-                skip += 1
+            by_col.setdefault(col, []).append((url, item_id, ext))
+        ok = skip = fail = 0
+        for col in sorted(by_col, key=_download_order_key):
+            tiles = sorted(by_col[col], key=lambda t: t[1])
+            total = len(tiles)
+            if flat:
+                sub_dir = dest_root
             else:
-                fail += 1
-                _warn("Failed to download {}.".format(item_id))
-            if delay:
-                time.sleep(delay)
+                sub_dir = os.path.join(dest_root, col)
+                if not os.path.isdir(sub_dir):
+                    os.makedirs(sub_dir)
+            _msg("  {0}: {1} tiles".format(col, total))
+            for n, (url, item_id, ext) in enumerate(tiles, 1):
+                dest = os.path.join(sub_dir, item_id + ext)
+                _msg("    [{0}/{1}] {2}".format(n, total, item_id + ext))
+                result = self._download(session, url, dest, overwrite)
+                if result == "ok":
+                    ok += 1
+                elif result == "skip":
+                    skip += 1
+                else:
+                    fail += 1
+                    _warn("Failed to download {}.".format(item_id))
+                if delay:
+                    time.sleep(delay)
         return ok, skip, fail
 
     def _download(self, session, url, dest, overwrite):
@@ -1127,19 +1166,20 @@ class DownloadDGTData(object):
             fh.write("Tiles: {}\n".format(n))
 
     def _build_vrt(self, folder):
-        """Build a per product VRT from the downloaded tiles, if gdal (osgeo) is available."""
+        """Build a VRT per product subfolder that holds GeoTIFFs, if gdal (osgeo) is available."""
         try:
             from osgeo import gdal
         except ImportError:
             _warn("VRT requested but gdal (osgeo) is not available; skipping the VRT.")
             return
-        for prod in ("MDT", "MDS"):
-            sub = os.path.join(folder, prod)
+        for entry in sorted(os.listdir(folder)):
+            sub = os.path.join(folder, entry)
             if not os.path.isdir(sub):
                 continue
-            tifs = [os.path.join(sub, f) for f in os.listdir(sub) if f.lower().endswith(".tif")]
+            tifs = [os.path.join(sub, f) for f in sorted(os.listdir(sub))
+                    if f.lower().endswith(".tif")]
             if tifs:
-                gdal.BuildVRT(os.path.join(folder, prod + ".vrt"), tifs)
+                gdal.BuildVRT(os.path.join(folder, entry + ".vrt"), tifs)
 
     def execute(self, parameters, messages):
         import time
@@ -1163,7 +1203,8 @@ class DownloadDGTData(object):
         overwrite = bool(parameters[11].value)
         build_vrt = bool(parameters[12].value)
         dry_run = bool(parameters[13].value)
-        per_feature = bool(parameters[14].value)
+        layout = parameters[14].valueAsText or LAYOUT_PER_AREA
+        per_feature = (layout == LAYOUT_PER_AREA)
 
         cred_path = dgt_credentials_path()
         if username and password:
@@ -1201,6 +1242,10 @@ class DownloadDGTData(object):
                 _warn("No collections found. Check the login and that the AOI has coverage.")
             return
 
+        if not collections:
+            collections = ["MDT-2m", "MDS-2m"]
+            _msg("No collection selected; defaulting to MDT-2m and MDS-2m.")
+
         wgs84 = arcpy.SpatialReference(WGS84_EPSG)
         desc = arcpy.Describe(in_aoi)
         aoi_sr = desc.spatialReference
@@ -1234,6 +1279,7 @@ class DownloadDGTData(object):
                     _warn("{}: no tiles found for the footprint.".format(area))
                     continue
                 folder = os.path.join(out_folder, area)
+                _msg("{}: downloading {} tiles...".format(area, len(assets)))
                 ok, skip, fail = self._download_assets(session, assets, folder, overwrite, delay)
                 self._write_manifest(folder, area, bbox, collections, len(assets))
                 if build_vrt:
@@ -1244,21 +1290,22 @@ class DownloadDGTData(object):
                 _msg("{}: downloaded {}, skipped {}, failed {} -> {}".format(
                     area, ok, skip, fail, folder))
         else:
-            # All features into one folder (block), deduplicated by URL.
+            # All features into one flat folder, deduplicated by URL.
             merged = {}
             for area, bbox in features:
                 merged.update(self._collect_assets(session, bbox, collections, delay))
             if dry_run:
-                _msg("Block: {} tiles from {} feature(s) (dry run, not downloaded).".format(
+                _msg("Flat: {} tiles from {} feature(s) (dry run, not downloaded).".format(
                     len(merged), len(features)))
             elif not merged:
                 _warn("No tiles found for any feature.")
             else:
+                _msg("Flat: downloading {} tiles...".format(len(merged)))
                 total_ok, total_skip, total_fail = self._download_assets(
-                    session, merged, out_folder, overwrite, delay)
+                    session, merged, out_folder, overwrite, delay, flat=True)
                 self._write_manifest(out_folder, "ALL", None, collections, len(merged))
                 if build_vrt:
-                    self._build_vrt(out_folder)
+                    _warn("VRT is not built for the flat layout (products share one folder).")
                 _msg("Block: downloaded {}, skipped {}, failed {} -> {}".format(
                     total_ok, total_skip, total_fail, out_folder))
 
