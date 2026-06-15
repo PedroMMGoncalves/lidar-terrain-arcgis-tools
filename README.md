@@ -132,9 +132,8 @@ Download the DGT LiDAR for each AOI feature into one folder per feature, ready f
 
 | Parameter | Description |
 | --- | --- |
-| AOI layer | Polygon or point features; one download folder per feature. |
+| AOI layer | Polygon or point features; one download folder per feature. An active selection on the layer is honored (only the selected features are downloaded). |
 | Folder name field | Names each folder (sanitized), for example the sheet or area name. |
-| Selected features only | On downloads only the selected features. |
 | Output root folder | Where the per feature folders are written. |
 | Point footprint size (meters) | Half side of the square downloaded around a point feature (ignored for polygons, which use their envelope). |
 | Collections to download | A checklist of the DGT elevation products (MDT and MDS at 2 m or 50 cm, and LAZ); MDT-2m and MDS-2m are checked by default. Use "List collections only" to see every collection the portal has. |

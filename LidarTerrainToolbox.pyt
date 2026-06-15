@@ -917,11 +917,6 @@ class DownloadDGTData(object):
         p_field.parameterDependencies = [p_aoi.name]
         p_field.filter.list = ["Text", "Short", "Long"]
 
-        p_selected = arcpy.Parameter(
-            displayName="Selected features only", name="selected_only",
-            datatype="GPBoolean", parameterType="Optional", direction="Input")
-        p_selected.value = False
-
         p_out = arcpy.Parameter(
             displayName="Output root folder", name="out_folder",
             datatype="DEFolder", parameterType="Required", direction="Input")
@@ -983,7 +978,7 @@ class DownloadDGTData(object):
         p_layout.filter.list = [LAYOUT_PER_AREA, LAYOUT_FLAT]
         p_layout.value = LAYOUT_PER_AREA
 
-        return [p_aoi, p_field, p_selected, p_out, p_point, p_collections, p_list,
+        return [p_aoi, p_field, p_out, p_point, p_collections, p_list,
                 p_user, p_pass, p_save, p_delay, p_overwrite, p_vrt, p_dry, p_layout]
 
     def isLicensed(self):
@@ -1191,19 +1186,18 @@ class DownloadDGTData(object):
 
         in_aoi = parameters[0].valueAsText
         name_field = parameters[1].valueAsText
-        selected_only = bool(parameters[2].value)
-        out_folder = parameters[3].valueAsText
-        point_size = float(parameters[4].value or 0)
-        collections = list(parameters[5].values) if parameters[5].values else []
-        list_only = bool(parameters[6].value)
-        username = (parameters[7].valueAsText or "").strip()
-        password = parameters[8].valueAsText or ""
-        save_creds = bool(parameters[9].value)
-        delay = float(parameters[10].value or 0)
-        overwrite = bool(parameters[11].value)
-        build_vrt = bool(parameters[12].value)
-        dry_run = bool(parameters[13].value)
-        layout = parameters[14].valueAsText or LAYOUT_PER_AREA
+        out_folder = parameters[2].valueAsText
+        point_size = float(parameters[3].value or 0)
+        collections = list(parameters[4].values) if parameters[4].values else []
+        list_only = bool(parameters[5].value)
+        username = (parameters[6].valueAsText or "").strip()
+        password = parameters[7].valueAsText or ""
+        save_creds = bool(parameters[8].value)
+        delay = float(parameters[9].value or 0)
+        overwrite = bool(parameters[10].value)
+        build_vrt = bool(parameters[11].value)
+        dry_run = bool(parameters[12].value)
+        layout = parameters[13].valueAsText or LAYOUT_PER_AREA
         per_feature = (layout == LAYOUT_PER_AREA)
 
         cred_path = dgt_credentials_path()
@@ -1249,11 +1243,7 @@ class DownloadDGTData(object):
         wgs84 = arcpy.SpatialReference(WGS84_EPSG)
         desc = arcpy.Describe(in_aoi)
         aoi_sr = desc.spatialReference
-        if selected_only and not (getattr(desc, "FIDSet", "") or ""):
-            msg = "Selected features only is on, but no features are selected."
-            _err(msg)
-            raise ValueError(msg)
-        source = in_aoi          # the layer cursor honors the current selection (all when none)
+        source = in_aoi          # the layer cursor honors the active selection (all when none)
         total_ok = total_skip = total_fail = 0
         features = []                             # (area, wgs84 bbox)
         with arcpy.da.SearchCursor(source, ["SHAPE@", name_field]) as cursor:
