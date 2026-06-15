@@ -19,7 +19,19 @@ This toolbox is the **factor engine only**. Any downstream analysis (suitability
 
 ## Contents
 
-[Summary](#summary) - [Method](#method) - [Requirements](#requirements) - [Data source](#data-source) - [Installation](#installation) - [Usage](#usage) - [Naming convention](#naming-convention) - [Example](#example) - [Performance](#performance) - [Tests](#tests) - [Troubleshooting](#troubleshooting) - [Limitations and notes](#limitations-and-notes) - [Contributing](#contributing) - [Citation](#citation) - [License](#license)
+[Quick start](#quick-start) - [Summary](#summary) - [Method](#method) - [Requirements](#requirements) - [Data source](#data-source) - [Installation](#installation) - [Usage](#usage) - [Naming convention](#naming-convention) - [Example](#example) - [Performance](#performance) - [Tests](#tests) - [Troubleshooting](#troubleshooting) - [Limitations and notes](#limitations-and-notes) - [Contributing](#contributing) - [Citation](#citation) - [License](#license)
+
+---
+
+## Quick start
+
+1. **Add the toolbox.** In *Catalog*, right-click a folder, *Add Toolbox*, and pick `LidarTerrainToolbox.pyt`.
+2. **Get the data.** Run **Tool 1, Download DGT Data** with your AOI layer and a name field (free CDD account needed), or point at LiDAR you already downloaded with the QGIS DGT CDD plugin.
+3. **Build the mosaics.** Run **Tool 2** on the download root to get one DEM and one DSM per area.
+4. **Derive the factors.** Run **Tool 3** (surfaces), **Tool 4** (solar), then **Tool 5** (reclassify) on the previous outputs.
+5. **Resample (optional).** Run **Tool 6**, for example 2 m to 5 m, to lighten later steps.
+
+Each tool reads the previous tool's output folder and writes with one consistent naming convention. Project CRS is EPSG:3763.
 
 ---
 
@@ -27,7 +39,7 @@ This toolbox is the **factor engine only**. Any downstream analysis (suitability
 
 Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. A sixth tool, Resample, is an optional utility you can run on any of the outputs:
 
-1. **Download DGT Data**: download the LiDAR tiles from the DGT CDD portal, one folder per AOI feature (cartogram sheet or buffered point/area), ready for the mosaic tool.
+1. **Download DGT Data**: download the LiDAR tiles from the DGT CDD portal, organized one folder per AOI feature (with a product subfolder each) or as a single flat folder, ready for the mosaic tool.
 2. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
 3. **Generate Surfaces**: slope (degrees and percent), aspect, hillshade and curvature (profile and plan) from each mosaic.
 4. **Solar Radiation**: annual solar radiation (global, kWh/m2) per area on the DEM with RasterSolarRadiation (GPU), with a choice of diffuse model (uniform, overcast, or both) and optional direct, diffuse and duration outputs, at the native 2 m baseline.
@@ -44,7 +56,7 @@ Every output is named by a single, consistent convention (see [Naming convention
 flowchart TD
     AOI["AOI polygons or points<br/>sheets or areas"]
     AOI --> TDL["Tool 1<br/>Download DGT Data"]
-    TDL --> LID["DGT LiDAR folders<br/>one per feature, MDT (DEM) and MDS (DSM)"]
+    TDL --> LID["DGT LiDAR folders<br/>per area, product subfolders<br/>MDT (DEM) and MDS (DSM)"]
     AOI --> T1
     LID --> T1
     T1["Tool 2<br/>Build Mosaics by Polygon"]
@@ -79,8 +91,8 @@ flowchart TD
     class EXT ext;
 ```
 
-- **Tool 1** downloads the DGT LiDAR per AOI feature: it takes the feature envelope in WGS84 (a clean square for points), searches the CDD STAC API by that bounding box, and saves the tiles into one folder per feature, ready for Tool 2.
-- The DGT LiDAR is organized as one download folder per area of interest, where the folder name ends in the AOI feature FID and holds the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. The 5 km buffer selection was already applied at download time.
+- **Tool 1** downloads the DGT LiDAR per AOI feature: it takes the feature envelope in WGS84 (a clean square for points) and searches the CDD STAC API by that bounding box. It offers two output layouts: one folder per area (named by a chosen field) with a product subfolder each (`MDT-2m`, `MDS-2m`, `MDT-50cm`, `MDS-50cm`, `LAZ`), ready for Tool 2, or a single flat folder with all tiles together. Tiles download one product at a time, in a fixed order, with each tile logged.
+- The DGT LiDAR is organized as one download folder per area of interest, holding the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. The folder is named by the area: the QGIS plugin numbered it by the AOI feature FID, Tool 1 names it by your chosen field, and Tool 2 maps either way. The 5 km buffer selection was applied at download time.
 - **Tool 2** groups AOI features by area name, then maps each area to its download folder. By default it maps **by geometry** (the folder whose tile extent is centered on the area), which is robust to a shapefile whose FID order no longer matches the folder numbering done at download time; a **by FID number** option keeps the older folder-number mapping. It merges each area's MDT and MDS tiles across its folders into one DEM and one DSM mosaic, deduplicating tiles by name. An optional clustering mode also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, written to a `clusters` subfolder, each with a `Cluster_NNN_members.txt` manifest.
 - **Tool 3** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees, and optionally percent; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
 - **Tool 4** computes annual solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated), at the native 2 m baseline. You pick the diffuse model (uniform, overcast, or both) and can also output the direct, diffuse and direct duration rasters; the output names carry the model (`SOLARUNI`, `SOLAROVC`). A coarser solar cell size resamples the DEM first.
@@ -96,7 +108,7 @@ flowchart TD
 - **Spatial Analyst** extension for Tool 3 (slope, aspect, curvature, traditional hillshade) and Tool 4 (solar radiation). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
 - **Image Analyst** extension for Tool 3 only when the hillshade type is Multidirectional.
 - **Network access, a free CDD account, and the `requests` library** (bundled with ArcGIS Pro) for Tool 1 (Download DGT Data).
-- Tools 1, 4 and 5 need no extension (mosaicking and resampling are core, and the reclassification is pure numpy).
+- Tools 1, 2, 5 and 6 need no extension (download, mosaicking and resampling are core, and the reclassification is pure numpy).
 - Tiles in the project CRS, ETRS89 / PT-TM06 (EPSG:3763). The tools log the CRS and warn if it differs.
 
 ---
@@ -107,7 +119,7 @@ The tools were built for the DGT LiDAR survey of mainland Portugal, *Levantament
 
 The data is distributed through the DGT Data Center (CDD), which requires a free registration: <https://cdd.dgterritorio.gov.pt/dgt-fe>.
 
-The tiles used here were downloaded with the [DGT CDD Downloader](https://plugins.qgis.org/plugins/dgt_cdd_downloader/) plugin for QGIS (Duarte Carreira, Hugo Santos and Pedro Venâncio). It authenticates against the CDD portal, splits a large area into chunks, organizes the files per area, and can build a per folder VRT. That is the exact on disk layout Tool 2 expects, and the layout this toolbox's Tool 1 (Download DGT Data) now produces directly: one download folder per area of interest, each with `MDT*` and `MDS*` subfolders (and an optional per product `.vrt`).
+The tiles used here were downloaded with the [DGT CDD Downloader](https://plugins.qgis.org/plugins/dgt_cdd_downloader/) plugin for QGIS (Duarte Carreira, Hugo Santos and Pedro Venâncio). It authenticates against the CDD portal, splits a large area into chunks, organizes the files per area, and can build a per folder VRT. That is the exact on disk layout Tool 2 expects, and the layout this toolbox's Tool 1 (Download DGT Data) produces in its per area mode: one download folder per area of interest, each with a product subfolder (`MDT-2m`, `MDS-2m`, `MDT-50cm`, `MDS-50cm`, `LAZ`) and an optional per product `.vrt`. Tool 1 can also dump every tile into a single flat folder.
 
 > The factor tools (2 to 4) work on any DEM and DSM raster. Only Tool 2 (mosaicking) is tailored to the DGT download folder layout described above.
 
@@ -128,7 +140,7 @@ Run the tools in order. Each tool takes its input from the previous tool's outpu
 
 ### Tool 1, Download DGT Data
 
-Download the DGT LiDAR for each AOI feature into one folder per feature, ready for Tool 2. Needs network access, a free CDD account, and the `requests` library (bundled with ArcGIS Pro). It is an independent client of the public CDD STAC API.
+Download the DGT LiDAR for your AOI features, ready for Tool 2. Needs network access, a free CDD account, and the `requests` library (bundled with ArcGIS Pro). It is an independent client of the public CDD STAC API.
 
 | Parameter | Description |
 | --- | --- |
