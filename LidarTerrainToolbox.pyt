@@ -768,6 +768,12 @@ DGT_ASSET_EXT = {                          # STAC asset MIME type (lowercased) t
     "application/vnd.laszip": ".laz",
     "application/vnd.las": ".las",
 }
+DGT_AUTH_HOST = "https://auth.cdd.dgterritorio.gov.pt"
+DGT_HEADERS = {                            # our client identity and the types we accept
+    "User-Agent": "LidarTerrainToolbox/1.0 (ArcGIS Pro; +https://github.com/PedroMMGoncalves/lidar-terrain-arcgis-tools)",
+    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "pt-PT,pt;q=0.8,en;q=0.6",
+}
 
 
 def _asset_extension(mime):
@@ -837,7 +843,7 @@ def write_dgt_credentials(path, username, password):
     return path
 
 
-class _KeycloakFormParser(HTMLParser):
+class _LoginFormParser(HTMLParser):
     """Pull the login form action and input fields from a Keycloak login page. After feeding
     the HTML, `action` is the form target URL and `fields` is the input name to value map (the
     hidden fields plus the empty username/password inputs)."""
@@ -849,25 +855,22 @@ class _KeycloakFormParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
-        if tag == "form":
-            fid = (a.get("id") or "").lower()
-            action = a.get("action") or ""
-            if self.action is None or "login" in fid or "authenticate" in action.lower():
-                self.action = action or self.action
-                self._in_form = True
+        if tag == "form" and a.get("id") == "kc-form-login":
+            self._in_form = True
+            self.action = a.get("action")
         elif tag == "input" and self._in_form:
             name = a.get("name")
-            if name:
+            if name and a.get("type") == "hidden":
                 self.fields[name] = a.get("value", "")
 
     def handle_endtag(self, tag):
-        if tag == "form":
+        if tag == "form" and self._in_form:
             self._in_form = False
 
 
-def parse_keycloak_login_form(html):
-    """Return (action_url, fields) for the Keycloak login form in `html`."""
-    parser = _KeycloakFormParser()
+def parse_login_form(html):
+    """Return (action_url, hidden_fields) for the CDD login form in `html`."""
+    parser = _LoginFormParser()
     parser.feed(html or "")
     return parser.action, parser.fields
 
@@ -952,8 +955,13 @@ class DownloadDGTData(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_dry.value = False
 
+        p_per_feature = arcpy.Parameter(
+            displayName="Separate folder per feature (off downloads all into one folder)",
+            name="per_feature", datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_per_feature.value = True
+
         return [p_aoi, p_field, p_selected, p_out, p_point, p_collections, p_list,
-                p_user, p_pass, p_save, p_delay, p_overwrite, p_vrt, p_dry]
+                p_user, p_pass, p_save, p_delay, p_overwrite, p_vrt, p_dry, p_per_feature]
 
     def isLicensed(self):
         return True
@@ -962,25 +970,39 @@ class DownloadDGTData(object):
 
     def _authenticate(self, session, username, password):
         """Log in to the CDD via the Keycloak OpenID flow, leaving the session authenticated.
-        Returns True on success. Isolated so it is easy to fix if the login page changes."""
-        session.get(DGT_CDD_BASE, timeout=30)
+        Returns True on success. Follows the public CDD login flow; isolated so it is easy to
+        fix if the login page changes."""
+        session.headers.update(DGT_HEADERS)
+        session.get(DGT_CDD_BASE, timeout=30).raise_for_status()
         params = urllib.parse.urlencode({
             "client_id": DGT_CDD_CLIENT_ID, "response_type": "code",
             "redirect_uri": DGT_CDD_REDIRECT, "scope": "openid profile email"})
         page = session.get(DGT_CDD_AUTH + "/auth?" + params, timeout=30)
-        action, fields = parse_keycloak_login_form(page.text)
+        page.raise_for_status()
+        action, fields = parse_login_form(page.text)
         if not action:
             _err("Could not find the CDD login form; the login page may have changed.")
             return False
+        if action.startswith("/"):
+            action = DGT_AUTH_HOST + action
+        fields = dict(fields)
         fields["username"] = username
         fields["password"] = password
-        session.post(action, data=fields, timeout=30, allow_redirects=True)
+        login_headers = {"Content-Type": "application/x-www-form-urlencoded",
+                         "Origin": DGT_AUTH_HOST, "Referer": page.url}
         try:
-            r = session.post(DGT_CDD_SEARCH, json={"bbox": [-9.2, 38.6, -9.1, 38.7], "limit": 1},
-                             timeout=30)
-            return r.status_code == 200
-        except Exception:
+            resp = session.post(action, data=fields, headers=login_headers,
+                                allow_redirects=True, timeout=30)
+            resp.raise_for_status()
+        except Exception as exc:
+            _err("CDD login request failed: {}".format(exc))
             return False
+        if not resp.url.startswith(DGT_CDD_BASE):
+            _err("CDD login did not redirect back to the site; check the credentials.")
+            return False
+        test = session.post(DGT_CDD_SEARCH, json={"bbox": [-9.0, 38.0, -8.0, 39.0], "limit": 1},
+                            timeout=30)
+        return test.status_code == 200
 
     def _search(self, session, bbox, collections):
         """STAC search for one bbox; returns the features list."""
@@ -990,6 +1012,91 @@ class DownloadDGTData(object):
         r = session.post(DGT_CDD_SEARCH, json=payload, timeout=60)
         r.raise_for_status()
         return r.json().get("features", [])
+
+    def _collections_via_endpoint(self, session):
+        """Collections from the standard STAC /collections endpoint (empty list on failure)."""
+        try:
+            r = session.get(DGT_CDD_BASE + "/dgt-be/v1/collections", timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            cols = data.get("collections") if isinstance(data, dict) else data
+            return sorted(c.get("id") for c in (cols or []) if isinstance(c, dict) and c.get("id"))
+        except Exception:
+            return []
+
+    def _first_feature_bbox(self, in_aoi, point_size):
+        """A small WGS84 bbox at the first AOI feature, to probe which collections cover the AOI."""
+        wgs84 = arcpy.SpatialReference(WGS84_EPSG)
+        aoi_sr = arcpy.Describe(in_aoi).spatialReference
+        with arcpy.da.SearchCursor(in_aoi, ["SHAPE@", "SHAPE@TYPE"]) as cursor:
+            for shape, _shp_type in cursor:
+                if shape is not None:
+                    return self._feature_bbox(shape, "point", point_size or 500.0, aoi_sr, wgs84)
+        return None
+
+    def _item_id(self, feat):
+        """Item id from the STAC self link (the file base name), else the feature id."""
+        for link in feat.get("links", []) or []:
+            if link.get("rel") == "self" and link.get("href"):
+                return link["href"].rstrip("/").split("/")[-1]
+        return feat.get("id") or "unknown"
+
+    def _feature_bbox(self, shape, shp_type, point_size, aoi_sr, wgs84):
+        """WGS84 (min_lon, min_lat, max_lon, max_lat) envelope for a feature; a square of half
+        side point_size around a point feature."""
+        if str(shp_type).lower() == "point":
+            c = shape.centroid
+            xmin, ymin = c.X - point_size, c.Y - point_size
+            xmax, ymax = c.X + point_size, c.Y + point_size
+        else:
+            e = shape.extent
+            xmin, ymin, xmax, ymax = e.XMin, e.YMin, e.XMax, e.YMax
+        corners = arcpy.Array([arcpy.Point(xmin, ymin), arcpy.Point(xmin, ymax),
+                               arcpy.Point(xmax, ymax), arcpy.Point(xmax, ymin),
+                               arcpy.Point(xmin, ymin)])
+        poly = arcpy.Polygon(corners, aoi_sr)
+        ll = poly if _same_crs(aoi_sr, wgs84) else poly.projectAs(wgs84)
+        we = ll.extent
+        return (we.XMin, we.YMin, we.XMax, we.YMax)
+
+    def _collect_assets(self, session, bbox, collections, delay):
+        """Search a bbox (split if large) and return {url: (collection, item_id, extension)}."""
+        import time
+        assets = {}
+        for chunk in divide_bbox(bbox):
+            for feat in self._search(session, chunk, collections or None):
+                col = feat.get("collection") or "unknown"
+                item_id = self._item_id(feat)
+                for asset in (feat.get("assets") or {}).values():
+                    url = asset.get("href")
+                    if url and url not in assets:
+                        assets[url] = (col, item_id, _asset_extension(asset.get("type")))
+            if delay:
+                time.sleep(delay)
+        return assets
+
+    def _download_assets(self, session, assets, dest_root, overwrite, delay):
+        """Download an assets dict into dest_root/<collection>/. Returns (ok, skip, fail)."""
+        import time
+        if not os.path.isdir(dest_root):
+            os.makedirs(dest_root)
+        ok = skip = fail = 0
+        for url, (col, item_id, ext) in assets.items():
+            sub_dir = os.path.join(dest_root, col)
+            if not os.path.isdir(sub_dir):
+                os.makedirs(sub_dir)
+            dest = os.path.join(sub_dir, item_id + ext)
+            result = self._download(session, url, dest, overwrite)
+            if result == "ok":
+                ok += 1
+            elif result == "skip":
+                skip += 1
+            else:
+                fail += 1
+                _warn("Failed to download {}.".format(item_id))
+            if delay:
+                time.sleep(delay)
+        return ok, skip, fail
 
     def _download(self, session, url, dest, overwrite):
         """Download one asset to dest (streamed), with retries. Returns ok / skip / fail."""
@@ -1014,7 +1121,8 @@ class DownloadDGTData(object):
         with open(os.path.join(folder, area + "_download.txt"), "w", encoding="utf-8") as fh:
             fh.write("Area: {}\n".format(area))
             fh.write("Source: DGT CDD (cdd.dgterritorio.gov.pt)\n")
-            fh.write("WGS84 bbox: {}\n".format(", ".join("{:.6f}".format(v) for v in bbox)))
+            if bbox:
+                fh.write("WGS84 bbox: {}\n".format(", ".join("{:.6f}".format(v) for v in bbox)))
             fh.write("Collections: {}\n".format(", ".join(collections) if collections else "(all)"))
             fh.write("Tiles: {}\n".format(n))
 
@@ -1055,6 +1163,7 @@ class DownloadDGTData(object):
         overwrite = bool(parameters[11].value)
         build_vrt = bool(parameters[12].value)
         dry_run = bool(parameters[13].value)
+        per_feature = bool(parameters[14].value)
 
         cred_path = dgt_credentials_path()
         if username and password:
@@ -1078,9 +1187,18 @@ class DownloadDGTData(object):
         _msg("Authenticated.")
 
         if list_only:
-            feats = self._search(session, (-9.6, 36.9, -6.1, 42.2), None)
-            found = sorted({f.get("collection") for f in feats if f.get("collection")})
-            _msg("Collections seen: {}".format(", ".join(found) if found else "(none)"))
+            cols = self._collections_via_endpoint(session)
+            if not cols:
+                probe = self._first_feature_bbox(in_aoi, point_size)
+                if probe:
+                    assets = self._collect_assets(session, probe, None, 0)
+                    cols = sorted({c for (c, _id, _ext) in assets.values()})
+            if cols:
+                _msg("Collections ({}):".format(len(cols)))
+                for cid in cols:
+                    _msg("  " + cid)
+            else:
+                _warn("No collections found. Check the login and that the AOI has coverage.")
             return
 
         wgs84 = arcpy.SpatialReference(WGS84_EPSG)
@@ -1095,69 +1213,31 @@ class DownloadDGTData(object):
         else:
             source = getattr(desc, "catalogPath", None) or in_aoi   # the data source, ignore any selection
         total_ok = total_skip = total_fail = 0
-
+        features = []                             # (area, wgs84 bbox)
         with arcpy.da.SearchCursor(source, ["SHAPE@", name_field, "SHAPE@TYPE"]) as cursor:
             for shape, raw_name, shp_type in cursor:
                 if shape is None or raw_name in (None, ""):
                     _warn("Feature with no geometry or empty name; skipped.")
                     continue
-                area = sanitize_name(str(raw_name))
-                if str(shp_type).lower() == "point":
-                    c = shape.centroid
-                    xmin, ymin = c.X - point_size, c.Y - point_size
-                    xmax, ymax = c.X + point_size, c.Y + point_size
-                else:
-                    e = shape.extent
-                    xmin, ymin, xmax, ymax = e.XMin, e.YMin, e.XMax, e.YMax
-                corners = arcpy.Array([arcpy.Point(xmin, ymin), arcpy.Point(xmin, ymax),
-                                       arcpy.Point(xmax, ymax), arcpy.Point(xmax, ymin),
-                                       arcpy.Point(xmin, ymin)])
-                poly = arcpy.Polygon(corners, aoi_sr)
-                ll = poly if _same_crs(aoi_sr, wgs84) else poly.projectAs(wgs84)
-                we = ll.extent
-                bbox = (we.XMin, we.YMin, we.XMax, we.YMax)
+                features.append((sanitize_name(str(raw_name)),
+                                 self._feature_bbox(shape, shp_type, point_size, aoi_sr, wgs84)))
+        if not features:
+            msg = "No features to download."
+            _err(msg)
+            raise ValueError(msg)
 
-                folder = os.path.join(out_folder, area)
-                chunks = divide_bbox(bbox)
-                assets = {}                       # item_id -> (url, extension)
-                for chunk in chunks:
-                    for feat in self._search(session, chunk, collections or None):
-                        item_id = feat.get("id") or ""
-                        for asset in (feat.get("assets") or {}).values():
-                            url = asset.get("href")
-                            if url:
-                                assets[item_id] = (url, _asset_extension(asset.get("type")))
-                    if delay:
-                        time.sleep(delay)
-
+        if per_feature:
+            # One folder per feature (the recurrence).
+            for area, bbox in features:
+                assets = self._collect_assets(session, bbox, collections, delay)
                 if dry_run:
-                    _msg("{}: {} tiles in {} chunk(s) (dry run, not downloaded).".format(
-                        area, len(assets), len(chunks)))
+                    _msg("{}: {} tiles (dry run, not downloaded).".format(area, len(assets)))
                     continue
                 if not assets:
                     _warn("{}: no tiles found for the footprint.".format(area))
                     continue
-
-                if not os.path.isdir(folder):
-                    os.makedirs(folder)
-                ok = skip = fail = 0
-                for item_id, (url, ext) in assets.items():
-                    sub = "MDS" if item_id.upper().startswith("MDS") else "MDT"
-                    sub_dir = os.path.join(folder, sub)
-                    if not os.path.isdir(sub_dir):
-                        os.makedirs(sub_dir)
-                    dest = os.path.join(sub_dir, item_id + ext)
-                    result = self._download(session, url, dest, overwrite)
-                    if result == "ok":
-                        ok += 1
-                    elif result == "skip":
-                        skip += 1
-                    else:
-                        fail += 1
-                        _warn("{}: failed to download {}.".format(area, item_id))
-                    if delay:
-                        time.sleep(delay)
-
+                folder = os.path.join(out_folder, area)
+                ok, skip, fail = self._download_assets(session, assets, folder, overwrite, delay)
                 self._write_manifest(folder, area, bbox, collections, len(assets))
                 if build_vrt:
                     self._build_vrt(folder)
@@ -1166,6 +1246,24 @@ class DownloadDGTData(object):
                 total_fail += fail
                 _msg("{}: downloaded {}, skipped {}, failed {} -> {}".format(
                     area, ok, skip, fail, folder))
+        else:
+            # All features into one folder (block), deduplicated by URL.
+            merged = {}
+            for area, bbox in features:
+                merged.update(self._collect_assets(session, bbox, collections, delay))
+            if dry_run:
+                _msg("Block: {} tiles from {} feature(s) (dry run, not downloaded).".format(
+                    len(merged), len(features)))
+            elif not merged:
+                _warn("No tiles found for any feature.")
+            else:
+                total_ok, total_skip, total_fail = self._download_assets(
+                    session, merged, out_folder, overwrite, delay)
+                self._write_manifest(out_folder, "ALL", None, collections, len(merged))
+                if build_vrt:
+                    self._build_vrt(out_folder)
+                _msg("Block: downloaded {}, skipped {}, failed {} -> {}".format(
+                    total_ok, total_skip, total_fail, out_folder))
 
         _msg("Download done. Tiles downloaded {}, skipped {}, failed {}.".format(
             total_ok, total_skip, total_fail))
@@ -2939,7 +3037,7 @@ def _run_self_tests():
           _square_bbox(0.0, 0.0, 4.0, 2.0) == (0.0, -1.0, 4.0, 3.0))
     check("small bbox is not split", len(divide_bbox((-8.0, 39.0, -7.99, 39.01))) == 1)
     check("large bbox is split into a grid", len(divide_bbox((-8.0, 39.0, -7.0, 39.5))) > 1)
-    _action, _fields = parse_keycloak_login_form(
+    _action, _fields = parse_login_form(
         '<form id="kc-form-login" action="https://x/auth">'
         '<input name="username" value=""><input type="hidden" name="tab_id" value="abc"></form>')
     check("keycloak form action", _action == "https://x/auth")
