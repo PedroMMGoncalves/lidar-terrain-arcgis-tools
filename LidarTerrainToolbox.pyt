@@ -1028,8 +1028,8 @@ class DownloadDGTData(object):
         """A small WGS84 bbox at the first AOI feature, to probe which collections cover the AOI."""
         wgs84 = arcpy.SpatialReference(WGS84_EPSG)
         aoi_sr = arcpy.Describe(in_aoi).spatialReference
-        with arcpy.da.SearchCursor(in_aoi, ["SHAPE@", "SHAPE@TYPE"]) as cursor:
-            for shape, _shp_type in cursor:
+        with arcpy.da.SearchCursor(in_aoi, ["SHAPE@"]) as cursor:
+            for (shape,) in cursor:
                 if shape is not None:
                     return self._feature_bbox(shape, "point", point_size or 500.0, aoi_sr, wgs84)
         return None
@@ -1204,23 +1204,20 @@ class DownloadDGTData(object):
         wgs84 = arcpy.SpatialReference(WGS84_EPSG)
         desc = arcpy.Describe(in_aoi)
         aoi_sr = desc.spatialReference
-        if selected_only:
-            if not (getattr(desc, "FIDSet", "") or ""):
-                msg = "Selected features only is on, but no features are selected."
-                _err(msg)
-                raise ValueError(msg)
-            source = in_aoi                       # the layer cursor returns the selected features
-        else:
-            source = getattr(desc, "catalogPath", None) or in_aoi   # the data source, ignore any selection
+        if selected_only and not (getattr(desc, "FIDSet", "") or ""):
+            msg = "Selected features only is on, but no features are selected."
+            _err(msg)
+            raise ValueError(msg)
+        source = in_aoi          # the layer cursor honors the current selection (all when none)
         total_ok = total_skip = total_fail = 0
         features = []                             # (area, wgs84 bbox)
-        with arcpy.da.SearchCursor(source, ["SHAPE@", name_field, "SHAPE@TYPE"]) as cursor:
-            for shape, raw_name, shp_type in cursor:
+        with arcpy.da.SearchCursor(source, ["SHAPE@", name_field]) as cursor:
+            for shape, raw_name in cursor:
                 if shape is None or raw_name in (None, ""):
                     _warn("Feature with no geometry or empty name; skipped.")
                     continue
                 features.append((sanitize_name(str(raw_name)),
-                                 self._feature_bbox(shape, shp_type, point_size, aoi_sr, wgs84)))
+                                 self._feature_bbox(shape, shape.type, point_size, aoi_sr, wgs84)))
         if not features:
             msg = "No features to download."
             _err(msg)
