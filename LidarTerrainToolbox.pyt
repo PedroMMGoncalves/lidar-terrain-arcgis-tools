@@ -1161,17 +1161,27 @@ class DownloadDGTData(object):
         return (we.XMin, we.YMin, we.XMax, we.YMax)
 
     def _collect_assets(self, session, bbox, collections, delay):
-        """Search a bbox (split if large) and return {url: (collection, item_id, extension)}."""
+        """Search a bbox (split if large) and return {url: (collection, item_id, extension)}.
+        Deduplicated by the output file (collection, item_id, extension), not just by URL, because a
+        feature can expose the same tile through more than one asset href; without this each tile is
+        listed twice (downloaded, then skipped as existing) and the tile count is doubled."""
         import time
         assets = {}
+        seen = set()
         for chunk in divide_bbox(bbox):
             for feat in self._search(session, chunk, collections or None):
                 col = feat.get("collection") or "unknown"
                 item_id = self._item_id(feat)
                 for asset in (feat.get("assets") or {}).values():
                     url = asset.get("href")
-                    if url and url not in assets:
-                        assets[url] = (col, item_id, _asset_extension(asset.get("type")))
+                    if not url or url in assets:
+                        continue
+                    ext = _asset_extension(asset.get("type"))
+                    key = (col, item_id, ext)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    assets[url] = (col, item_id, ext)
             if delay:
                 time.sleep(delay)
         return assets
