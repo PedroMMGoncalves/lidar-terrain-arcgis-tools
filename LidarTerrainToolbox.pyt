@@ -1078,6 +1078,12 @@ class DownloadDGTData(object):
         page.raise_for_status()
         action, fields = parse_login_form(page.text)
         if not action:
+            # No login form. If the authorize request redirected back to the app, the Keycloak SSO
+            # session is still valid and we are already authenticated (common on a proactive renew).
+            if page.url.startswith(DGT_CDD_BASE) and self._stac_ok(session):
+                import time
+                self._auth_time = time.time()
+                return True
             _warn("Could not find the CDD login form; the login page may have changed.")
             return False
         if action.startswith("/"):
@@ -1097,13 +1103,20 @@ class DownloadDGTData(object):
         if not resp.url.startswith(DGT_CDD_BASE):
             _warn("CDD login did not redirect back to the site; check the credentials.")
             return False
-        test = session.post(DGT_CDD_SEARCH, json={"bbox": [-9.0, 38.0, -8.0, 39.0], "limit": 1},
-                            timeout=30)
-        if test.status_code != 200:
+        if not self._stac_ok(session):
             return False
         import time
         self._auth_time = time.time()      # for the proactive renewal in _ensure_session
         return True
+
+    def _stac_ok(self, session):
+        """True when the session can query the STAC search (HTTP 200), i.e. it is authenticated."""
+        try:
+            return session.post(DGT_CDD_SEARCH,
+                                json={"bbox": [-9.0, 38.0, -8.0, 39.0], "limit": 1},
+                                timeout=30).status_code == 200
+        except Exception:
+            return False
 
     def _search(self, session, bbox, collections):
         """STAC search for one bbox; returns the features list."""
@@ -1291,11 +1304,15 @@ class DownloadDGTData(object):
         return False
 
     def _ensure_session(self, session):
-        """Proactively renew the CDD session before its token expires (it lasts about 30 minutes,
-        renewed at 25). The DGT downloader plugin renews on a timer rather than only reacting to an
-        expiry, which keeps long downloads from hitting an expired session mid stream."""
+        """Proactively keep the CDD session alive during long downloads (its token lasts about 30
+        minutes; we check at 25). Following the DGT downloader plugin, this first tests whether the
+        session is still valid and only re-authenticates when it is not, so a still-valid Keycloak
+        SSO session is not mistaken for an expiry."""
         import time
         if time.time() - getattr(self, "_auth_time", 0) < DGT_SESSION_TIMEOUT:
+            return
+        if self._stac_ok(session):
+            self._auth_time = time.time()   # still valid, no login needed
             return
         if not self._reauthenticate(session):
             self._auth_time = time.time()   # back off so the renewal is not retried every tile
