@@ -1228,20 +1228,28 @@ class DownloadDGTData(object):
                 if not os.path.isdir(sub_dir):
                     os.makedirs(sub_dir)
             _msg("  {0}: {1} tiles".format(col, total))
+            col_ok = col_skip = col_fail = 0
             for n, (url, item_id, ext) in enumerate(tiles, 1):
                 dest = os.path.join(sub_dir, item_id + ext)
                 result = self._download(session, url, dest, overwrite)
-                status = {"ok": "downloaded", "skip": "skipped (exists)",
-                          "fail": "FAILED"}.get(result, result)
-                _msg("    [{0}/{1}] {2} - {3}".format(n, total, item_id + ext, status))
+                # Log only the interesting tiles per line (downloaded or failed); a re-run over
+                # existing data would otherwise print thousands of "skipped" lines. The skipped
+                # count is reported in the per product summary below.
                 if result == "ok":
                     ok += 1
+                    col_ok += 1
+                    _msg("    [{0}/{1}] {2} - downloaded".format(n, total, item_id + ext))
                 elif result == "skip":
                     skip += 1
+                    col_skip += 1
                 else:
                     fail += 1
+                    col_fail += 1
+                    _msg("    [{0}/{1}] {2} - FAILED".format(n, total, item_id + ext))
                 if delay and result != "skip":     # a skip does not hit the server, so no delay
                     time.sleep(delay)
+            _msg("  {0}: {1} downloaded, {2} skipped, {3} failed.".format(
+                col, col_ok, col_skip, col_fail))
         return ok, skip, fail
 
     def _download(self, session, url, dest, overwrite):
