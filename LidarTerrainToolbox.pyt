@@ -1179,27 +1179,25 @@ class DownloadDGTData(object):
         return (we.XMin, we.YMin, we.XMax, we.YMax)
 
     def _collect_assets(self, session, bbox, collections, delay):
-        """Search a bbox (split if large) and return {url: (collection, item_id, extension)}.
-        Deduplicated by the output file (collection, item_id, extension), not just by URL, because a
-        feature can expose the same tile through more than one asset href; without this each tile is
-        listed twice (downloaded, then skipped as existing) and the tile count is doubled."""
+        """Search a bbox (split if large) and return {(collection, item_id, extension): [urls]}.
+        Keyed by the output file, with the list of candidate asset URLs for it: a feature can expose
+        the same tile through more than one href, and one of a tile's per search download tokens can
+        be forbidden (403) while another works, so the downloader tries them in turn. Keying by the
+        file (not the URL) also keeps each tile listed and counted once."""
         import time
         assets = {}
-        seen = set()
         for chunk in divide_bbox(bbox):
             for feat in self._search(session, chunk, collections or None):
                 col = feat.get("collection") or "unknown"
                 item_id = self._item_id(feat)
                 for asset in (feat.get("assets") or {}).values():
                     url = asset.get("href")
-                    if not url or url in assets:
+                    if not url:
                         continue
-                    ext = _asset_extension(asset.get("type"))
-                    key = (col, item_id, ext)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    assets[url] = (col, item_id, ext)
+                    urls = assets.setdefault(
+                        (col, item_id, _asset_extension(asset.get("type"))), [])
+                    if url not in urls:
+                        urls.append(url)
             if delay:
                 time.sleep(delay)
         return assets
@@ -1215,11 +1213,11 @@ class DownloadDGTData(object):
         if not os.path.isdir(dest_root):
             os.makedirs(dest_root)
         by_col = {}
-        for url, (col, item_id, ext) in assets.items():
-            by_col.setdefault(col, []).append((url, item_id, ext))
+        for (col, item_id, ext), urls in assets.items():
+            by_col.setdefault(col, []).append((item_id, ext, urls))
         ok = skip = fail = 0
         for col in sorted(by_col, key=_download_order_key):
-            tiles = sorted(by_col[col], key=lambda t: t[1])
+            tiles = sorted(by_col[col], key=lambda t: t[0])
             total = len(tiles)
             if flat:
                 sub_dir = dest_root
@@ -1229,9 +1227,9 @@ class DownloadDGTData(object):
                     os.makedirs(sub_dir)
             _msg("  {0}: {1} tiles".format(col, total))
             col_ok = col_skip = col_fail = 0
-            for n, (url, item_id, ext) in enumerate(tiles, 1):
+            for n, (item_id, ext, urls) in enumerate(tiles, 1):
                 dest = os.path.join(sub_dir, item_id + ext)
-                result = self._download(session, url, dest, overwrite)
+                result = self._download(session, urls, dest, overwrite)
                 # Log only the interesting tiles per line (downloaded or failed); a re-run over
                 # existing data would otherwise print thousands of "skipped" lines. The skipped
                 # count is reported in the per product summary below.
@@ -1252,60 +1250,68 @@ class DownloadDGTData(object):
                 col, col_ok, col_skip, col_fail))
         return ok, skip, fail
 
-    def _download(self, session, url, dest, overwrite):
-        """Download one asset to dest (streamed), with retries. Returns ok / skip / fail. Guards
-        against an expired session: the CDD then serves the Keycloak login page with HTTP 200, so a
-        response that is HTML, or whose body is not a GeoTIFF or LAZ, is never written; the session
-        is re-authenticated once and the tile retried. An existing file that is not a valid asset
-        (an error page saved by an earlier run) is re-downloaded even when overwrite is off."""
+    def _download(self, session, urls, dest, overwrite):
+        """Download a tile to dest (streamed), trying each candidate URL until one succeeds. A tile
+        is often exposed by more than one asset href and one of a tile's per search tokens can be
+        forbidden (403) while another works, so a 403 falls through to the next URL. Returns ok /
+        skip / fail. Guards against an expired session: the CDD then serves the Keycloak login page
+        with HTTP 200, so a response that is HTML, or whose body is not a GeoTIFF or LAZ, is never
+        written, and the session is re-authenticated once. An existing valid file is skipped; an
+        invalid one (an error page saved by an earlier run) is re-downloaded even without overwrite."""
         if os.path.exists(dest) and not overwrite:
             if _file_looks_valid(dest):
                 return "skip"
             _warn("Existing file is not a valid tile (an earlier error page); re-downloading {}."
                   .format(os.path.basename(dest)))
         self._ensure_session(session)
+        import time
         tmp = dest + ".part"
         reauthed = False
-        last_exc = None
-        for attempt in range(DGT_DOWNLOAD_RETRIES):
-            try:
-                with session.get(url, stream=True, timeout=120) as r:
-                    # A 401/403 on the download endpoint can mean the session lost authorization;
-                    # re-authenticate once and retry (a genuine, still-forbidden tile then fails).
-                    if r.status_code in (401, 403) and not reauthed and self._reauthenticate(session):
-                        reauthed = True
-                        continue
-                    r.raise_for_status()
-                    ctype = (r.headers.get("Content-Type") or "").lower()
-                    stream = r.iter_content(chunk_size=1 << 20)
-                    head = next(stream, b"")
-                    if "text/html" in ctype or not _looks_like_asset(head):
-                        if not reauthed and self._reauthenticate(session):
-                            reauthed = True
+        throttled = False
+        last_reason = None
+        for cycle in range(DGT_DOWNLOAD_RETRIES):
+            for url in urls:
+                try:
+                    with session.get(url, stream=True, timeout=120) as r:
+                        if r.status_code in (401, 403):
+                            # Lost authorization or a forbidden token; re-auth once, then let the
+                            # next candidate URL (or the next cycle) try.
+                            throttled = throttled or r.status_code == 403
+                            last_reason = "HTTP {}".format(r.status_code)
+                            if not reauthed and self._reauthenticate(session):
+                                reauthed = True
                             continue
-                        return "fail"
-                    with open(tmp, "wb") as fh:
-                        fh.write(head)
-                        for chunk in stream:
-                            if chunk:
-                                fh.write(chunk)
-                    os.replace(tmp, dest)
-                return "ok"
-            except Exception as exc:
-                last_exc = exc
-                if attempt < DGT_DOWNLOAD_RETRIES - 1:
-                    import time
-                    # A 403/429 is usually throttling that clears with time, so back off longer.
-                    base = 5 if _http_status(exc) in (403, 429) else 1
-                    time.sleep(base * (2 ** attempt))
-        if last_exc is not None:
-            _warn("{} failed after {} attempts: {}".format(
-                os.path.basename(dest), DGT_DOWNLOAD_RETRIES, last_exc))
+                        r.raise_for_status()
+                        ctype = (r.headers.get("Content-Type") or "").lower()
+                        stream = r.iter_content(chunk_size=1 << 20)
+                        head = next(stream, b"")
+                        if "text/html" in ctype or not _looks_like_asset(head):
+                            last_reason = "not a tile (login page or unexpected content)"
+                            if not reauthed and self._reauthenticate(session):
+                                reauthed = True
+                            continue
+                        with open(tmp, "wb") as fh:
+                            fh.write(head)
+                            for chunk in stream:
+                                if chunk:
+                                    fh.write(chunk)
+                        os.replace(tmp, dest)
+                    return "ok"
+                except Exception as exc:
+                    throttled = throttled or _http_status(exc) in (403, 429)
+                    last_reason = str(exc)
+            # Every candidate URL failed this cycle; back off before retrying the set. A 403/429 is
+            # usually throttling that clears with time, so wait longer.
+            if cycle < DGT_DOWNLOAD_RETRIES - 1:
+                time.sleep((5 if throttled else 1) * (2 ** cycle))
         if os.path.exists(tmp):
             try:
                 os.remove(tmp)
             except OSError:
                 pass
+        if last_reason is not None:
+            _warn("{} failed after {} cycles over {} url(s); last: {}".format(
+                os.path.basename(dest), DGT_DOWNLOAD_RETRIES, len(urls), last_reason))
         return "fail"
 
     def _reauthenticate(self, session):
@@ -1418,7 +1424,7 @@ class DownloadDGTData(object):
                 probe = self._first_feature_bbox(in_aoi, point_size)
                 if probe:
                     assets = self._collect_assets(session, probe, None, 0)
-                    cols = sorted({c for (c, _id, _ext) in assets.values()})
+                    cols = sorted({col for (col, _id, _ext) in assets})
             if cols:
                 _msg("Collections ({}):".format(len(cols)))
                 for cid in cols:
@@ -1476,7 +1482,11 @@ class DownloadDGTData(object):
             # All features into one flat folder, deduplicated by URL.
             merged = {}
             for area, bbox in features:
-                merged.update(self._collect_assets(session, bbox, collections, delay))
+                for key, urls in self._collect_assets(session, bbox, collections, delay).items():
+                    dst = merged.setdefault(key, [])
+                    for u in urls:
+                        if u not in dst:
+                            dst.append(u)
             if dry_run:
                 _msg("Flat: {} tiles from {} feature(s) (dry run, not downloaded).".format(
                     len(merged), len(features)))
