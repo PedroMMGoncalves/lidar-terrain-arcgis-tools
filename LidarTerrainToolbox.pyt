@@ -1257,6 +1257,11 @@ class DownloadDGTData(object):
         for attempt in range(DGT_DOWNLOAD_RETRIES):
             try:
                 with session.get(url, stream=True, timeout=120) as r:
+                    # A 401/403 on the download endpoint can mean the session lost authorization;
+                    # re-authenticate once and retry (a genuine, still-forbidden tile then fails).
+                    if r.status_code in (401, 403) and not reauthed and self._reauthenticate(session):
+                        reauthed = True
+                        continue
                     r.raise_for_status()
                     ctype = (r.headers.get("Content-Type") or "").lower()
                     stream = r.iter_content(chunk_size=1 << 20)
