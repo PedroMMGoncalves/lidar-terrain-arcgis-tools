@@ -1018,7 +1018,7 @@ class DownloadDGTData(object):
         page.raise_for_status()
         action, fields = parse_login_form(page.text)
         if not action:
-            _err("Could not find the CDD login form; the login page may have changed.")
+            _warn("Could not find the CDD login form; the login page may have changed.")
             return False
         if action.startswith("/"):
             action = DGT_AUTH_HOST + action
@@ -1032,10 +1032,10 @@ class DownloadDGTData(object):
                                 allow_redirects=True, timeout=30)
             resp.raise_for_status()
         except Exception as exc:
-            _err("CDD login request failed: {}".format(exc))
+            _warn("CDD login request failed: {}".format(exc))
             return False
         if not resp.url.startswith(DGT_CDD_BASE):
-            _err("CDD login did not redirect back to the site; check the credentials.")
+            _warn("CDD login did not redirect back to the site; check the credentials.")
             return False
         test = session.post(DGT_CDD_SEARCH, json={"bbox": [-9.0, 38.0, -8.0, 39.0], "limit": 1},
                             timeout=30)
@@ -1204,7 +1204,7 @@ class DownloadDGTData(object):
                 return True
         except Exception:
             pass
-        _err("Re-authentication failed.")
+        _warn("Re-authentication failed; the affected tiles will be retried on a re-run.")
         return False
 
     def _write_manifest(self, folder, area, bbox, collections, n):
