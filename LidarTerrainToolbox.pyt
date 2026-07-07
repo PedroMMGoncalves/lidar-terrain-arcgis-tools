@@ -793,6 +793,25 @@ def _download_order_key(collection):
 LAYOUT_PER_AREA = "One folder per area, products in subfolders"
 LAYOUT_FLAT = "Single flat folder, all tiles together"
 
+# Leading signatures of the files we download: GeoTIFF (little/big endian, classic and BigTIFF)
+# and LAS/LAZ point clouds. An expired CDD session returns the HTML login page instead, which we
+# must never save as a tile, so downloads and existing files are checked against these.
+DGT_ASSET_SIGNATURES = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+", b"LASF")
+
+
+def _looks_like_asset(head):
+    """True when head starts with a GeoTIFF or LAS/LAZ signature (not an HTML error page)."""
+    return any(head[:4] == sig[:4] for sig in DGT_ASSET_SIGNATURES)
+
+
+def _file_looks_valid(path):
+    """True when the file on disk starts with a valid asset signature."""
+    try:
+        with open(path, "rb") as fh:
+            return _looks_like_asset(fh.read(4))
+    except OSError:
+        return False
+
 
 def _asset_extension(mime):
     """File extension for a STAC asset MIME type (.bin if unknown)."""
@@ -1133,23 +1152,60 @@ class DownloadDGTData(object):
         return ok, skip, fail
 
     def _download(self, session, url, dest, overwrite):
-        """Download one asset to dest (streamed), with retries. Returns ok / skip / fail."""
+        """Download one asset to dest (streamed), with retries. Returns ok / skip / fail. Guards
+        against an expired session: the CDD then serves the Keycloak login page with HTTP 200, so a
+        response that is HTML, or whose body is not a GeoTIFF or LAZ, is never written; the session
+        is re-authenticated once and the tile retried. An existing file that is not a valid asset
+        (an error page saved by an earlier run) is re-downloaded even when overwrite is off."""
         if os.path.exists(dest) and not overwrite:
-            return "skip"
+            if _file_looks_valid(dest):
+                return "skip"
+            _warn("Existing file is not a valid tile (an earlier error page); re-downloading {}."
+                  .format(os.path.basename(dest)))
+        tmp = dest + ".part"
+        reauthed = False
         for _attempt in range(DGT_DOWNLOAD_RETRIES):
             try:
                 with session.get(url, stream=True, timeout=120) as r:
                     r.raise_for_status()
-                    tmp = dest + ".part"
+                    ctype = (r.headers.get("Content-Type") or "").lower()
+                    stream = r.iter_content(chunk_size=1 << 20)
+                    head = next(stream, b"")
+                    if "text/html" in ctype or not _looks_like_asset(head):
+                        if not reauthed and self._reauthenticate(session):
+                            reauthed = True
+                            continue
+                        return "fail"
                     with open(tmp, "wb") as fh:
-                        for chunk in r.iter_content(chunk_size=1 << 20):
+                        fh.write(head)
+                        for chunk in stream:
                             if chunk:
                                 fh.write(chunk)
                     os.replace(tmp, dest)
                 return "ok"
             except Exception:
                 continue
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         return "fail"
+
+    def _reauthenticate(self, session):
+        """Re-login the session after it expires mid-download. Returns True on success."""
+        user, pwd = getattr(self, "_creds", (None, None))
+        if not (user and pwd):
+            return False
+        _warn("The CDD session expired; re-authenticating...")
+        try:
+            if self._authenticate(session, user, pwd):
+                _msg("Re-authenticated.")
+                return True
+        except Exception:
+            pass
+        _err("Re-authentication failed.")
+        return False
 
     def _write_manifest(self, folder, area, bbox, collections, n):
         with open(os.path.join(folder, area + "_download.txt"), "w", encoding="utf-8") as fh:
@@ -1220,6 +1276,7 @@ class DownloadDGTData(object):
             _err(msg)
             raise RuntimeError(msg)
         _msg("Authenticated.")
+        self._creds = (username, password)   # kept so a mid-download expiry can re-authenticate
 
         if list_only:
             cols = self._collections_via_endpoint(session)
@@ -3067,6 +3124,9 @@ def _run_self_tests():
           _asset_extension("image/tiff; application=geotiff") == ".tif")
     check("asset extension laz", _asset_extension("application/vnd.laszip") == ".laz")
     check("asset extension unknown", _asset_extension("application/json") == ".bin")
+    check("geotiff head is a valid asset", _looks_like_asset(b"II*\x00\x08\x00"))
+    check("laz head is a valid asset", _looks_like_asset(b"LASF\x00\x00"))
+    check("html login page is not an asset", not _looks_like_asset(b"<!DOCTYPE html>"))
     check("square bbox from a rectangle",
           _square_bbox(0.0, 0.0, 4.0, 2.0) == (0.0, -1.0, 4.0, 3.0))
     check("small bbox is not split", len(divide_bbox((-8.0, 39.0, -7.99, 39.01))) == 1)
