@@ -758,6 +758,7 @@ DGT_CDD_REDIRECT = DGT_CDD_BASE + "/auth/callback"
 DGT_STAC_LIMIT = 1000
 DGT_MAX_CHUNK_KM2 = 200.0                 # split a WGS84 bbox larger than this before searching
 DGT_DOWNLOAD_RETRIES = 3
+DGT_SESSION_TIMEOUT = 25 * 60             # renew the CDD session before its token (about 30 min) expires
 DGT_CRED_DIRNAME = "LidarTerrainToolbox"
 DGT_CRED_FILENAME = "dgt_cdd_credentials.json"
 WGS84_EPSG = 4326
@@ -1039,7 +1040,11 @@ class DownloadDGTData(object):
             return False
         test = session.post(DGT_CDD_SEARCH, json={"bbox": [-9.0, 38.0, -8.0, 39.0], "limit": 1},
                             timeout=30)
-        return test.status_code == 200
+        if test.status_code != 200:
+            return False
+        import time
+        self._auth_time = time.time()      # for the proactive renewal in _ensure_session
+        return True
 
     def _search(self, session, bbox, collections):
         """STAC search for one bbox; returns the features list."""
@@ -1162,6 +1167,7 @@ class DownloadDGTData(object):
                 return "skip"
             _warn("Existing file is not a valid tile (an earlier error page); re-downloading {}."
                   .format(os.path.basename(dest)))
+        self._ensure_session(session)
         tmp = dest + ".part"
         reauthed = False
         for _attempt in range(DGT_DOWNLOAD_RETRIES):
@@ -1197,7 +1203,7 @@ class DownloadDGTData(object):
         user, pwd = getattr(self, "_creds", (None, None))
         if not (user and pwd):
             return False
-        _warn("The CDD session expired; re-authenticating...")
+        _msg("Renewing the CDD session...")
         try:
             if self._authenticate(session, user, pwd):
                 _msg("Re-authenticated.")
@@ -1206,6 +1212,16 @@ class DownloadDGTData(object):
             pass
         _warn("Re-authentication failed; the affected tiles will be retried on a re-run.")
         return False
+
+    def _ensure_session(self, session):
+        """Proactively renew the CDD session before its token expires (it lasts about 30 minutes,
+        renewed at 25). The DGT downloader plugin renews on a timer rather than only reacting to an
+        expiry, which keeps long downloads from hitting an expired session mid stream."""
+        import time
+        if time.time() - getattr(self, "_auth_time", 0) < DGT_SESSION_TIMEOUT:
+            return
+        if not self._reauthenticate(session):
+            self._auth_time = time.time()   # back off so the renewal is not retried every tile
 
     def _write_manifest(self, folder, area, bbox, collections, n):
         with open(os.path.join(folder, area + "_download.txt"), "w", encoding="utf-8") as fh:
