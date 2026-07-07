@@ -1216,6 +1216,7 @@ class DownloadDGTData(object):
         for (col, item_id, ext), urls in assets.items():
             by_col.setdefault(col, []).append((item_id, ext, urls))
         ok = skip = fail = 0
+        failed = []
         for col in sorted(by_col, key=_download_order_key):
             tiles = sorted(by_col[col], key=lambda t: t[0])
             total = len(tiles)
@@ -1243,12 +1244,13 @@ class DownloadDGTData(object):
                 else:
                     fail += 1
                     col_fail += 1
+                    failed.append(item_id + ext)
                     _msg("    [{0}/{1}] {2} - FAILED".format(n, total, item_id + ext))
                 if delay and result != "skip":     # a skip does not hit the server, so no delay
                     time.sleep(delay)
             _msg("  {0}: {1} downloaded, {2} skipped, {3} failed.".format(
                 col, col_ok, col_skip, col_fail))
-        return ok, skip, fail
+        return ok, skip, fail, failed
 
     def _download(self, session, urls, dest, overwrite):
         """Download a tile to dest (streamed), trying each candidate URL until one succeeds. A tile
@@ -1351,6 +1353,17 @@ class DownloadDGTData(object):
                 fh.write("WGS84 bbox: {}\n".format(", ".join("{:.6f}".format(v) for v in bbox)))
             fh.write("Collections: {}\n".format(", ".join(collections) if collections else "(all)"))
             fh.write("Tiles: {}\n".format(n))
+
+    def _write_failed(self, folder, area, failed):
+        """List the tiles that could not be downloaded. A tile that stays forbidden (403) across a
+        re-auth and every candidate URL is usually not served by the CDD yet; re-running later
+        retries only these, since the downloaded tiles are skipped."""
+        path = os.path.join(folder, area + "_failed.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("Tiles that failed to download (re-run later to retry):\n")
+            for name in failed:
+                fh.write(name + "\n")
+        _warn("{}: {} tile(s) failed; listed in {}".format(area, len(failed), os.path.basename(path)))
 
     def _build_vrt(self, folder):
         """Build a VRT per product subfolder that holds GeoTIFFs, if gdal (osgeo) is available."""
@@ -1469,8 +1482,11 @@ class DownloadDGTData(object):
                     continue
                 folder = os.path.join(out_folder, area)
                 _msg("{}: processing {} tiles...".format(area, len(assets)))
-                ok, skip, fail = self._download_assets(session, assets, folder, overwrite, delay)
+                ok, skip, fail, failed = self._download_assets(
+                    session, assets, folder, overwrite, delay)
                 self._write_manifest(folder, area, bbox, collections, len(assets))
+                if failed:
+                    self._write_failed(folder, area, failed)
                 if build_vrt:
                     self._build_vrt(folder)
                 total_ok += ok
@@ -1494,9 +1510,11 @@ class DownloadDGTData(object):
                 _warn("No tiles found for any feature.")
             else:
                 _msg("Flat: processing {} tiles...".format(len(merged)))
-                total_ok, total_skip, total_fail = self._download_assets(
+                total_ok, total_skip, total_fail, failed = self._download_assets(
                     session, merged, out_folder, overwrite, delay, flat=True)
                 self._write_manifest(out_folder, "ALL", None, collections, len(merged))
+                if failed:
+                    self._write_failed(out_folder, "ALL", failed)
                 if build_vrt:
                     _warn("VRT is not built for the flat layout (products share one folder).")
                 _msg("Block: downloaded {}, skipped {}, failed {} -> {}".format(
