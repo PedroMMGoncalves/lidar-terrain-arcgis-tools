@@ -145,6 +145,47 @@ def _err(text):
         arcpy.AddError(text)
 
 
+def _delete_partial_raster(path):
+    """Remove a raster output and its sidecars so a re-run does not skip a partial or corrupt write
+    and feed it downstream. Tries arcpy first (handles locks and sidecars), then removes the files
+    directly in case the raster is too truncated for arcpy to recognize."""
+    try:
+        if arcpy is not None and arcpy.Exists(path):
+            arcpy.management.Delete(path)
+    except Exception:
+        pass
+    for p in (path, path + ".aux.xml", path + ".ovr", path + ".vat.dbf", path + ".xml",
+              os.path.splitext(path)[0] + ".tfw"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
+class _CleanupOnError(object):
+    """Context manager that deletes partial raster outputs if the wrapped write raises, so an
+    interrupted or failed write never leaves a truncated file for a later run to skip."""
+    def __init__(self, *out_paths):
+        self._out_paths = out_paths
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            for path in self._out_paths:
+                if path:
+                    _delete_partial_raster(path)
+        return False
+
+
+def _save_raster(raster, out_path):
+    """Save a Spatial Analyst / Image Analyst raster result, deleting the partial output on error."""
+    with _CleanupOnError(out_path):
+        raster.save(out_path)
+
+
 # ===========================================================================
 # Helpers (single source of truth for naming, sanitization, validation)
 # ===========================================================================
@@ -1151,7 +1192,6 @@ class DownloadDGTData(object):
                     skip += 1
                 else:
                     fail += 1
-                    _warn("Failed to download {}.".format(item_id))
                 if delay:
                     time.sleep(delay)
         return ok, skip, fail
@@ -1170,7 +1210,8 @@ class DownloadDGTData(object):
         self._ensure_session(session)
         tmp = dest + ".part"
         reauthed = False
-        for _attempt in range(DGT_DOWNLOAD_RETRIES):
+        last_exc = None
+        for attempt in range(DGT_DOWNLOAD_RETRIES):
             try:
                 with session.get(url, stream=True, timeout=120) as r:
                     r.raise_for_status()
@@ -1189,8 +1230,14 @@ class DownloadDGTData(object):
                                 fh.write(chunk)
                     os.replace(tmp, dest)
                 return "ok"
-            except Exception:
-                continue
+            except Exception as exc:
+                last_exc = exc
+                if attempt < DGT_DOWNLOAD_RETRIES - 1:
+                    import time
+                    time.sleep(2 ** attempt)      # 1s, then 2s backoff before the next attempt
+        if last_exc is not None:
+            _warn("{} failed after {} attempts: {}".format(
+                os.path.basename(dest), DGT_DOWNLOAD_RETRIES, last_exc))
         if os.path.exists(tmp):
             try:
                 os.remove(tmp)
@@ -1288,6 +1335,7 @@ class DownloadDGTData(object):
         session = requests.Session()
         _msg("Authenticating with the CDD...")
         if not self._authenticate(session, username, password):
+            session.close()
             msg = "CDD authentication failed; check the credentials and the service."
             _err(msg)
             raise RuntimeError(msg)
@@ -1307,6 +1355,7 @@ class DownloadDGTData(object):
                     _msg("  " + cid)
             else:
                 _warn("No collections found. Check the login and that the AOI has coverage.")
+            session.close()
             return
 
         if not collections:
@@ -1327,6 +1376,7 @@ class DownloadDGTData(object):
                 features.append((sanitize_name(str(raw_name)),
                                  self._feature_bbox(shape, shape.type, point_size, aoi_sr, wgs84)))
         if not features:
+            session.close()
             msg = "No features to download."
             _err(msg)
             raise ValueError(msg)
@@ -1376,6 +1426,7 @@ class DownloadDGTData(object):
             total_ok, total_skip, total_fail))
         if total_fail:
             _warn("{} tile(s) failed. Re-run to retry; existing tiles are skipped.".format(total_fail))
+        session.close()
         return
 
 
@@ -1591,15 +1642,16 @@ class BuildMosaicsByPolygon(object):
                     present_folders, product_prefix, tile_resolution)
                 if not tiles:
                     continue
-                arcpy.management.MosaicToNewRaster(
-                    input_rasters=tiles,
-                    output_location=location,
-                    raster_dataset_name_with_extension=out_name,
-                    coordinate_system_for_the_raster=sr,
-                    pixel_type=pixel_type,
-                    number_of_bands=1,
-                    mosaic_method=mosaic_method,
-                )
+                with _CleanupOnError(out_path):
+                    arcpy.management.MosaicToNewRaster(
+                        input_rasters=tiles,
+                        output_location=location,
+                        raster_dataset_name_with_extension=out_name,
+                        coordinate_system_for_the_raster=sr,
+                        pixel_type=pixel_type,
+                        number_of_bands=1,
+                        mosaic_method=mosaic_method,
+                    )
                 size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
                 _msg("{} ({}): mosaicked {} tiles ({}) from {} member area(s) -> {}".format(
                     cluster_id, source, len(tiles), size_label, len(member_areas), out_name))
@@ -1891,15 +1943,16 @@ class BuildMosaicsByPolygon(object):
                 if os.path.exists(out_path) and overwrite_existing:
                     _msg("Area '{}' ({}): overwriting existing {}.".format(final_area, source, out_name))
 
-                arcpy.management.MosaicToNewRaster(
-                    input_rasters=tiles,
-                    output_location=location,
-                    raster_dataset_name_with_extension=out_name,
-                    coordinate_system_for_the_raster=sr,
-                    pixel_type=pixel_type,
-                    number_of_bands=1,
-                    mosaic_method=mosaic_method,
-                )
+                with _CleanupOnError(out_path):
+                    arcpy.management.MosaicToNewRaster(
+                        input_rasters=tiles,
+                        output_location=location,
+                        raster_dataset_name_with_extension=out_name,
+                        coordinate_system_for_the_raster=sr,
+                        pixel_type=pixel_type,
+                        number_of_bands=1,
+                        mosaic_method=mosaic_method,
+                    )
                 size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
                 _msg("Area '{}' ({}): mosaicked {} tiles ({}) from {} folder(s) -> {}".format(
                     final_area, source, len(tiles), size_label, len(present_folders), out_name))
@@ -2186,25 +2239,25 @@ class DeriveSurfaces(object):
                         todo[product] = True
 
                 if todo.get("SLOPE"):
-                    arcpy.sa.Slope(path, "DEGREE", z_factor).save(targets["SLOPE"])
+                    _save_raster(arcpy.sa.Slope(path, "DEGREE", z_factor), targets["SLOPE"])
                     created += 1
                 if todo.get("SLOPEP"):
-                    arcpy.sa.Slope(path, "PERCENT_RISE", z_factor).save(targets["SLOPEP"])
+                    _save_raster(arcpy.sa.Slope(path, "PERCENT_RISE", z_factor), targets["SLOPEP"])
                     created += 1
                 if todo.get("ASPECT"):
                     # Aspect takes no z_factor (it is direction only); z_factor applies to
                     # slope, hillshade and curvature.
-                    arcpy.sa.Aspect(path).save(targets["ASPECT"])
+                    _save_raster(arcpy.sa.Aspect(path), targets["ASPECT"])
                     created += 1
                 if todo.get("HILLSHADE"):
                     if multidirectional:
                         # arcpy.ia.Hillshade hillshade_type is an integer: 1 = multidirectional,
                         # 0 = single direction. The UI string is mapped to this integer here.
-                        arcpy.ia.Hillshade(path, hillshade_type=1,
-                                           z_factor=z_factor).save(targets["HILLSHADE"])
+                        _save_raster(arcpy.ia.Hillshade(path, hillshade_type=1, z_factor=z_factor),
+                                     targets["HILLSHADE"])
                     else:
-                        arcpy.sa.Hillshade(path, azimuth, altitude, "SHADOWS", z_factor).save(
-                            targets["HILLSHADE"])
+                        _save_raster(arcpy.sa.Hillshade(path, azimuth, altitude, "SHADOWS", z_factor),
+                                     targets["HILLSHADE"])
                     created += 1
 
                 # Profile and plan curvature share one Curvature call; pass only the wanted outputs.
@@ -2213,9 +2266,11 @@ class DeriveSurfaces(object):
                 if want_profc or want_planc:
                     # "#" skips an unwanted optional output. The returned standard curvature
                     # is intentionally discarded; only profile and plan are kept.
-                    arcpy.sa.Curvature(path, z_factor,
-                                       targets["PROFC"] if want_profc else "#",
-                                       targets["PLANC"] if want_planc else "#")
+                    with _CleanupOnError(targets["PROFC"] if want_profc else None,
+                                         targets["PLANC"] if want_planc else None):
+                        arcpy.sa.Curvature(path, z_factor,
+                                           targets["PROFC"] if want_profc else "#",
+                                           targets["PLANC"] if want_planc else "#")
                     created += (1 if want_profc else 0) + (1 if want_planc else 0)
 
                 _msg("{} ({}): surfaces done.".format(area, source))
@@ -2355,7 +2410,8 @@ class ReclassifyFactor(object):
 
             src = arcpy.Raster(path)
             sr = src.spatialReference
-            if sr is None or sr.name in (None, "", "Unknown"):
+            sr_defined = not (sr is None or sr.name in (None, "", "Unknown"))
+            if not sr_defined:
                 _warn("{} ({}): input {} has an undefined CRS; the outputs CRS will be undefined "
                       "too.".format(area, source, product))
             lower_left = arcpy.Point(src.extent.XMin, src.extent.YMin)
@@ -2391,11 +2447,14 @@ class ReclassifyFactor(object):
                 out_arr = reclassify_array(arr, classes, RECLASS_NODATA,
                                            flat_value=-1 if flat_class is not None else None,
                                            flat_class=flat_class)
-                out_raster = arcpy.NumPyArrayToRaster(out_arr, lower_left, cell_w, cell_h,
-                                                      value_to_nodata=RECLASS_NODATA)
-                out_raster.save(out_path)
-                arcpy.management.DefineProjection(out_path, sr)   # NumPyArrayToRaster leaves CRS undefined
-                _msg("{} ({}): {} -> {}".format(area, source, product, out_name))
+                with _CleanupOnError(out_path):
+                    out_raster = arcpy.NumPyArrayToRaster(out_arr, lower_left, cell_w, cell_h,
+                                                          value_to_nodata=RECLASS_NODATA)
+                    out_raster.save(out_path)
+                    if sr_defined:
+                        # NumPyArrayToRaster leaves the CRS undefined; set it when it is known.
+                        arcpy.management.DefineProjection(out_path, sr)
+                _msg("{} ({}): {} ({}) -> {}".format(area, source, product, _crs_label(sr), out_name))
                 created += 1
 
         for location, names in folders_written.items():
@@ -2702,11 +2761,15 @@ class SolarRadiation(object):
                         continue
 
                     resampled = None
+                    kwargs = {}
                     try:
                         sr = _assert_projected_raster(path)
                         native = arcpy.Raster(path).meanCellWidth
                         surface = path
                         did_resample = False
+                        if solar_cell_size and solar_cell_size < native:
+                            _warn("{} ({}): requested solar cell size {:g} m is finer than the native "
+                                  "{:g} m; running at native.".format(area, source, solar_cell_size, native))
                         if solar_cell_size and solar_cell_size > native:
                             resampled = os.path.join(arcpy.env.scratchFolder,
                                                      "solar_{}.tif".format(area))
@@ -2763,6 +2826,11 @@ class SolarRadiation(object):
                             area, source, suffix, _crs_label(sr), note, out_name))
                         created += 1
                     except Exception as exc:
+                        _delete_partial_raster(out_path)
+                        for aux in ("out_direct_radiation_raster", "out_diffuse_radiation_raster",
+                                    "out_duration_raster"):
+                            if kwargs.get(aux):
+                                _delete_partial_raster(kwargs[aux])
                         _err("{} ({}, {}): solar radiation failed: {}".format(area, source, suffix, exc))
                         failed.append("{} ({}, {})".format(area, source, suffix))
                     finally:
@@ -2923,6 +2991,7 @@ class Resample(object):
                     area, token, native, target_cell, method, _crs_label(sr), fn))
                 created += 1
             except Exception as exc:
+                _delete_partial_raster(out_path)
                 _err("{} ({}): resample failed: {}".format(area, token, exc))
                 failed.append("{} ({})".format(area, token))
 
