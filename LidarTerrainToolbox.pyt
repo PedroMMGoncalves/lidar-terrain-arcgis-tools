@@ -1184,15 +1184,17 @@ class DownloadDGTData(object):
             _msg("  {0}: {1} tiles".format(col, total))
             for n, (url, item_id, ext) in enumerate(tiles, 1):
                 dest = os.path.join(sub_dir, item_id + ext)
-                _msg("    [{0}/{1}] {2}".format(n, total, item_id + ext))
                 result = self._download(session, url, dest, overwrite)
+                status = {"ok": "downloaded", "skip": "skipped (exists)",
+                          "fail": "FAILED"}.get(result, result)
+                _msg("    [{0}/{1}] {2} - {3}".format(n, total, item_id + ext, status))
                 if result == "ok":
                     ok += 1
                 elif result == "skip":
                     skip += 1
                 else:
                     fail += 1
-                if delay:
+                if delay and result != "skip":     # a skip does not hit the server, so no delay
                     time.sleep(delay)
         return ok, skip, fail
 
@@ -1392,7 +1394,7 @@ class DownloadDGTData(object):
                     _warn("{}: no tiles found for the footprint.".format(area))
                     continue
                 folder = os.path.join(out_folder, area)
-                _msg("{}: downloading {} tiles...".format(area, len(assets)))
+                _msg("{}: processing {} tiles...".format(area, len(assets)))
                 ok, skip, fail = self._download_assets(session, assets, folder, overwrite, delay)
                 self._write_manifest(folder, area, bbox, collections, len(assets))
                 if build_vrt:
@@ -1413,7 +1415,7 @@ class DownloadDGTData(object):
             elif not merged:
                 _warn("No tiles found for any feature.")
             else:
-                _msg("Flat: downloading {} tiles...".format(len(merged)))
+                _msg("Flat: processing {} tiles...".format(len(merged)))
                 total_ok, total_skip, total_fail = self._download_assets(
                     session, merged, out_folder, overwrite, delay, flat=True)
                 self._write_manifest(out_folder, "ALL", None, collections, len(merged))
