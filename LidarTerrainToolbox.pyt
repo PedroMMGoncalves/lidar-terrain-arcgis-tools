@@ -798,7 +798,7 @@ DGT_CDD_CLIENT_ID = "aai-oidc-dgt"
 DGT_CDD_REDIRECT = DGT_CDD_BASE + "/auth/callback"
 DGT_STAC_LIMIT = 1000
 DGT_MAX_CHUNK_KM2 = 200.0                 # split a WGS84 bbox larger than this before searching
-DGT_DOWNLOAD_RETRIES = 3
+DGT_DOWNLOAD_RETRIES = 4
 DGT_SESSION_TIMEOUT = 25 * 60             # renew the CDD session before its token (about 30 min) expires
 DGT_CRED_DIRNAME = "LidarTerrainToolbox"
 DGT_CRED_FILENAME = "dgt_cdd_credentials.json"
@@ -871,6 +871,11 @@ def _requests_ca_bundle():
         return certifi.where()
     except Exception:
         return None
+
+
+def _http_status(exc):
+    """HTTP status code carried by a requests exception, or None."""
+    return getattr(getattr(exc, "response", None), "status_code", None)
 
 
 def _asset_extension(mime):
@@ -1282,7 +1287,9 @@ class DownloadDGTData(object):
                 last_exc = exc
                 if attempt < DGT_DOWNLOAD_RETRIES - 1:
                     import time
-                    time.sleep(2 ** attempt)      # 1s, then 2s backoff before the next attempt
+                    # A 403/429 is usually throttling that clears with time, so back off longer.
+                    base = 5 if _http_status(exc) in (403, 429) else 1
+                    time.sleep(base * (2 ** attempt))
         if last_exc is not None:
             _warn("{} failed after {} attempts: {}".format(
                 os.path.basename(dest), DGT_DOWNLOAD_RETRIES, last_exc))
