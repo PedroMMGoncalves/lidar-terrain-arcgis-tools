@@ -855,6 +855,24 @@ def _file_looks_valid(path):
         return False
 
 
+def _requests_ca_bundle():
+    """CA bundle for HTTPS. Some machines set REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / SSL_CERT_FILE
+    to a file that does not exist (a PostgreSQL install is a common cause), which makes requests
+    fail every HTTPS call with 'Could not find a suitable TLS CA certificate bundle'. When such a
+    pointer is broken, drop it for this process and fall back to certifi's bundle. Returns the
+    certifi path to use, or None to leave the requests default."""
+    for var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        val = os.environ.get(var)
+        if val and not os.path.isfile(val):
+            _warn("Ignoring {} (points to a missing CA bundle: {}).".format(var, val))
+            os.environ.pop(var, None)
+    try:
+        import certifi
+        return certifi.where()
+    except Exception:
+        return None
+
+
 def _asset_extension(mime):
     """File extension for a STAC asset MIME type (.bin if unknown)."""
     if not mime:
@@ -1335,6 +1353,9 @@ class DownloadDGTData(object):
                 raise ValueError(msg)
 
         session = requests.Session()
+        ca_bundle = _requests_ca_bundle()
+        if ca_bundle:
+            session.verify = ca_bundle
         _msg("Authenticating with the CDD...")
         if not self._authenticate(session, username, password):
             session.close()
