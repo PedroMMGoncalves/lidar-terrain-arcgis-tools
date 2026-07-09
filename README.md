@@ -60,7 +60,7 @@ flowchart TD
     AOI --> T1
     LID --> T1
     T1["Tool 2<br/>Build Mosaics by Polygon"]
-    T1 --> M["Per area mosaics<br/>Area_DEM.tif / Area_DSM.tif"]
+    T1 --> M["Per area mosaics<br/>Area_DEM.tif / Area_DSM.tif<br/>(optional clip to AOI)"]
     T1 -.-> CL["Clusters (optional)<br/>clusters/Cluster_NNN/<br/>contiguous areas merged"]
     M --> T2["Tool 3<br/>Generate Surfaces"]
     M --> T3["Tool 4<br/>Solar Radiation"]
@@ -92,8 +92,8 @@ flowchart TD
 ```
 
 - **Tool 1** downloads the DGT LiDAR per AOI feature: it takes the feature envelope in WGS84 (a clean square for points) and searches the CDD STAC API by that bounding box. It offers two output layouts: one folder per area (named by a chosen field) with a product subfolder each (`MDT-2m`, `MDS-2m`, `MDT-50cm`, `MDS-50cm`, `LAZ`), ready for Tool 2, or a single flat folder with all tiles together. Tiles download one product at a time, in a fixed order, with each tile logged.
-- The DGT LiDAR is organized as one download folder per area of interest, holding the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. The folder is named by the area: the QGIS plugin numbered it by the AOI feature FID, Tool 1 names it by your chosen field, and Tool 2 maps either way. The 5 km buffer selection was applied at download time.
-- **Tool 2** groups AOI features by area name, then maps each area to its download folder. By default it maps **by geometry** (the folder whose tile extent is centered on the area), which is robust to a shapefile whose FID order no longer matches the folder numbering done at download time; a **by FID number** option keeps the older folder-number mapping. It merges each area's MDT and MDS tiles across its folders into one DEM and one DSM mosaic, deduplicating tiles by name. An optional clustering mode also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, written to a `clusters` subfolder, each with a `Cluster_NNN_members.txt` manifest.
+- The DGT LiDAR is organized as one download folder per area of interest, holding the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. Tool 1 names each folder by your chosen field; the QGIS plugin numbered it by the AOI feature FID; Tool 2 maps by name, by geometry, or by FID accordingly. The spatial selection (for example a buffer around the AOI) is applied upstream, so Tool 2 does no buffering or tile intersection.
+- **Tool 2** groups AOI features by area name, then maps each area to its download folder. By default it maps **by name** (the folder whose name equals the sanitized area name, the exact pairing for Tool 1 output); **by geometry** (the folder whose tile extent is centered on the area) and **by FID number** (the folder numbered with the area FID, the old plugin layout) are there for folders not named by the area. It merges each area's MDT and MDS tiles across its folders into one DEM and one DSM mosaic, deduplicating tiles by name, and can optionally **clip each mosaic to its AOI extent** so it does not overshoot the boundary (an exact cut for a rectangular cartogram sheet). An optional clustering mode also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, written to a `clusters` subfolder, each with a `Cluster_NNN_members.txt` manifest.
 - **Tool 3** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees, and optionally percent; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
 - **Tool 4** computes annual solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated), at the native 2 m baseline. You pick the diffuse model (uniform, overcast, or both) and can also output the direct, diffuse and direct duration rasters; the output names carry the model (`SOLARUNI`, `SOLAROVC`). A coarser solar cell size resamples the DEM first.
 - **Tool 5** reclassifies aspect, slope and the annual solar raster into fixed project suitability classes, in numpy with `[min, max)` semantics. Aspect yields two rasters: quadrants (`ASPECT_DIR`, N to NW plus flat) and solar suitability (`ASPECT_RCL`, south and flat best); slope and solar yield `SLOPE_RCL` and `SOLARUNI_RCL`. Each output, plus a legend (`RECLASS_legenda.txt`), goes to a `Reclass` subfolder next to the inputs.
@@ -153,14 +153,14 @@ Download the DGT LiDAR for your AOI features, ready for Tool 2. Needs network ac
 | CDD username, password | Blank uses the saved config. Configure them on the first use. |
 | Save credentials to the config file | Writes the username and password once to `%LOCALAPPDATA%/LidarTerrainToolbox`, reused on later runs. Use a dedicated CDD account; the file is plain text in your profile. |
 | Delay between requests | Seconds between requests, to be gentle on the service. |
-| Overwrite existing tiles | Off skips tiles already downloaded (idempotent re-runs). |
+| Overwrite existing tiles | Off skips tiles already downloaded, but still re-downloads any saved invalid (idempotent, self-healing re-runs). |
 | Build a VRT per folder | Optional VRT per product subfolder (per area layout only). |
 | Dry run | Report the tile count per feature without downloading. |
 | Output layout | One folder per area with a product subfolder each (default), or a single flat folder with all tiles together. |
 
-For each feature the tool takes the envelope in WGS84 (a clean square for points), splits it if large, and searches the CDD STAC API by that bounding box. Tiles download one product at a time in a fixed order (MDT-50cm, MDS-50cm, MDT-2m, MDS-2m, LAZ), with each tile logged. In the per area layout they go to `<name>/<product>/` with a `<name>_download.txt` manifest; in the flat layout every tile lands in one folder. Re-running skips existing tiles and retries failures.
+For each feature the tool takes the envelope in WGS84 (a clean square for points), splits it if large, and searches the CDD STAC API by that bounding box. Tiles download one product at a time in a fixed order (MDT-50cm, MDS-50cm, MDT-2m, MDS-2m, LAZ), with each tile logged. In the per area layout they go to `<name>/<product>/` with a `<name>_download.txt` manifest; in the flat layout every tile lands in one folder. Re-running skips existing tiles (and re-downloads any that were saved invalid) and retries failures. The download is resilient: it renews the CDD session on long runs, re-authenticates and backs off on transient or throttling errors, checks that each file really is a GeoTIFF or LAZ (never saving an error page as a tile), and lists any tiles the CDD would not serve in a `<name>_failed.txt` for a later re-run.
 
-### Tool 2, Build Mosaics By Polygon
+### Tool 2, Build Mosaics by Polygon
 
 One DEM and one DSM mosaic per area, merging all of that area's download folders.
 
@@ -168,7 +168,7 @@ One DEM and one DSM mosaic per area, merging all of that area's download folders
 | --- | --- |
 | AOI layer | Polygon layer for the areas of interest, carrying the `Area` name field. |
 | Area name field | Field that names the output (sanitized: accents and special characters removed). |
-| LiDAR root folder | Folder that contains the `..._<FID>` download folders. |
+| LiDAR root folder | Folder that contains the download folders (named by area for Tool 1 output, or `..._<FID>` for the QGIS plugin). |
 | Output folder | Where the mosaics are written. |
 | Output structure | `per_area_subfolder` (default) or `flat`. |
 | Products | `BOTH` (default), `DEM`, or `DSM`. |
@@ -176,13 +176,13 @@ One DEM and one DSM mosaic per area, merging all of that area's download folders
 | Mosaic method | For overlaps; `FIRST` recommended for contiguous tiles. |
 | Overwrite existing outputs | Off skips existing mosaics. |
 | Skip areas with missing folders | On (default) skips areas whose folders are not all present yet. |
-| Verify folder extent against AOI polygon | On (default) checks each folder maps to the right area; skipped under by-geometry mapping, which already guarantees it. |
+| Verify folder extent against AOI polygon | On (default) checks each folder maps to the right area; runs only under `by FID number` mapping, since `by name` and `by geometry` are authoritative. |
 | Folder name prefix | Optional. Leave blank to auto-detect the prefix from the data folders. |
 | Tile resolution | Optional. Leave blank to auto-detect; set (for example `2m` or `50cm`) to pick one resolution when a folder holds more than one. |
 | Also build overlap clusters | Off by default. Also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, alongside the per area output. |
 | Report clusters only | Dry-run for clustering: lists the clusters and member counts without building any mosaic. |
 | Folder to area mapping | `by name` (default; the download folder whose name equals the sanitized area name, the exact pairing for Tool 1 output), `by geometry` (maps each area to the folder whose tile extent is centered on it, for folders not named by the area), or `by FID number` (the folder named with the area FID, the old plugin layout). |
-| Clip mosaic to the AOI polygon | Off by default. On cuts each area's mosaic to its AOI polygon (dissolved and projected to the tile CRS), so it does not overshoot the boundary, for example a cartogram sheet; cells outside become NoData. Per area output only, not the overlap clusters. |
+| Clip mosaic to the AOI extent | Off by default. On bounds each area's mosaic to the AOI extent (the combined extent of the area's polygons, in the tile CRS) through the analysis extent, so the mosaic does not overshoot the boundary, an exact cut for a rectangular cartogram sheet. Fast, no separate clip pass. Per area output only, not the overlap clusters. |
 
 With **overlap clustering** on, Tool 2 also groups areas whose AOI polygons are contiguous (touch or overlap) into one mosaic per cluster, in parallel to the per area output, which is unchanged. Every area belongs to exactly one cluster (a non overlapping area is its own one member cluster). Clusters go to a `clusters` subfolder, named `Cluster_NNN` by the smallest member FID, each with a `Cluster_NNN_members.txt` manifest listing the member areas (the ids renumber if the AOI is edited, so the manifest is the authority). Tiles shared between areas are deduplicated by name. Run the dry-run first to see the clusters before the heavy build.
 
@@ -288,7 +288,7 @@ The `.tif` extension is added on write. Area names are sanitized for ArcGIS and 
 
 ## Example
 
-A real run over 38 areas. The AOI layer was in EPSG:102164, projected only for the extent check; the mosaics inherit the tiles CRS, EPSG:3763. One area (`Cortes Pereira`) has two AOI polygons that were merged into a single output. Abbreviated geoprocessing log for the whole pipeline:
+A real run over 38 areas, on data downloaded with the QGIS plugin (folders named by FID, so the log shows the prefix auto-detection of the `by FID number` mapping). The AOI layer was in EPSG:102164, projected only for the extent check; the mosaics inherit the tiles CRS, EPSG:3763. One area (`Cortes Pereira`) has two AOI polygons that were merged into a single output. Abbreviated geoprocessing log for the whole pipeline:
 
 ```text
 # Tool 2, Build Mosaics by Polygon
@@ -346,10 +346,10 @@ This exercises name sanitization and collision handling, the output name build a
 
 | Message in the geoprocessing log | Cause | Fix |
 | --- | --- | --- |
-| `No LiDAR data folders ... found` | LiDAR root does not contain folders with `MDT*`/`MDS*` | Point at the folder that contains the `..._<FID>` download folders. |
+| `No LiDAR data folders ... found` | LiDAR root does not contain folders with `MDT*`/`MDS*` | Point at the folder that contains the download folders (by area, or `..._<FID>`). |
 | `Cannot auto-detect a folder prefix ...` | Folder names are inconsistent or have no trailing FID number | Set the folder prefix explicitly. |
 | `... missing folders for FIDs ...` (skipped) | An area's download folders are not all present yet | Re-run after the download finishes (keep Skip incomplete on). |
-| `... does not contain its AOI polygon centroid` | Under by-FID mapping, a folder maps to the wrong area | Switch Folder to area mapping to `by geometry` (the default), or fix the FID to folder alignment. |
+| `... does not contain its AOI polygon centroid` | Under by-FID mapping, a folder maps to the wrong area | Switch Folder to area mapping to `by name` (the default) or `by geometry`, or fix the FID to folder alignment. |
 | `Spatial Analyst extension is not available` | Tool 3 has no Spatial Analyst license | Enable Spatial Analyst in *Project > Licensing*. |
 | `Multidirectional hillshade needs the Image Analyst extension` | Tool 3 multidirectional without Image Analyst | Enable Image Analyst, or choose Traditional, or turn hillshade off. |
 
@@ -359,7 +359,7 @@ This exercises name sanitization and collision handling, the output name build a
 
 - **The ordinal scale is not harmonized between factors.** You define arbitrary intervals per factor; only slope and aspect are reclassified. Harmonizing the classes is a downstream analysis step, outside this toolbox. *Document this for whoever consumes the outputs, to avoid misuse.*
 - **The downstream analysis is external** and not part of this toolbox.
-- **Folder layout assumption (Tool 2):** the download folder number must equal the AOI feature FID (0 based shapefile FID). Loading the AOI as a geodatabase feature class (1 based OBJECTID) can shift the mapping; the tool warns when the OID field is not `FID`.
+- **Folder to area mapping (Tool 2):** `by name` (the default) pairs each area with the folder of the same sanitized name and is immune to FID order. Only the `by FID number` mode requires the download folder number to equal the AOI feature FID (0 based shapefile FID); loading the AOI as a geodatabase feature class (1 based OBJECTID) then shifts that mapping, and the tool warns when the OID field is not `FID`.
 - **Memory (Tool 5):** each factor raster is read into memory for the numpy reclassification. The per area extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
 - **Datum reprojection:** `projectAs` uses the default transformation. Where no default geographic transformation exists between the input and project datums, it may need to be specified explicitly.
 - **Aspect Flat:** aspect uses -1 for flat. In Tool 5 the optional flat class wins over any class interval that happens to contain -1.
