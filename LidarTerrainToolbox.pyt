@@ -1624,8 +1624,8 @@ class BuildMosaicsByPolygon(object):
             displayName="Folder to area mapping", name="folder_mapping",
             datatype="GPString", parameterType="Required", direction="Input")
         p_mapping.filter.type = "ValueList"
-        p_mapping.filter.list = ["by geometry", "by FID number"]
-        p_mapping.value = "by geometry"
+        p_mapping.filter.list = ["by name", "by geometry", "by FID number"]
+        p_mapping.value = "by name"
 
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
                 p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res,
@@ -1768,6 +1768,21 @@ class BuildMosaicsByPolygon(object):
         if not dry_run:
             _msg("Clusters done. Built: {}. Skipped: {}. Output in '{}'.".format(
                 built, skipped, cluster_root))
+
+    def _map_folders_by_name(self, data_folders, fid_to_area):
+        """Map each AOI feature to the download folder whose name equals the sanitized area name.
+        This is the exact pairing for folders produced by Tool 1 (Download DGT Data), which names
+        each folder by the area name field; no geometry or FID number is involved, and folders not
+        downloaded yet are simply absent (their areas are skipped, to be built on a later re-run)."""
+        by_name = {name: full for name, full in data_folders}
+        fid_to_folder = {}
+        for fid, raw in fid_to_area.items():
+            folder = by_name.get(sanitize_name(str(raw)))
+            if folder is not None:
+                fid_to_folder[fid] = folder
+        _msg("Mapped {} of {} AOI feature(s) to a folder by name.".format(
+            len(fid_to_folder), len(fid_to_area)))
+        return fid_to_folder
 
     def _map_folders_by_geometry(self, data_folders, fid_to_geom, fid_to_area, aoi_sr):
         """Map each AOI feature to its download folder by geometry, not by the FID number in
@@ -1919,7 +1934,9 @@ class BuildMosaicsByPolygon(object):
             _err(msg)
             raise ValueError(msg)
 
-        if mapping_mode == "by geometry":
+        if mapping_mode == "by name":
+            fid_to_folder = self._map_folders_by_name(data_folders, fid_to_area)
+        elif mapping_mode == "by geometry":
             fid_to_folder = self._map_folders_by_geometry(
                 data_folders, fid_to_geom, fid_to_area, aoi_sr)
         else:
@@ -1994,7 +2011,7 @@ class BuildMosaicsByPolygon(object):
             # Spatial sanity check: each folder's VRT extent must contain its FID's AOI
             # polygon centroid. Catches a wrong FID to folder mapping (disjoint was too weak,
             # an adjacent folder still overlaps).
-            if verify_extent and mapping_mode != "by geometry":
+            if verify_extent and mapping_mode == "by FID number":
                 mismatch = False
                 for f in present:
                     folder_poly = _folder_extent_polygon(fid_to_folder[f], ref_tile_sr)
