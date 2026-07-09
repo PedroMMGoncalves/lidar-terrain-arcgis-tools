@@ -1628,7 +1628,7 @@ class BuildMosaicsByPolygon(object):
         p_mapping.value = "by name"
 
         p_clip = arcpy.Parameter(
-            displayName="Clip mosaic to the AOI polygon", name="clip_to_aoi",
+            displayName="Clip mosaic to the AOI extent", name="clip_to_aoi",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_clip.value = False
 
@@ -1789,25 +1789,24 @@ class BuildMosaicsByPolygon(object):
             len(fid_to_folder), len(fid_to_area)))
         return fid_to_folder
 
-    def _clip_to_area(self, in_raster, out_raster, geoms, aoi_sr, tile_sr):
-        """Clip a mosaic to the AOI polygon(s) of the area so it does not overshoot the boundary
-        (for example a cartogram sheet), writing out_raster with NoData outside. The polygons are
-        dissolved and projected to the tile CRS. Uses core Clip, no Spatial Analyst."""
-        union = None
+    def _area_extent(self, geoms, aoi_sr, tile_sr):
+        """Combined extent of the area's AOI polygon(s) in the tile CRS, as an arcpy.Extent, used to
+        bound the mosaic to the AOI (for example a cartogram sheet) through the analysis extent, so
+        the mosaic comes out already cut with no extra clip pass. Returns None when there is no
+        usable geometry. This is the extent (a clean cut for a rectangular sheet); it does not mask
+        an irregular polygon to its shape."""
+        box = None
         for g in geoms:
             if g is None:
                 continue
             gt = g if _same_crs(aoi_sr, tile_sr) else g.projectAs(tile_sr)
-            union = gt if union is None else union.union(gt)
-        if union is None:
-            arcpy.management.CopyRaster(in_raster, out_raster)
-            return
-        clip_fc = "in_memory/_clip_aoi"
-        if arcpy.Exists(clip_fc):
-            arcpy.management.Delete(clip_fc)
-        arcpy.management.CopyFeatures([union], clip_fc)
-        arcpy.management.Clip(in_raster, "#", out_raster, clip_fc, "#", "ClippingGeometry")
-        arcpy.management.Delete(clip_fc)
+            e = gt.extent
+            if box is None:
+                box = [e.XMin, e.YMin, e.XMax, e.YMax]
+            else:
+                box = [min(box[0], e.XMin), min(box[1], e.YMin),
+                       max(box[2], e.XMax), max(box[3], e.YMax)]
+        return arcpy.Extent(*box) if box is not None else None
 
     def _map_folders_by_geometry(self, data_folders, fid_to_geom, fid_to_area, aoi_sr):
         """Map each AOI feature to its download folder by geometry, not by the FID number in
@@ -2084,25 +2083,26 @@ class BuildMosaicsByPolygon(object):
                 if os.path.exists(out_path) and overwrite_existing:
                     _msg("Area '{}' ({}): overwriting existing {}.".format(final_area, source, out_name))
 
-                mosaic_name = ("_full_" + out_name) if clip_to_aoi else out_name
-                mosaic_path = os.path.join(location, mosaic_name)
-                with _CleanupOnError(mosaic_path, out_path):
-                    arcpy.management.MosaicToNewRaster(
-                        input_rasters=tiles,
-                        output_location=location,
-                        raster_dataset_name_with_extension=mosaic_name,
-                        coordinate_system_for_the_raster=sr,
-                        pixel_type=pixel_type,
-                        number_of_bands=1,
-                        mosaic_method=mosaic_method,
-                    )
-                    if clip_to_aoi:
-                        self._clip_to_area(mosaic_path, out_path,
-                                           [fid_to_geom[f] for f in present], aoi_sr, sr)
-                if clip_to_aoi:
-                    _delete_partial_raster(mosaic_path)
+                clip_extent = self._area_extent(
+                    [fid_to_geom[f] for f in present], aoi_sr, sr) if clip_to_aoi else None
+                prev_extent = arcpy.env.extent
+                try:
+                    if clip_extent is not None:
+                        arcpy.env.extent = clip_extent   # bound the mosaic to the AOI, no clip pass
+                    with _CleanupOnError(out_path):
+                        arcpy.management.MosaicToNewRaster(
+                            input_rasters=tiles,
+                            output_location=location,
+                            raster_dataset_name_with_extension=out_name,
+                            coordinate_system_for_the_raster=sr,
+                            pixel_type=pixel_type,
+                            number_of_bands=1,
+                            mosaic_method=mosaic_method,
+                        )
+                finally:
+                    arcpy.env.extent = prev_extent
                 size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
-                clip_note = ", clipped to AOI" if clip_to_aoi else ""
+                clip_note = ", clipped to the AOI extent" if clip_extent is not None else ""
                 _msg("Area '{}' ({}): mosaicked {} tiles ({}) from {} folder(s){} -> {}".format(
                     final_area, source, len(tiles), size_label, len(present_folders), clip_note, out_name))
                 created_here += 1
