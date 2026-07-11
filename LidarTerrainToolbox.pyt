@@ -77,6 +77,7 @@ MAX_NAME_LEN = 40                                    # margin for suffixes like 
 RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
 RESAMPLE_DIRNAME = "Resample"                        # output subfolder created by the Resample tool
 RECLASS_DIRNAME = "Reclass"                          # output subfolder created by the Reclassify tool
+CONTOURS_DIRNAME = "Contours"                        # output subfolder created by the Contours tool
 
 # Fixed project reclassification schemes (suitability classes). Each list is consumed by
 # reclassify_array as (class_id, lo, hi) with [lo, hi) intervals, the class with the largest
@@ -556,9 +557,10 @@ class Toolbox(object):
         self.alias = "LidarTerrain"
         # Tool labels are numbered so they sort in pipeline order at the toolbox root
         # (no toolset categories): 01 Download DGT Data, 02 Build Mosaics by Polygon,
-        # 03 Generate Surfaces, 04 Solar Radiation, 05 Reclassify Factors, 06 Resample.
+        # 03 Generate Surfaces, 04 Solar Radiation, 05 Reclassify Factors, 06 Resample,
+        # 07 Contours (optional cartographic output).
         self.tools = [DownloadDGTData, BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation,
-                      ReclassifyFactor, Resample]
+                      ReclassifyFactor, Resample, Contours]
 
 
 # ===========================================================================
@@ -2431,6 +2433,260 @@ class DeriveSurfaces(object):
             if ia_checked_out:
                 arcpy.CheckInExtension("ImageAnalyst")
         return
+
+
+class Contours(object):
+    def __init__(self):
+        self.label = "07 - Contours"
+        self.description = ("Generate cartographic contour lines from the per area DEM or DSM "
+                            "mosaics, with a chosen equidistance and an optional master (index) "
+                            "interval. The surface is smoothed before contouring and the lines are "
+                            "smoothed after, both given in meters so the same values work for a "
+                            "0.5 m or a 2 m mosaic. Output is one polyline shapefile per area in a "
+                            "Contours subfolder.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Input mosaics folder", name="in_mosaics_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder (per_area_subfolder or flat only)", name="out_folder",
+            datatype="DEFolder", parameterType="Optional", direction="Input")
+
+        p_struct = arcpy.Parameter(
+            displayName="Output structure", name="output_structure",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_struct.filter.type = "ValueList"
+        p_struct.filter.list = ["same_as_input", "per_area_subfolder", "flat"]
+        p_struct.value = "same_as_input"
+
+        p_source = arcpy.Parameter(
+            displayName="Source", name="source_filter",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_source.filter.type = "ValueList"
+        p_source.filter.list = ["DEM", "DSM", "BOTH"]
+        p_source.value = "DEM"
+
+        p_interval = arcpy.Parameter(
+            displayName="Contour interval / equidistance (meters)", name="contour_interval",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_interval.value = 5
+
+        p_index = arcpy.Parameter(
+            displayName="Master (index) interval (meters, 0 = none)", name="index_interval",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_index.value = 25
+
+        p_base = arcpy.Parameter(
+            displayName="Base contour (meters)", name="base_contour",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_base.value = 0
+
+        p_smooth_dem = arcpy.Parameter(
+            displayName="DEM smoothing radius (meters, 0 = none)", name="dem_smooth_radius",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_smooth_dem.value = 5
+
+        p_smooth_line = arcpy.Parameter(
+            displayName="Line smoothing tolerance (meters, PAEK, 0 = none)", name="line_smooth_tol",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_smooth_line.value = 12
+
+        p_min_length = arcpy.Parameter(
+            displayName="Minimum contour length (meters, 0 = keep all)", name="min_length",
+            datatype="GPDouble", parameterType="Optional", direction="Input")
+        p_min_length.value = 0
+
+        p_z = arcpy.Parameter(
+            displayName="Z factor", name="z_factor",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_z.value = 1
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_in, p_recurse, p_out, p_struct, p_source, p_interval, p_index, p_base,
+                p_smooth_dem, p_smooth_line, p_min_length, p_z, p_overwrite]
+
+    def isLicensed(self):
+        # Contour and Focal Statistics need Spatial Analyst; Smooth Line is core.
+        try:
+            return arcpy.CheckExtension("Spatial") == "Available"
+        except Exception:
+            return False
+
+    def updateParameters(self, parameters):
+        parameters[2].enabled = parameters[3].valueAsText != "same_as_input"
+        return
+
+    def updateMessages(self, parameters):
+        if parameters[3].valueAsText != "same_as_input" and not parameters[2].valueAsText:
+            parameters[2].setErrorMessage("Output folder is required unless output structure is "
+                                          "same_as_input.")
+        interval = parameters[5].value
+        if interval is not None and interval <= 0:
+            parameters[5].setErrorMessage("The contour interval must be greater than 0.")
+        index = parameters[6].value
+        if interval and index and index > 0 and abs((index / interval) - round(index / interval)) > 1e-6:
+            parameters[6].setWarningMessage("The master interval is usually a multiple of the "
+                                            "contour interval.")
+        return
+
+    def execute(self, parameters, messages):
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        out_folder = parameters[2].valueAsText
+        output_structure = parameters[3].valueAsText
+        source_filter = parameters[4].valueAsText
+        interval = float(parameters[5].value)
+        index_interval = float(parameters[6].value or 0)
+        base = float(parameters[7].value or 0)
+        smooth_dem_m = float(parameters[8].value or 0)
+        smooth_line_m = float(parameters[9].value or 0)
+        min_length_m = float(parameters[10].value or 0)
+        z_factor = float(parameters[11].value)
+        overwrite_existing = bool(parameters[12].value)
+
+        if interval <= 0:
+            msg = "The contour interval must be greater than 0."
+            _err(msg)
+            raise ValueError(msg)
+        if output_structure != "same_as_input" and not out_folder:
+            msg = "Output folder is required unless output structure is same_as_input."
+            _err(msg)
+            raise ValueError(msg)
+
+        if arcpy.CheckExtension("Spatial") != "Available":
+            msg = "Spatial Analyst extension is not available. It is required for this tool."
+            _err(msg)
+            raise RuntimeError(msg)
+        arcpy.CheckOutExtension("Spatial")
+        arcpy.env.overwriteOutput = overwrite_existing
+        try:
+            allowed_sources = SOURCES if source_filter == "BOTH" else (source_filter,)
+
+            # Discover base mosaics (source set, product None), skipping the Contours subfolders.
+            mosaics = []
+            if recurse:
+                walker = os.walk(in_folder)
+            else:
+                only_files = [n for n in os.listdir(in_folder)
+                              if os.path.isfile(os.path.join(in_folder, n))]
+                walker = [(in_folder, [], only_files)]
+            for dirpath, _dirs, files in walker:
+                if os.path.basename(dirpath) == CONTOURS_DIRNAME:
+                    continue
+                for fn in files:
+                    if not fn.lower().endswith(".tif"):
+                        continue
+                    info = parse_source_and_product(fn)
+                    if info["source"] is None or info["product"] is not None or info["area"] is None:
+                        continue
+                    if info["source"] not in allowed_sources:
+                        continue
+                    mosaics.append((os.path.join(dirpath, fn), info["area"], info["source"]))
+
+            if not mosaics:
+                msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), in_folder)
+                _err(msg)
+                raise ValueError(msg)
+
+            total = len(mosaics)
+            created = 0
+            skipped = 0
+            arcpy.SetProgressor("step", "Generating contours...", 0, total, 1)
+            for path, area, source in mosaics:
+                arcpy.SetProgressorPosition()
+                sr = _assert_projected_raster(path)
+                if output_structure == "same_as_input":
+                    base_loc = os.path.dirname(path)
+                elif output_structure == "per_area_subfolder":
+                    base_loc = os.path.join(out_folder, area)
+                else:
+                    base_loc = out_folder
+                location = os.path.join(base_loc, CONTOURS_DIRNAME)
+                if not os.path.isdir(location):
+                    os.makedirs(location)
+                out_shp = os.path.join(location, build_output_name(area, source, "CONT") + ".shp")
+
+                if arcpy.Exists(out_shp) and not overwrite_existing:
+                    _msg("{} ({}): contours exist, skipping.".format(area, source))
+                    skipped += 1
+                    continue
+
+                cell = arcpy.Raster(path).meanCellWidth
+                if interval < 2 * cell:
+                    _warn("{} ({}): a {:g} m interval is small for the {:g} m cell size; the "
+                          "contours may be dense and noisy.".format(area, source, interval, cell))
+
+                n = self._contours_for(path, out_shp, interval, index_interval, base, z_factor,
+                                       smooth_dem_m, smooth_line_m, min_length_m)
+                master_note = ", master {:g} m".format(index_interval) if index_interval > 0 else ""
+                _msg("{} ({}, {}): {} contours ({:g} m interval{}) -> {}".format(
+                    area, source, _crs_label(sr), n, interval, master_note, os.path.basename(out_shp)))
+                created += 1
+
+            arcpy.ResetProgressor()
+            _msg("Done. Mosaics: {}. Contour layers created: {}. Skipped existing: {}.".format(
+                total, created, skipped))
+        finally:
+            arcpy.CheckInExtension("Spatial")
+        return
+
+    def _contours_for(self, dem_path, out_shp, interval, index_interval, base, z_factor,
+                      smooth_dem_m, smooth_line_m, min_length_m):
+        """Smooth the surface (Focal MEAN in map units, so it is resolution aware), contour, smooth
+        the lines (PAEK, meters), flag the master contours and drop the short ones, then write
+        out_shp. Returns the contour feature count."""
+        scratch = arcpy.env.scratchGDB
+        tmp_lines = os.path.join(scratch, "cont_lines")
+        tmp_smooth = os.path.join(scratch, "cont_smooth")
+        for tmp in (tmp_lines, tmp_smooth):
+            if arcpy.Exists(tmp):
+                arcpy.management.Delete(tmp)
+
+        surface = dem_path
+        if smooth_dem_m and smooth_dem_m > 0:
+            # NbrCircle in MAP units keeps the smoothing scale in meters at any cell size.
+            surface = arcpy.sa.FocalStatistics(
+                dem_path, arcpy.sa.NbrCircle(smooth_dem_m, "MAP"), "MEAN")
+
+        arcpy.sa.Contour(surface, tmp_lines, interval, base, z_factor)
+
+        result = tmp_lines
+        if smooth_line_m and smooth_line_m > 0:
+            arcpy.cartography.SmoothLine(tmp_lines, tmp_smooth, "PAEK",
+                                         "{} Meters".format(smooth_line_m))
+            result = tmp_smooth
+
+        if min_length_m and min_length_m > 0:
+            with arcpy.da.UpdateCursor(result, ["SHAPE@LENGTH"]) as cur:
+                for (length,) in cur:
+                    if length is not None and length < min_length_m:
+                        cur.deleteRow()
+
+        if index_interval and index_interval > 0:
+            arcpy.management.AddField(result, "master", "SHORT")
+            with arcpy.da.UpdateCursor(result, ["Contour", "master"]) as cur:
+                for value, _m in cur:
+                    ratio = (value / index_interval) if value is not None else 0.0
+                    cur.updateRow((value, 1 if abs(ratio - round(ratio)) < 1e-6 else 0))
+
+        count = int(arcpy.management.GetCount(result)[0])
+        arcpy.management.CopyFeatures(result, out_shp)
+        for tmp in (tmp_lines, tmp_smooth):
+            if arcpy.Exists(tmp):
+                arcpy.management.Delete(tmp)
+        return count
 
 
 class ReclassifyFactor(object):

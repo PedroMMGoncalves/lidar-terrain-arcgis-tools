@@ -37,7 +37,7 @@ Each tool reads the previous tool's output folder and writes with one consistent
 
 ## Summary
 
-Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. A sixth tool, Resample, is an optional utility you can run on any of the outputs:
+Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. Two more, Resample and Contours, are optional utilities you can run on the outputs:
 
 1. **Download DGT Data**: download the LiDAR tiles from the DGT CDD portal, organized one folder per AOI feature (with a product subfolder each) or as a single flat folder, ready for the mosaic tool.
 2. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
@@ -45,6 +45,7 @@ Five tools form the pipeline, run in order, with the input and output folders al
 4. **Solar Radiation**: annual solar radiation (global, kWh/m2) per area on the DEM with RasterSolarRadiation (GPU), with a choice of diffuse model (uniform, overcast, or both) and optional direct, diffuse and duration outputs, at the native 2 m baseline.
 5. **Reclassify Factors**: fixed suitability classes for aspect, slope and annual solar (aspect yields two rasters, quadrants and solar suitability), written to a `Reclass` subfolder with a legend.
 6. **Resample** (optional): resample the named rasters to a coarser cell size, for example 2 m to 5 m, into a `Resample` folder grouped by area.
+7. **Contours** (optional): cartographic contour lines from the DEM or DSM mosaics, with a chosen equidistance and a master (index) interval, smoothed for high resolution LiDAR, into a `Contours` subfolder.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -65,6 +66,8 @@ flowchart TD
     M --> T2["Tool 3<br/>Generate Surfaces"]
     M --> T3["Tool 4<br/>Solar Radiation"]
     M -.-> T5["Tool 6 (optional)<br/>Resample"]
+    M -.-> CT["Tool 7 (optional)<br/>Contours"]
+    CT -.-> CO["Contour lines (.shp)<br/>per area, master flag"]
     CL -.-> T2
     CL -.-> T3
     CL -.-> T5
@@ -86,8 +89,8 @@ flowchart TD
     classDef data fill:#eaf2ff,stroke:#1f6feb,color:#0b2a5b;
     classDef ext fill:#f5f5f5,stroke:#999999,color:#333333,stroke-dasharray:4 3;
     class TDL,T1,T2,T3,T4 tool;
-    class T5 opttool;
-    class AOI,LID,M,S,SOL,RCL,RS,CL data;
+    class T5,CT opttool;
+    class AOI,LID,M,S,SOL,RCL,RS,CL,CO data;
     class EXT ext;
 ```
 
@@ -98,6 +101,7 @@ flowchart TD
 - **Tool 4** computes annual solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated), at the native 2 m baseline. You pick the diffuse model (uniform, overcast, or both) and can also output the direct, diffuse and direct duration rasters; the output names carry the model (`SOLARUNI`, `SOLAROVC`). A coarser solar cell size resamples the DEM first.
 - **Tool 5** reclassifies aspect, slope and the annual solar raster into fixed project suitability classes, in numpy with `[min, max)` semantics. Aspect yields two rasters: quadrants (`ASPECT_DIR`, N to NW plus flat) and solar suitability (`ASPECT_RCL`, south and flat best); slope and solar yield `SLOPE_RCL` and `SOLARUNI_RCL`. Each output, plus a legend (`RECLASS_legenda.txt`), goes to a `Reclass` subfolder next to the inputs.
 - **Tool 6** (optional) resamples the selected data types to a target cell size with core Resample, writing to a `Resample` folder grouped by area; continuous rasters use bilinear, reclassified (`_RCL`) rasters use nearest. Typical use is 2 m to 5 m to lighten the later steps.
+- **Tool 7** (optional) generates cartographic contour lines from the DEM or DSM mosaics: it smooths the surface (Focal mean, given in meters so it is resolution independent), contours at the chosen equidistance, smooths the lines (PAEK), flags the master (index) contours and drops the short noise rings, writing one polyline shapefile per area to a `Contours` subfolder. Needs Spatial Analyst.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent check.
 
 ---
@@ -105,7 +109,7 @@ flowchart TD
 ## Requirements
 
 - ArcGIS Pro **3.7**, Windows (arcpy is Windows only on ArcGIS Pro 3.x). Uses the Python bundled with ArcGIS Pro and numpy from that environment; no extra packages.
-- **Spatial Analyst** extension for Tool 3 (slope, aspect, curvature, traditional hillshade) and Tool 4 (solar radiation). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
+- **Spatial Analyst** extension for Tool 3 (slope, aspect, curvature, traditional hillshade), Tool 4 (solar radiation), and Tool 7 (contours: Contour and Focal Statistics; Smooth Line is core). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
 - **Image Analyst** extension for Tool 3 only when the hillshade type is Multidirectional.
 - **Network access, a free CDD account, and the `requests` library** (bundled with ArcGIS Pro) for Tool 1 (Download DGT Data).
 - Tools 1, 2, 5 and 6 need no extension (download, mosaicking and resampling are core, and the reclassification is pure numpy).
@@ -262,6 +266,27 @@ Resample the named rasters to a coarser cell size (for example 2 m to 5 m), in b
 | Overwrite existing outputs | Off skips existing resampled rasters. |
 
 The method is automatic per type: bilinear for continuous rasters, nearest for reclassified (`_RCL`) so the ordinal classes are preserved. A raster already at the target cell size is copied through unchanged, so the `Resample` folder stays a complete set; a target finer than the native cell size warns, since upsampling adds no real detail.
+
+### Tool 7, Contours
+
+Cartographic contour lines from the DEM (or DSM) mosaics, with a chosen equidistance. High resolution LiDAR is smoothed so the contours are clean rather than jagged. Needs Spatial Analyst. Output is one polyline shapefile per area in a `Contours` subfolder, with a `Contour` field (the elevation) and a `master` field (1 for the index contours).
+
+| Parameter | Description |
+| --- | --- |
+| Input mosaics folder | The Tool 2 output (the DEM mosaics). |
+| Recurse subfolders | On (default). |
+| Output structure, Output folder | `same_as_input` default, as in the other tools; the shapefiles go to a `Contours` subfolder there. |
+| Source | `DEM` (default), `DSM`, or `BOTH`. |
+| Contour interval / equidistance (meters) | The normal contour spacing, for example 5. |
+| Master (index) interval (meters) | Bold, labeled contours every this many meters (a multiple of the interval), for example 25; 0 = none. Flagged in the `master` field (1/0). |
+| Base contour | Contours are computed relative to this value; default 0. |
+| DEM smoothing radius (meters) | Focal mean radius applied to the surface before contouring, in meters (resolution independent); 0 = none. Removes the micro relief that makes contours jagged, the main, terrain aware smoothing. |
+| Line smoothing tolerance (meters) | Smooth Line (PAEK) tolerance on the contour geometry, in meters; 0 = none. Removes the pixel staircase; keep it light. |
+| Minimum contour length (meters) | Drops contours shorter than this (the small noise rings); 0 = keep all. |
+| Z factor | Default 1. |
+| Overwrite existing outputs | Off skips existing contour shapefiles. |
+
+The two smoothing values are in meters and applied in map units, so the same numbers work for a 0.5 m or a 2 m mosaic. A good starting point for a 2 m DEM: interval 5 m, master 25 m, DEM smoothing 5 m, line smoothing 12 m, then adjust to taste. For 0.5 m the same smoothing in meters applies (a larger pixel window, slower); resampling to 2 m first is often the better route.
 
 ---
 
