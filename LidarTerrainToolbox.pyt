@@ -182,9 +182,19 @@ class _CleanupOnError(object):
 
 
 def _save_raster(raster, out_path):
-    """Save a Spatial Analyst / Image Analyst raster result, deleting the partial output on error."""
-    with _CleanupOnError(out_path):
-        raster.save(out_path)
+    """Save a Spatial Analyst / Image Analyst raster result, deleting the partial output on error.
+    Retries a few times when the existing output cannot be deleted or is locked (often a transient
+    lock from antivirus or a brief hold), which would otherwise abort a long batch."""
+    import time
+    for attempt in range(3):
+        try:
+            with _CleanupOnError(out_path):
+                raster.save(out_path)
+            return
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(2)
 
 
 # ===========================================================================
@@ -2363,76 +2373,93 @@ class DeriveSurfaces(object):
 
             total = len(mosaics)
             created = 0
+            failed = []
             arcpy.SetProgressor("step", "Deriving surfaces...", 0, total, 1)
             for path, area, source in mosaics:
                 arcpy.SetProgressorPosition()
-                _assert_projected_raster(path)
-
-                if output_structure == "same_as_input":
-                    location = os.path.dirname(path)
-                elif output_structure == "per_area_subfolder":
-                    location = os.path.join(out_folder, area)
-                else:
-                    location = out_folder
-                if not os.path.isdir(location):
-                    os.makedirs(location)
-
-                # Resolve which selected surfaces still need writing (idempotency).
-                targets = {}
-                todo = {}
-                for product in wanted:
-                    target = os.path.join(location, build_output_name(area, source, product) + ".tif")
-                    targets[product] = target
-                    if os.path.exists(target) and not overwrite_existing:
-                        _msg("{} ({}): {} exists, skipping.".format(area, source, os.path.basename(target)))
-                        todo[product] = False
-                    else:
-                        todo[product] = True
-
-                if todo.get("SLOPE"):
-                    _save_raster(arcpy.sa.Slope(path, "DEGREE", z_factor), targets["SLOPE"])
-                    created += 1
-                if todo.get("SLOPEP"):
-                    _save_raster(arcpy.sa.Slope(path, "PERCENT_RISE", z_factor), targets["SLOPEP"])
-                    created += 1
-                if todo.get("ASPECT"):
-                    # Aspect takes no z_factor (it is direction only); z_factor applies to
-                    # slope, hillshade and curvature.
-                    _save_raster(arcpy.sa.Aspect(path), targets["ASPECT"])
-                    created += 1
-                if todo.get("HILLSHADE"):
-                    if multidirectional:
-                        # arcpy.ia.Hillshade hillshade_type is an integer: 1 = multidirectional,
-                        # 0 = single direction. The UI string is mapped to this integer here.
-                        _save_raster(arcpy.ia.Hillshade(path, hillshade_type=1, z_factor=z_factor),
-                                     targets["HILLSHADE"])
-                    else:
-                        _save_raster(arcpy.sa.Hillshade(path, azimuth, altitude, "SHADOWS", z_factor),
-                                     targets["HILLSHADE"])
-                    created += 1
-
-                # Profile and plan curvature share one Curvature call; pass only the wanted outputs.
-                want_profc = todo.get("PROFC", False)
-                want_planc = todo.get("PLANC", False)
-                if want_profc or want_planc:
-                    # "#" skips an unwanted optional output. The returned standard curvature
-                    # is intentionally discarded; only profile and plan are kept.
-                    with _CleanupOnError(targets["PROFC"] if want_profc else None,
-                                         targets["PLANC"] if want_planc else None):
-                        arcpy.sa.Curvature(path, z_factor,
-                                           targets["PROFC"] if want_profc else "#",
-                                           targets["PLANC"] if want_planc else "#")
-                    created += (1 if want_profc else 0) + (1 if want_planc else 0)
-
-                _msg("{} ({}): surfaces done.".format(area, source))
+                try:
+                    created += self._surfaces_for_mosaic(
+                        path, area, source, out_folder, output_structure, wanted,
+                        overwrite_existing, z_factor, multidirectional, azimuth, altitude)
+                    _msg("{} ({}): surfaces done.".format(area, source))
+                except Exception as exc:
+                    _warn("{} ({}): surfaces failed: {}. Skipping this mosaic; a re-run retries it "
+                          "(check the output is not locked by an open map or another process)."
+                          .format(area, source, exc))
+                    failed.append("{} ({})".format(area, source))
 
             arcpy.ResetProgressor()
-            _msg("Done. Mosaics processed: {}. Surfaces created: {}.".format(total, created))
+            _msg("Done. Mosaics processed: {}. Surfaces created: {}. Failed: {}.".format(
+                total, created, len(failed)))
+            if failed:
+                _warn("Surfaces failed for {} mosaic(s); re-run to retry: {}".format(
+                    len(failed), ", ".join(failed)))
         finally:
             arcpy.CheckInExtension("Spatial")
             if ia_checked_out:
                 arcpy.CheckInExtension("ImageAnalyst")
         return
+
+    def _surfaces_for_mosaic(self, path, area, source, out_folder, output_structure, wanted,
+                             overwrite_existing, z_factor, multidirectional, azimuth, altitude):
+        """Derive the wanted surfaces for one mosaic (idempotent). Returns the number created.
+        Isolated so a failure on one mosaic (for example a locked output) can be caught and the
+        batch can continue with the rest."""
+        _assert_projected_raster(path)
+        if output_structure == "same_as_input":
+            location = os.path.dirname(path)
+        elif output_structure == "per_area_subfolder":
+            location = os.path.join(out_folder, area)
+        else:
+            location = out_folder
+        if not os.path.isdir(location):
+            os.makedirs(location)
+
+        # Resolve which selected surfaces still need writing (idempotency).
+        targets = {}
+        todo = {}
+        for product in wanted:
+            target = os.path.join(location, build_output_name(area, source, product) + ".tif")
+            targets[product] = target
+            if os.path.exists(target) and not overwrite_existing:
+                _msg("{} ({}): {} exists, skipping.".format(area, source, os.path.basename(target)))
+                todo[product] = False
+            else:
+                todo[product] = True
+
+        created = 0
+        if todo.get("SLOPE"):
+            _save_raster(arcpy.sa.Slope(path, "DEGREE", z_factor), targets["SLOPE"])
+            created += 1
+        if todo.get("SLOPEP"):
+            _save_raster(arcpy.sa.Slope(path, "PERCENT_RISE", z_factor), targets["SLOPEP"])
+            created += 1
+        if todo.get("ASPECT"):
+            # Aspect takes no z_factor (it is direction only); z_factor applies to slope,
+            # hillshade and curvature.
+            _save_raster(arcpy.sa.Aspect(path), targets["ASPECT"])
+            created += 1
+        if todo.get("HILLSHADE"):
+            if multidirectional:
+                # arcpy.ia.Hillshade hillshade_type: 1 = multidirectional, 0 = single direction.
+                _save_raster(arcpy.ia.Hillshade(path, hillshade_type=1, z_factor=z_factor),
+                             targets["HILLSHADE"])
+            else:
+                _save_raster(arcpy.sa.Hillshade(path, azimuth, altitude, "SHADOWS", z_factor),
+                             targets["HILLSHADE"])
+            created += 1
+
+        # Profile and plan curvature share one Curvature call; pass only the wanted outputs.
+        want_profc = todo.get("PROFC", False)
+        want_planc = todo.get("PLANC", False)
+        if want_profc or want_planc:
+            with _CleanupOnError(targets["PROFC"] if want_profc else None,
+                                 targets["PLANC"] if want_planc else None):
+                arcpy.sa.Curvature(path, z_factor,
+                                   targets["PROFC"] if want_profc else "#",
+                                   targets["PLANC"] if want_planc else "#")
+            created += (1 if want_profc else 0) + (1 if want_planc else 0)
+        return created
 
 
 class Contours(object):
