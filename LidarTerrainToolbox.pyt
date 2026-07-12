@@ -1596,15 +1596,17 @@ class BuildMosaicsByPolygon(object):
     def __init__(self):
         self.label = "02 - Build Mosaics by Polygon"
         self.description = ("Build one DEM and one DSM mosaic per area from the DGT LiDAR "
-                            "download folders. Each folder 02_DGT_LiDAR_Data_<FID> holds the "
-                            "tiles of one AOI; folders are matched to areas by FID and merged "
-                            "per area. The spatial selection was already done at download time "
-                            "(5 km buffer per AOI), so no buffering or tile intersection is needed.")
+                            "download folders. Folders are matched to areas by name (the Tool 1 "
+                            "layout, the default), by geometry, or by the FID number (the old "
+                            "plugin layout), and merged per area. The spatial selection was "
+                            "already done at download time, so no buffering or tile intersection "
+                            "is needed. Optional AOI clip, per resolution trees, overlap clusters "
+                            "and pyramids.")
         self.canRunInBackground = False
 
     def getParameterInfo(self):
         p_aoi = arcpy.Parameter(
-            displayName="AOI layer (FID maps to download folder)", name="in_aoi",
+            displayName="AOI layer (areas of interest)", name="in_aoi",
             datatype="GPFeatureLayer", parameterType="Required", direction="Input")
         p_aoi.filter.list = ["Polygon"]
 
@@ -2361,7 +2363,7 @@ class DeriveSurfaces(object):
             displayName="Source", name="source_filter",
             datatype="GPString", parameterType="Required", direction="Input")
         p_source.filter.type = "ValueList"
-        p_source.filter.list = ["BOTH", "DEM", "DSM"]
+        p_source.filter.list = ["DEM", "DSM", "BOTH"]   # same order in every tool
         p_source.value = "BOTH"
 
         p_slope = arcpy.Parameter(
@@ -2823,43 +2825,55 @@ class Contours(object):
             total = len(mosaics)
             created = 0
             skipped = 0
+            failed = []
             arcpy.SetProgressor("step", "Generating contours...", 0, total, 1)
             for path, area, source in mosaics:
                 arcpy.SetProgressorPosition()
-                sr = _assert_projected_raster(path)
-                if output_structure == "same_as_input":
-                    base_loc = os.path.dirname(path)
-                elif output_structure == "per_area_subfolder":
-                    base_loc = os.path.join(out_folder, area)
-                else:
-                    base_loc = out_folder
-                location = os.path.join(base_loc, CONTOURS_DIRNAME)
-                if not os.path.isdir(location):
-                    os.makedirs(location)
-                out_shp = os.path.join(location, build_output_name(area, source, "CONT") + ".shp")
+                try:
+                    sr = _assert_projected_raster(path)
+                    if output_structure == "same_as_input":
+                        base_loc = os.path.dirname(path)
+                    elif output_structure == "per_area_subfolder":
+                        base_loc = os.path.join(out_folder, area)
+                    else:
+                        base_loc = out_folder
+                    location = os.path.join(base_loc, CONTOURS_DIRNAME)
+                    if not os.path.isdir(location):
+                        os.makedirs(location)
+                    out_shp = os.path.join(location, build_output_name(area, source, "CONT") + ".shp")
 
-                if arcpy.Exists(out_shp) and not overwrite_existing:
-                    _msg("{} ({}): contours exist, skipping.".format(area, source))
-                    skipped += 1
-                    continue
+                    if arcpy.Exists(out_shp) and not overwrite_existing:
+                        _msg("{} ({}): contours exist, skipping.".format(area, source))
+                        skipped += 1
+                        continue
 
-                cell = arcpy.Raster(path).meanCellWidth
-                if interval < 2 * cell:
-                    _warn("{} ({}): a {:g} m interval is small for the {:g} m cell size; the "
-                          "contours may be dense and noisy.".format(area, source, interval, cell))
+                    cell = arcpy.Raster(path).meanCellWidth
+                    if interval < 2 * cell:
+                        _warn("{} ({}): a {:g} m interval is small for the {:g} m cell size; the "
+                              "contours may be dense and noisy.".format(area, source, interval, cell))
 
-                n = self._contours_for(path, out_shp, interval, index_interval, base, z_factor,
-                                       smooth_dem_m, smooth_line_m, min_length_m)
-                master_note = ", master {:g} m".format(index_interval) if index_interval > 0 else ""
-                _msg("{} ({}, {}): {} contours ({:g} m interval{}) -> {}".format(
-                    area, source, _crs_label(sr), n, interval, master_note, os.path.basename(out_shp)))
-                created += 1
+                    n = self._contours_for(path, out_shp, interval, index_interval, base, z_factor,
+                                           smooth_dem_m, smooth_line_m, min_length_m)
+                    master_note = ", master {:g} m".format(index_interval) if index_interval > 0 else ""
+                    _msg("{} ({}, {}): {} contours ({:g} m interval{}) -> {}".format(
+                        area, source, _crs_label(sr), n, interval, master_note,
+                        os.path.basename(out_shp)))
+                    created += 1
+                except Exception as exc:
+                    _warn("{} ({}): contours failed: {}. Skipping this mosaic; a re-run retries "
+                          "it.".format(area, source, exc))
+                    failed.append("{} ({})".format(area, source))
 
             arcpy.ResetProgressor()
-            _msg("Done. Mosaics: {}. Contour layers created: {}. Skipped existing: {}.".format(
-                total, created, skipped))
+            _msg("Done. Mosaics: {}. Contour layers created: {}. Skipped existing: {}. "
+                 "Failed: {}.".format(total, created, skipped, len(failed)))
         finally:
             arcpy.CheckInExtension("Spatial")
+        # Fail loud: if any mosaic failed, the tool result must be a failure, not SUCCESS.
+        if failed:
+            msg = "Contours failed for: " + ", ".join(failed)
+            _err(msg)
+            raise RuntimeError(msg)
         return
 
     def _contours_for(self, dem_path, out_shp, interval, index_interval, base, z_factor,
@@ -2936,7 +2950,7 @@ class ReclassifyFactor(object):
 
     def getParameterInfo(self):
         p_in = arcpy.Parameter(
-            displayName="Input results folder", name="in_folder",
+            displayName="Results folder (the Tool 3 and Tool 4 outputs)", name="in_folder",
             datatype="DEFolder", parameterType="Required", direction="Input")
 
         p_recurse = arcpy.Parameter(
@@ -3048,61 +3062,25 @@ class ReclassifyFactor(object):
         total = len(rasters)
         created = 0
         skipped_existing = 0
+        failed = []
         folders_written = {}                                  # Reclass subfolder -> [output names]
         arcpy.SetProgressor("step", "Reclassifying factors...", 0, total, 1)
         for path, area, source, product in rasters:
             arcpy.SetProgressorPosition()
             location = os.path.join(os.path.dirname(path), RECLASS_DIRNAME)
             folders_written.setdefault(location, [])
-
-            src = arcpy.Raster(path)
-            sr = src.spatialReference
-            sr_defined = not (sr is None or sr.name in (None, "", "Unknown"))
-            if not sr_defined:
-                _warn("{} ({}): input {} has an undefined CRS; the outputs CRS will be undefined "
-                      "too.".format(area, source, product))
-            lower_left = arcpy.Point(src.extent.XMin, src.extent.YMin)
-            cell_w = src.meanCellWidth
-            cell_h = src.meanCellHeight
-            arr = None                                        # read once per source, lazily
-
-            for out_name, classes, flat_class in self._schemes_for(area, source, product):
-                if out_name not in folders_written[location]:
-                    folders_written[location].append(out_name)
-                out_path = os.path.join(location, out_name)
-                if os.path.exists(out_path) and not overwrite_existing:
-                    _msg("{} ({}): {} exists, skipping.".format(area, source, out_name))
-                    skipped_existing += 1
-                    continue
-
-                if arr is None:
-                    # Read as float (Slope/Aspect/Solar are float) and map the raster's own
-                    # NoData to NaN, so reclassify_array sends those cells to the output NoData.
-                    try:
-                        arr = arcpy.RasterToNumPyArray(path).astype("float32")
-                    except MemoryError:
-                        msg = ("{} ({}) {} is too large to load into memory for reclassification. "
-                               "Reduce the extent or process fewer rasters at a time.").format(
-                                   area, source, product)
-                        _err(msg)
-                        raise
-                    if src.noDataValue is not None:
-                        arr[arr == src.noDataValue] = float("nan")
-
-                if not os.path.isdir(location):
-                    os.makedirs(location)
-                out_arr = reclassify_array(arr, classes, RECLASS_NODATA,
-                                           flat_value=-1 if flat_class is not None else None,
-                                           flat_class=flat_class)
-                with _CleanupOnError(out_path):
-                    out_raster = arcpy.NumPyArrayToRaster(out_arr, lower_left, cell_w, cell_h,
-                                                          value_to_nodata=RECLASS_NODATA)
-                    out_raster.save(out_path)
-                    if sr_defined:
-                        # NumPyArrayToRaster leaves the CRS undefined; set it when it is known.
-                        arcpy.management.DefineProjection(out_path, sr)
-                _msg("{} ({}): {} ({}) -> {}".format(area, source, product, _crs_label(sr), out_name))
-                created += 1
+            try:
+                made, skipped = self._reclassify_raster(
+                    path, area, source, product, location, folders_written[location],
+                    overwrite_existing)
+                created += made
+                skipped_existing += skipped
+            except Exception as exc:
+                _warn("{} ({}): reclassification failed: {}. Skipping this raster; a re-run "
+                      "retries it.".format(area, source, exc))
+                failed.append("{} ({} {})".format(area, source, product))
+                import gc
+                gc.collect()                  # free the numpy array of a failed raster
 
         for location, names in folders_written.items():
             if os.path.isdir(location):
@@ -3110,8 +3088,70 @@ class ReclassifyFactor(object):
 
         arcpy.ResetProgressor()
         _msg("Done. Source rasters: {}. Reclassified outputs: {}. Skipped existing: {}. "
-             "NoData: {}.".format(total, created, skipped_existing, RECLASS_NODATA))
+             "Failed: {}. NoData: {}.".format(total, created, skipped_existing, len(failed),
+                                              RECLASS_NODATA))
+        # Fail loud: if any raster failed, the tool result must be a failure, not SUCCESS.
+        if failed:
+            msg = "Reclassification failed for: " + ", ".join(failed)
+            _err(msg)
+            raise RuntimeError(msg)
         return
+
+    def _reclassify_raster(self, path, area, source, product, location, names,
+                           overwrite_existing):
+        """Reclassify one factor raster into its scheme outputs (idempotent). Returns
+        (created, skipped). Isolated so a failure on one raster (a locked output, memory) can be
+        caught and the batch can continue with the rest."""
+        created = 0
+        skipped = 0
+        src = arcpy.Raster(path)
+        sr = src.spatialReference
+        sr_defined = not (sr is None or sr.name in (None, "", "Unknown"))
+        if not sr_defined:
+            _warn("{} ({}): input {} has an undefined CRS; the outputs CRS will be undefined "
+                  "too.".format(area, source, product))
+        lower_left = arcpy.Point(src.extent.XMin, src.extent.YMin)
+        cell_w = src.meanCellWidth
+        cell_h = src.meanCellHeight
+        arr = None                                        # read once per source, lazily
+
+        for out_name, classes, flat_class in self._schemes_for(area, source, product):
+            if out_name not in names:
+                names.append(out_name)
+            out_path = os.path.join(location, out_name)
+            if os.path.exists(out_path) and not overwrite_existing:
+                _msg("{} ({}): {} exists, skipping.".format(area, source, out_name))
+                skipped += 1
+                continue
+
+            if arr is None:
+                # Read as float (Slope/Aspect/Solar are float) and map the raster's own
+                # NoData to NaN, so reclassify_array sends those cells to the output NoData.
+                try:
+                    arr = arcpy.RasterToNumPyArray(path).astype("float32")
+                except MemoryError:
+                    raise MemoryError(
+                        "{} ({}) {} is too large to load into memory for reclassification. "
+                        "Reduce the extent or process fewer rasters at a time.".format(
+                            area, source, product))
+                if src.noDataValue is not None:
+                    arr[arr == src.noDataValue] = float("nan")
+
+            if not os.path.isdir(location):
+                os.makedirs(location)
+            out_arr = reclassify_array(arr, classes, RECLASS_NODATA,
+                                       flat_value=-1 if flat_class is not None else None,
+                                       flat_class=flat_class)
+            with _CleanupOnError(out_path):
+                out_raster = arcpy.NumPyArrayToRaster(out_arr, lower_left, cell_w, cell_h,
+                                                      value_to_nodata=RECLASS_NODATA)
+                out_raster.save(out_path)
+                if sr_defined:
+                    # NumPyArrayToRaster leaves the CRS undefined; set it when it is known.
+                    arcpy.management.DefineProjection(out_path, sr)
+            _msg("{} ({}): {} ({}) -> {}".format(area, source, product, _crs_label(sr), out_name))
+            created += 1
+        return created, skipped
 
 
 class SolarRadiation(object):
