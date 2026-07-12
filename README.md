@@ -328,7 +328,7 @@ The final binary mask per mine: `1` = suitable (gentle slope AND enough solar), 
 | Minimum suitable solar radiation | Default 1400 kWh/m2, the lower bound of solar class 3 (so classes 3 to 6 are suitable, 1 and 2 are not). |
 | Overwrite existing outputs | Off skips existing masks. |
 
-Each mine is matched to the area raster that covers it, by name first (an area named like the mine) and spatially otherwise (the raster whose extent contains the mine centroid), so it works on per area results and on cluster results. The computation is bounded to the mine polygons (snapped to the slope grid) and clipped to their shape with Extract By Mask.
+Each mine is matched to the area raster that covers it, by name first (an area named like the mine) and spatially otherwise (the raster whose extent contains the most polygon centroids), so it works on per area results and on cluster results; a warning is issued when part of a mine falls outside the chosen raster. The computation is bounded to the mine polygons (snapped to the slope grid) and clipped to their shape with Extract By Mask. Cells that are NoData in either input stay NoData in the mask (only cells with data become 1 or 0).
 
 ---
 

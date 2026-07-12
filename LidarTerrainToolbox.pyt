@@ -1778,6 +1778,8 @@ class BuildMosaicsByPolygon(object):
                 out_path = os.path.join(location, out_name)
                 if os.path.exists(out_path) and not overwrite_existing:
                     _msg("{} ({}): exists, skipping ({}).".format(cluster_id, source, out_name))
+                    if build_pyramids:
+                        _build_pyramids_stats(out_path)   # idempotent via SKIP_EXISTING
                     continue
                 tiles, sr, cell, res_used = _gather_product_tiles(
                     present_folders, product_prefix, tile_resolution)
@@ -1823,7 +1825,9 @@ class BuildMosaicsByPolygon(object):
         # "Sao Joao" and "S. Joao"): both would silently read the same folder and one area's
         # mosaic would be built from the other's tiles.
         claimed = {}
-        for raw in set(str(r) for r in fid_to_area.values()):
+        # Strip like build_area_groups does, so "Covas" and "Covas " (a stray space) count as the
+        # SAME raw value (one area, no false collision) rather than two different names.
+        for raw in set(str(r).strip() for r in fid_to_area.values()):
             claimed.setdefault(sanitize_name(raw), set()).add(raw)
         collisions = {s: raws for s, raws in claimed.items() if len(raws) > 1}
         if collisions:
@@ -2142,6 +2146,10 @@ class BuildMosaicsByPolygon(object):
                 if os.path.exists(out_path) and not overwrite_existing:
                     _msg("Area '{}' ({}): output exists, skipping ({}).".format(
                         final_area, source, out_name))
+                    if build_pyramids:
+                        # SKIP_EXISTING makes this idempotent, so the option also serves a re-run
+                        # that only adds pyramids to mosaics built earlier.
+                        _build_pyramids_stats(out_path)
                     existing_here += 1
                     continue
                 if os.path.exists(out_path) and overwrite_existing:
@@ -2420,7 +2428,7 @@ class DeriveSurfaces(object):
             for dirpath, dirs, files in walker:
                 # Do not descend into the Resample tree: it holds same-named copies of the base
                 # mosaics at another cell size, which would be processed a second time.
-                dirs[:] = [d for d in dirs if d != RESAMPLE_DIRNAME]
+                dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
                 for fn in files:
                     if not fn.lower().endswith(".tif"):
                         continue
@@ -2694,7 +2702,7 @@ class Contours(object):
                 walker = [(in_folder, [], only_files)]
             for dirpath, dirs, files in walker:
                 # Skip our own Contours output and the Resample tree (same-named mosaic copies).
-                dirs[:] = [d for d in dirs if d != RESAMPLE_DIRNAME]
+                dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
                 if os.path.basename(dirpath) == CONTOURS_DIRNAME:
                     continue
                 for fn in files:
@@ -3255,7 +3263,7 @@ class SolarRadiation(object):
             walker = [(in_folder, [], only_files)]
         for dirpath, dirs, files in walker:
             # Do not descend into the Resample tree (same-named mosaic copies at another cell size).
-            dirs[:] = [d for d in dirs if d != RESAMPLE_DIRNAME]
+            dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
             for fn in files:
                 if not fn.lower().endswith(".tif"):
                     continue
@@ -3424,8 +3432,9 @@ class Resample(object):
             datatype="GPString", parameterType="Required", direction="Input", multiValue=True)
         p_types.filter.type = "ValueList"
         # Derived from the tuples so new products (slope percent, solar variants) appear
-        # automatically; the _RCL variants are the products Tool 04 reclassifies.
-        p_types.filter.list = (list(SOURCES) + list(PRODUCTS)
+        # automatically; the _RCL variants are the products Tool 05 reclassifies. CONT is a
+        # shapefile (Tool 7), so it is excluded, there is no contour raster to resample.
+        p_types.filter.list = (list(SOURCES) + [p for p in PRODUCTS if p != "CONT"]
                                + [p + "_" + RECLASS_SUFFIX for p in ("SLOPE", "ASPECT")])
         p_types.value = ["DEM", "DSM"]
 
@@ -3542,7 +3551,9 @@ class Resample(object):
                 if target_cell < native:
                     _warn("{} ({}): target {:g} m is finer than native {:g} m; upsampling adds no "
                           "real detail.".format(area, token, target_cell, native))
-                method = "NEAREST" if info["reclass"] else "BILINEAR"
+                # Categorical rasters (reclassified, and the binary APT mask) must use nearest,
+                # or interpolation would produce fractional class values.
+                method = "NEAREST" if (info["reclass"] or info["product"] == "APT") else "BILINEAR"
                 arcpy.management.Resample(path, out_path, "{0} {0}".format(target_cell), method)
                 _msg("{} ({}): resampled {:g} m -> {:g} m ({}, {}) -> {}".format(
                     area, token, native, target_cell, method, _crs_label(sr), fn))
@@ -3587,7 +3598,9 @@ class VerifyOutputs(object):
             displayName="Expected products per area", name="expected_products",
             datatype="GPString", parameterType="Optional", direction="Input", multiValue=True)
         p_expected.filter.type = "ValueList"
-        p_expected.filter.list = list(PRODUCTS)
+        # CONT is a shapefile and APT is per mine in its own folder, so neither can be found by
+        # the per area .tif completeness check; offering them would always report missing.
+        p_expected.filter.list = [p for p in PRODUCTS if p not in ("CONT", "APT")]
         p_expected.value = ["SLOPE", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLARUNI"]
 
         p_epsg = arcpy.Parameter(
@@ -3657,6 +3670,7 @@ class VerifyOutputs(object):
                 else:
                     products_seen.add((info["area"], info["source"], info["product"]))
 
+        arcpy.ResetProgressor()
         missing = []
         for area, source in sorted(base_seen):
             for product in expected:
@@ -3701,10 +3715,11 @@ class SuitabilityMask(object):
         self.label = "09 - Suitability Mask"
         self.description = ("Binary suitability mask per mine: 1 where the slope is at or below "
                             "the threshold AND the annual solar radiation (SOLARUNI) is at or "
-                            "above the minimum, else 0, clipped to each mask polygon. Polygons "
-                            "sharing a name are treated as one mine. The output is one "
-                            "<Mine>_<SOURCE>_APT.tif per mine. Weighted overlay and exclusion "
-                            "masks remain outside this toolbox.")
+                            "above the minimum, else 0 (cells that are NoData in either input "
+                            "stay NoData), clipped to each mask polygon. Polygons sharing a name "
+                            "are treated as one mine. The output is one <Mine>_<SOURCE>_APT.tif "
+                            "per mine. Weighted overlay and exclusion masks remain outside this "
+                            "toolbox.")
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -3825,7 +3840,7 @@ class SuitabilityMask(object):
                               if os.path.isfile(os.path.join(in_folder, n))]
                 walker = [(in_folder, [], only_files)]
             for dirpath, dirs, files in walker:
-                dirs[:] = [d for d in dirs if d != RESAMPLE_DIRNAME]
+                dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
                 for fn in files:
                     if not fn.lower().endswith(".tif"):
                         continue
@@ -3833,9 +3848,17 @@ class SuitabilityMask(object):
                     if info["area"] is None or info["source"] != source or info["reclass"]:
                         continue
                     if info["product"] == "SLOPE":
-                        slope_by_area[info["area"]] = os.path.join(dirpath, fn)
+                        target = slope_by_area
                     elif info["product"] == "SOLARUNI":
-                        solar_by_area[info["area"]] = os.path.join(dirpath, fn)
+                        target = solar_by_area
+                    else:
+                        continue
+                    path = os.path.join(dirpath, fn)
+                    prev = target.get(info["area"])
+                    if prev and prev != path:
+                        _warn("Duplicate {} raster for area '{}': using {} over {}.".format(
+                            info["product"], info["area"], path, prev))
+                    target[info["area"]] = path
             areas = sorted(set(slope_by_area) & set(solar_by_area))
             if not areas:
                 msg = ("No area has both a {0} SLOPE and a {0} SOLARUNI raster under '{1}'. Run "
@@ -3847,15 +3870,28 @@ class SuitabilityMask(object):
                 _warn("Areas missing one of the two inputs (skipped for spatial matching): {}"
                       .format(", ".join(only_one)))
 
-            # Group the mask polygons by mine name (same-name polygons are one mine).
+            # Group the mask polygons by mine name (same-name polygons are one mine). Fail loud
+            # when two DIFFERENT names sanitize to the same output name: their polygons would
+            # silently merge into one mask and one mine would get no output.
             aoi_sr = arcpy.Describe(mask_layer).spatialReference
             mines = {}
+            raws_by_name = {}
             with arcpy.da.SearchCursor(mask_layer, [name_field, "SHAPE@"]) as cursor:
                 for raw, shape in cursor:
                     if shape is None or raw in (None, ""):
                         _warn("Feature with no geometry or empty name; skipped.")
                         continue
-                    mines.setdefault(sanitize_name(str(raw)), []).append(shape)
+                    name = sanitize_name(str(raw))
+                    raws_by_name.setdefault(name, set()).add(str(raw).strip())
+                    mines.setdefault(name, []).append(shape)
+            collisions = {n: r for n, r in raws_by_name.items() if len(r) > 1}
+            if collisions:
+                detail = "; ".join("'{}' <- {}".format(n, ", ".join(sorted(r)))
+                                   for n, r in sorted(collisions.items()))
+                msg = ("Different mine names sanitize to the same output name, so their polygons "
+                       "would merge into one mask: {}. Rename the mines.").format(detail)
+                _err(msg)
+                raise ValueError(msg)
             if not mines:
                 msg = "No usable mask polygons in '{}'.".format(mask_layer)
                 _err(msg)
@@ -3866,6 +3902,7 @@ class SuitabilityMask(object):
             created = 0
             skipped = 0
             failed = []
+            ext_cache = {}                 # area -> (extent, sr), Describe-d once per area
             arcpy.SetProgressor("step", "Building suitability masks...", 0, len(mines), 1)
             for mine, shapes in sorted(mines.items()):
                 arcpy.SetProgressorPosition()
@@ -3875,7 +3912,7 @@ class SuitabilityMask(object):
                     skipped += 1
                     continue
                 try:
-                    area = self._area_for_mine(mine, shapes, areas, slope_by_area, aoi_sr)
+                    area = self._area_for_mine(mine, shapes, areas, slope_by_area, aoi_sr, ext_cache)
                     if area is None:
                         raise ValueError("no SLOPE/SOLARUNI raster covers this mine")
                     self._mask_for_mine(mine, shapes, slope_by_area[area], solar_by_area[area],
@@ -3899,21 +3936,44 @@ class SuitabilityMask(object):
             raise RuntimeError(msg)
         return
 
-    def _area_for_mine(self, mine, shapes, areas, slope_by_area, aoi_sr):
+    def _area_for_mine(self, mine, shapes, areas, slope_by_area, aoi_sr, ext_cache):
         """Resolve which area raster covers a mine: by name first (the area named like the mine),
-        else by spatial matching (the raster whose extent contains the mine centroid)."""
-        if mine in areas:
-            return mine
-        for area in areas:
-            desc = arcpy.Describe(slope_by_area[area])
-            r_sr = desc.spatialReference
-            ext = desc.extent
+        else spatially (the raster whose extent contains the most polygon centroids). Extents are
+        Describe-d once per area, cached across mines. Warns when part of a multi polygon mine
+        falls outside the chosen raster extent, since those cells come out NoData."""
+        def _info(area):
+            if area not in ext_cache:
+                desc = arcpy.Describe(slope_by_area[area])
+                ext_cache[area] = (desc.extent, desc.spatialReference)
+            return ext_cache[area]
+
+        def _centroids_inside(area):
+            ext, r_sr = _info(area)
+            inside = 0
             for shape in shapes:
                 geom = shape if _same_crs(aoi_sr, r_sr) else shape.projectAs(r_sr)
                 c = geom.centroid
                 if ext.XMin <= c.X <= ext.XMax and ext.YMin <= c.Y <= ext.YMax:
-                    return area
-        return None
+                    inside += 1
+            return inside
+
+        chosen = None
+        if mine in areas:
+            chosen = mine
+        else:
+            best = 0
+            for area in areas:
+                n = _centroids_inside(area)
+                if n > best:
+                    best, chosen = n, area
+                    if n == len(shapes):
+                        break
+        if chosen is not None:
+            inside = _centroids_inside(chosen)
+            if inside < len(shapes):
+                _warn("{}: {} of {} polygon(s) fall outside raster '{}'; those cells will be "
+                      "NoData in the mask.".format(mine, len(shapes) - inside, len(shapes), chosen))
+        return chosen
 
     def _mask_for_mine(self, mine, shapes, slope_path, solar_path, thr_deg, solar_min,
                        aoi_sr, out_path):
