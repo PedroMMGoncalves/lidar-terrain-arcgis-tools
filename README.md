@@ -37,7 +37,7 @@ Each tool reads the previous tool's output folder and writes with one consistent
 
 ## Summary
 
-Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. Two more, Resample and Contours, are optional utilities you can run on the outputs:
+Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. Four more are utilities you can run on the outputs:
 
 1. **Download DGT Data**: download the LiDAR tiles from the DGT CDD portal, organized one folder per AOI feature (with a product subfolder each) or as a single flat folder, ready for the mosaic tool.
 2. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
@@ -46,6 +46,8 @@ Five tools form the pipeline, run in order, with the input and output folders al
 5. **Reclassify Factors**: fixed suitability classes for aspect, slope and annual solar (aspect yields two rasters, quadrants and solar suitability), written to a `Reclass` subfolder with a legend.
 6. **Resample** (optional): resample the named rasters to a coarser cell size, for example 2 m to 5 m, into a `Resample` folder grouped by area.
 7. **Contours** (optional): cartographic contour lines from the DEM or DSM mosaics, with a chosen equidistance and a master (index) interval, smoothed for high resolution LiDAR, into a `Contours` subfolder.
+8. **Verify Outputs**: read-only integrity check of a results tree; flags corrupt or unreadable rasters, a CRS other than the expected EPSG, and missing expected products per area, with an optional report file.
+9. **Suitability Mask**: binary mask per mine, 1 where the slope is at or below a threshold (degrees or percent) and the annual solar radiation is at or above a minimum, clipped to each mine polygon.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -81,16 +83,20 @@ flowchart TD
     S --> T4["Tool 5<br/>Reclassify Factors"]
     SOL --> T4
     T4 --> RCL["Reclass subfolder<br/>ASPECT_DIR, ASPECT_RCL,<br/>SLOPE_RCL, SOLARUNI_RCL<br/>(+ legenda)"]
+    S --> T9["Tool 9<br/>Suitability Mask"]
+    SOL --> T9
+    T9 --> APT["Per mine masks<br/>Mine_SOURCE_APT.tif (1/0)"]
     RCL --> EXT["Analysis<br/>(external to this toolbox)"]
     SOL --> EXT
+    APT --> EXT
 
     classDef tool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff;
     classDef opttool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff,stroke-dasharray:5 3;
     classDef data fill:#eaf2ff,stroke:#1f6feb,color:#0b2a5b;
     classDef ext fill:#f5f5f5,stroke:#999999,color:#333333,stroke-dasharray:4 3;
-    class TDL,T1,T2,T3,T4 tool;
+    class TDL,T1,T2,T3,T4,T9 tool;
     class T5,CT opttool;
-    class AOI,LID,M,S,SOL,RCL,RS,CL,CO data;
+    class AOI,LID,M,S,SOL,RCL,RS,CL,CO,APT data;
     class EXT ext;
 ```
 
@@ -102,6 +108,8 @@ flowchart TD
 - **Tool 5** reclassifies aspect, slope and the annual solar raster into fixed project suitability classes, in numpy with `[min, max)` semantics. Aspect yields two rasters: quadrants (`ASPECT_DIR`, N to NW plus flat) and solar suitability (`ASPECT_RCL`, south and flat best); slope and solar yield `SLOPE_RCL` and `SOLARUNI_RCL`. Each output, plus a legend (`RECLASS_legenda.txt`), goes to a `Reclass` subfolder next to the inputs.
 - **Tool 6** (optional) resamples the selected data types to a target cell size with core Resample, writing to a `Resample` folder grouped by area; continuous rasters use bilinear, reclassified (`_RCL`) rasters use nearest. Typical use is 2 m to 5 m to lighten the later steps.
 - **Tool 7** (optional) generates cartographic contour lines from the DEM or DSM mosaics: it smooths the surface (Focal mean, given in meters so it is resolution independent), contours at the chosen equidistance, smooths the lines (PAEK), flags the master (index) contours and drops the short noise rings, writing one polyline shapefile per area to a `Contours` subfolder. Needs Spatial Analyst.
+- **Tool 8** verifies a results tree without writing anything (except an optional report): every `.tif` must have a valid GeoTIFF signature, open in arcpy, and match the expected EPSG; every area with a base mosaic must have the expected products. The `Resample` tree is checked for integrity but not completeness.
+- **Tool 9** builds the final binary suitability mask per mine: `1` where slope <= the threshold (given in degrees or percent) AND `SOLARUNI` >= the minimum (default 1400 kWh/m2, the lower bound of solar class 3), else `0`, computed on the area raster that covers each mine (matched by name, else spatially) and clipped to the mine polygons (same-name polygons are one mine). Output `<Mine>_<SOURCE>_APT.tif`. The weighted overlay and the REN/RAN/PDM exclusions remain outside this toolbox.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent check.
 
 ---
@@ -109,10 +117,10 @@ flowchart TD
 ## Requirements
 
 - ArcGIS Pro **3.7**, Windows (arcpy is Windows only on ArcGIS Pro 3.x). Uses the Python bundled with ArcGIS Pro and numpy from that environment; no extra packages.
-- **Spatial Analyst** extension for Tool 3 (slope, aspect, curvature, traditional hillshade), Tool 4 (solar radiation), and Tool 7 (contours: Contour and Focal Statistics; Smooth Line is core). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
+- **Spatial Analyst** extension for Tool 3 (slope, aspect, curvature, traditional hillshade), Tool 4 (solar radiation), Tool 7 (contours: Contour and Focal Statistics; Smooth Line is core), and Tool 9 (suitability mask: Con and Extract By Mask). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
 - **Image Analyst** extension for Tool 3 only when the hillshade type is Multidirectional.
 - **Network access, a free CDD account, and the `requests` library** (bundled with ArcGIS Pro) for Tool 1 (Download DGT Data).
-- Tools 1, 2, 5 and 6 need no extension (download, mosaicking and resampling are core, and the reclassification is pure numpy).
+- Tools 1, 2, 5, 6 and 8 need no extension (download, mosaicking, resampling and the verification are core, and the reclassification is pure numpy).
 - Tiles in the project CRS, ETRS89 / PT-TM06 (EPSG:3763). The tools log the CRS and warn if it differs.
 
 ---
@@ -187,6 +195,7 @@ One DEM and one DSM mosaic per area, merging all of that area's download folders
 | Report clusters only | Dry-run for clustering: lists the clusters and member counts without building any mosaic. |
 | Folder to area mapping | `by name` (default; the download folder whose name equals the sanitized area name, the exact pairing for Tool 1 output), `by geometry` (maps each area to the folder whose tile extent is centered on it, for folders not named by the area), or `by FID number` (the folder named with the area FID, the old plugin layout). |
 | Clip mosaic to the AOI extent | Off by default. On bounds each area's mosaic to the AOI extent (the combined extent of the area's polygons, in the tile CRS) through the analysis extent, so the mosaic does not overshoot the boundary, an exact cut for a rectangular cartogram sheet. Fast, no separate clip pass. Per area output only, not the overlap clusters. |
+| Build pyramids and statistics | Off by default. On builds pyramids and statistics on each mosaic after writing (per area and clusters), so the large rasters display fast in ArcGIS Pro. Adds some time per mosaic. |
 
 With **overlap clustering** on, Tool 2 also groups areas whose AOI polygons are contiguous (touch or overlap) into one mosaic per cluster, in parallel to the per area output, which is unchanged. Every area belongs to exactly one cluster (a non overlapping area is its own one member cluster). Clusters go to a `clusters` subfolder, named `Cluster_NNN` by the smallest member FID, each with a `Cluster_NNN_members.txt` manifest listing the member areas (the ids renumber if the AOI is edited, so the manifest is the authority). Tiles shared between areas are deduplicated by name. Run the dry-run first to see the clusters before the heavy build.
 
@@ -288,6 +297,39 @@ Cartographic contour lines from the DEM (or DSM) mosaics, with a chosen equidist
 
 The two smoothing values are in meters and applied in map units, so the same numbers work for a 0.5 m or a 2 m mosaic. A good starting point for a 2 m DEM: interval 5 m, master 25 m, DEM smoothing 5 m, line smoothing 12 m, then adjust to taste. For 0.5 m the same smoothing in meters applies (a larger pixel window, slower); resampling to 2 m first is often the better route.
 
+### Tool 8, Verify Outputs
+
+Read-only integrity check of a results tree; nothing is modified. Useful after a long batch to answer "is everything there and valid?". No extension needed.
+
+| Parameter | Description |
+| --- | --- |
+| Results folder | The tree to verify (mosaics, surfaces, solar, reclass, resample). |
+| Recurse subfolders | On (default). |
+| Expected products per area | Which products every area with a base mosaic must have; default the six factor rasters. Tailor it to what you ran. |
+| Expected EPSG | Default 3763. Rasters in any other CRS are flagged. |
+| Write VERIFY_report.txt | On (default) writes the full lists to a report in the results folder; the log shows the first 20 of each. |
+
+Three checks: a valid GeoTIFF signature and arcpy can open the raster (corrupt or truncated files), the CRS matches the expected EPSG, and per (area, source) with a base mosaic all the expected products exist. The `Resample` tree is verified for integrity but not completeness, since it is a copy set. The tool succeeds even when problems are found (its job is the verification); the summary and report list them.
+
+### Tool 9, Suitability Mask
+
+The final binary mask per mine: `1` = suitable (gentle slope AND enough solar), `0` = not. Needs Spatial Analyst. The weighted overlay and the REN/RAN/PDM exclusions remain outside this toolbox.
+
+| Parameter | Description |
+| --- | --- |
+| Results folder | The tree with the `SLOPE` and `SOLARUNI` rasters (Tools 3 and 4 outputs; the `Resample` tree is not scanned, point at it directly to use resampled inputs). |
+| Recurse subfolders | On (default). |
+| Source | `DEM` (default) or `DSM`. |
+| Mask polygons (mines) | Polygon layer; polygons sharing a name are treated as one mine. |
+| Mine name field | Names each output (sanitized). |
+| Output folder | One `<Mine>_<SOURCE>_APT.tif` per mine. |
+| Slope threshold units | `degrees` (default) or `percent` (converted internally; 20 percent = 11.31 degrees). |
+| Maximum suitable slope | Default 20. Slope at or below it is suitable. |
+| Minimum suitable solar radiation | Default 1400 kWh/m2, the lower bound of solar class 3 (so classes 3 to 6 are suitable, 1 and 2 are not). |
+| Overwrite existing outputs | Off skips existing masks. |
+
+Each mine is matched to the area raster that covers it, by name first (an area named like the mine) and spatially otherwise (the raster whose extent contains the mine centroid), so it works on per area results and on cluster results. The computation is bounded to the mine polygons (snapped to the slope grid) and clipped to their shape with Extract By Mask.
+
 ---
 
 ## Naming convention
@@ -298,6 +340,8 @@ A single convention links the tools:
 - Surface: `{Area}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE` (degrees), `SLOPEP` (percent), `ASPECT`, `HILLSHADE`, `PROFC` or `PLANC`.
 - Solar: `{Area}_{SOURCE}_SOLARUNI` or `_SOLAROVC` (global, by diffuse model), with `_SOLARUNIDIR` / `_SOLARUNIDIF` / `_SOLARUNIDUR` (and the `_SOLAROVC` equivalents) for the optional direct, diffuse and duration rasters.
 - Reclassified (Tool 5): the suitability rasters go to a `Reclass` subfolder. The surface name plus `_RCL` (`SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`), and the aspect quadrants as `{Area}_{SOURCE}_ASPECT_DIR`.
+- Contours (Tool 7): `{Area}_{SOURCE}_CONT.shp` in a `Contours` subfolder, with `Contour` (elevation) and `master` (1/0) fields.
+- Suitability mask (Tool 9): `{Mine}_{SOURCE}_APT.tif` (1 = suitable, 0 = not), one per mine.
 - Cluster: `Cluster_NNN_{SOURCE}` (overlap clustering), numbered by the smallest member FID; a `Cluster_NNN_members.txt` lists the member areas.
 
 The `.tif` extension is added on write. Area names are sanitized for ArcGIS and the file system (accents and c cedilla folded to ASCII, separators to underscore). If two different areas sanitize to the same name they get a numeric suffix; several AOI polygons of the **same** area are merged into one output.

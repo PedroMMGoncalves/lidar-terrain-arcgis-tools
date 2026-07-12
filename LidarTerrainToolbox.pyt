@@ -71,7 +71,7 @@ PROJECT_EPSG = 3763                                  # ETRS89 / PT-TM06, meters
 SOURCES = ("DEM", "DSM")
 PRODUCTS = ("SLOPE", "SLOPEP", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLAR",
             "SOLARUNI", "SOLAROVC", "SOLARUNIDIR", "SOLARUNIDIF", "SOLARUNIDUR",
-            "SOLAROVCDIR", "SOLAROVCDIF", "SOLAROVCDUR", "CONT")
+            "SOLAROVCDIR", "SOLAROVCDIF", "SOLAROVCDUR", "CONT", "APT")
 RECLASS_SUFFIX = "RCL"
 MAX_NAME_LEN = 40                                    # margin for suffixes like _DEM_ASPECT_RCL
 RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
@@ -179,6 +179,16 @@ class _CleanupOnError(object):
                 if path:
                     _delete_partial_raster(path)
         return False
+
+
+def _build_pyramids_stats(path):
+    """Build pyramids and statistics on a written raster so it displays fast in Pro. Best effort:
+    a failure here does not invalidate the raster itself, so it warns instead of raising."""
+    try:
+        arcpy.management.BuildPyramids(path, skip_existing="SKIP_EXISTING")
+        arcpy.management.CalculateStatistics(path, skip_existing="SKIP_EXISTING")
+    except Exception as exc:
+        _warn("Could not build pyramids/statistics for {}: {}".format(os.path.basename(path), exc))
 
 
 def _save_raster(raster, out_path):
@@ -570,16 +580,17 @@ class Toolbox(object):
         # Tool labels are numbered so they sort in pipeline order at the toolbox root
         # (no toolset categories): 01 Download DGT Data, 02 Build Mosaics by Polygon,
         # 03 Generate Surfaces, 04 Solar Radiation, 05 Reclassify Factors, 06 Resample,
-        # 07 Contours (optional cartographic output).
+        # 07 Contours (optional cartographic output), 08 Verify Outputs (read-only check),
+        # 09 Suitability Mask (binary slope x solar mask per mine).
         self.tools = [DownloadDGTData, BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation,
-                      ReclassifyFactor, Resample, Contours]
+                      ReclassifyFactor, Resample, Contours, VerifyOutputs, SuitabilityMask]
 
 
 # ===========================================================================
 # Tools
 # ===========================================================================
 #   01 DownloadDGTData, 02 BuildMosaicsByPolygon, 03 DeriveSurfaces, 04 SolarRadiation,
-#   05 ReclassifyFactor, 06 Resample, 07 Contours.
+#   05 ReclassifyFactor, 06 Resample, 07 Contours, 08 VerifyOutputs, 09 SuitabilityMask.
 #   SolarRadiation uses arcpy.sa.RasterSolarRadiation (GPU); ReclassifyFactor imports numpy lazily.
 
 
@@ -1654,9 +1665,14 @@ class BuildMosaicsByPolygon(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_clip.value = False
 
+        p_pyramids = arcpy.Parameter(
+            displayName="Build pyramids and statistics", name="build_pyramids",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_pyramids.value = False
+
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
                 p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res,
-                p_clusters, p_dry_run, p_mapping, p_clip]
+                p_clusters, p_dry_run, p_mapping, p_clip, p_pyramids]
 
     def isLicensed(self):
         # Uses core Mosaic To New Raster, no Spatial Analyst needed.
@@ -1672,7 +1688,7 @@ class BuildMosaicsByPolygon(object):
 
     def _build_clusters(self, groups, fid_to_geom, fid_to_folder, products,
                         out_folder, pixel_type, mosaic_method, tile_resolution,
-                        skip_incomplete, overwrite_existing, dry_run):
+                        skip_incomplete, overwrite_existing, dry_run, build_pyramids=False):
         """Aggregate areas whose AOI polygons are contiguous (touch or overlap) into one
         mosaic per cluster, in parallel to the per area output.
 
@@ -1777,6 +1793,8 @@ class BuildMosaicsByPolygon(object):
                         number_of_bands=1,
                         mosaic_method=mosaic_method,
                     )
+                if build_pyramids:
+                    _build_pyramids_stats(out_path)
                 size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
                 _msg("{} ({}): mosaicked {} tiles ({}) from {} member area(s) -> {}".format(
                     cluster_id, source, len(tiles), size_label, len(member_areas), out_name))
@@ -1943,6 +1961,7 @@ class BuildMosaicsByPolygon(object):
         cluster_dry_run = bool(parameters[14].value)
         mapping_mode = parameters[15].valueAsText
         clip_to_aoi = bool(parameters[16].value)
+        build_pyramids = bool(parameters[17].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -2146,6 +2165,8 @@ class BuildMosaicsByPolygon(object):
                         )
                 finally:
                     arcpy.env.extent = prev_extent
+                if build_pyramids:
+                    _build_pyramids_stats(out_path)
                 size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
                 clip_note = ", clipped to the AOI extent" if clip_extent is not None else ""
                 _msg("Area '{}' ({}): mosaicked {} tiles ({}) from {} folder(s){} -> {}".format(
@@ -2176,7 +2197,7 @@ class BuildMosaicsByPolygon(object):
             self._build_clusters(
                 groups, fid_to_geom, fid_to_folder, products, out_folder, pixel_type,
                 mosaic_method, tile_resolution, skip_incomplete, overwrite_existing,
-                cluster_dry_run)
+                cluster_dry_run, build_pyramids)
         return
 
 
@@ -3542,6 +3563,391 @@ class Resample(object):
         return
 
 
+class VerifyOutputs(object):
+    def __init__(self):
+        self.label = "08 - Verify Outputs"
+        self.description = ("Read-only integrity check of a results tree. Verifies every .tif "
+                            "(GeoTIFF signature, opens in arcpy, CRS matches the expected EPSG) "
+                            "and, per area with a base mosaic, that the expected products exist. "
+                            "The Resample tree is checked for integrity but not for completeness "
+                            "(it is a copy set). Nothing is written except an optional report.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Results folder", name="results_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_expected = arcpy.Parameter(
+            displayName="Expected products per area", name="expected_products",
+            datatype="GPString", parameterType="Optional", direction="Input", multiValue=True)
+        p_expected.filter.type = "ValueList"
+        p_expected.filter.list = list(PRODUCTS)
+        p_expected.value = ["SLOPE", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLARUNI"]
+
+        p_epsg = arcpy.Parameter(
+            displayName="Expected EPSG", name="expected_epsg",
+            datatype="GPLong", parameterType="Required", direction="Input")
+        p_epsg.value = PROJECT_EPSG
+
+        p_report = arcpy.Parameter(
+            displayName="Write VERIFY_report.txt in the results folder", name="write_report",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_report.value = True
+
+        return [p_in, p_recurse, p_expected, p_epsg, p_report]
+
+    def isLicensed(self):
+        return True                        # read-only, no extension needed
+
+    def execute(self, parameters, messages):
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        expected = list(parameters[2].values) if parameters[2].values else []
+        expected_epsg = int(parameters[3].value)
+        write_report = bool(parameters[4].value)
+
+        if recurse:
+            walker = os.walk(in_folder)
+        else:
+            only_files = [n for n in os.listdir(in_folder)
+                          if os.path.isfile(os.path.join(in_folder, n))]
+            walker = [(in_folder, [], only_files)]
+
+        rasters = []                       # (path, info dict, under_resample)
+        for dirpath, _dirs, files in walker:
+            parts = os.path.normpath(os.path.relpath(dirpath, in_folder)).split(os.sep)
+            under_resample = RESAMPLE_DIRNAME in parts
+            for fn in files:
+                if fn.lower().endswith(".tif"):
+                    rasters.append((os.path.join(dirpath, fn), parse_source_and_product(fn),
+                                    under_resample))
+        if not rasters:
+            msg = "No .tif rasters found in '{}'.".format(in_folder)
+            _err(msg)
+            raise ValueError(msg)
+
+        corrupt = []
+        wrong_crs = []
+        base_seen = set()                  # (area, source) with a base mosaic, main tree only
+        products_seen = set()              # (area, source, product) in the main tree
+        arcpy.SetProgressor("step", "Verifying rasters...", 0, len(rasters), 1)
+        for path, info, under_resample in rasters:
+            arcpy.SetProgressorPosition()
+            rel = os.path.relpath(path, in_folder)
+            if not _file_looks_valid(path):
+                corrupt.append(rel + " (not a valid GeoTIFF signature)")
+                continue
+            try:
+                sr = arcpy.Describe(path).spatialReference
+            except Exception as exc:
+                corrupt.append("{} (arcpy cannot open it: {})".format(rel, exc))
+                continue
+            code = getattr(sr, "factoryCode", 0) if sr is not None else 0
+            if code != expected_epsg:
+                wrong_crs.append("{} ({})".format(rel, _crs_label(sr)))
+            if not under_resample and info["area"] and info["source"] and not info["reclass"]:
+                if info["product"] is None:
+                    base_seen.add((info["area"], info["source"]))
+                else:
+                    products_seen.add((info["area"], info["source"], info["product"]))
+
+        missing = []
+        for area, source in sorted(base_seen):
+            for product in expected:
+                if (area, source, product) not in products_seen:
+                    missing.append("{} ({}): {}".format(area, source, product))
+
+        _msg("Verified {} raster(s). Areas with a base mosaic: {}.".format(
+            len(rasters), len(base_seen)))
+        for label, items in (("Corrupt or unreadable", corrupt),
+                             ("CRS differs from EPSG:{}".format(expected_epsg), wrong_crs),
+                             ("Missing expected products", missing)):
+            if items:
+                _warn("{}: {}".format(label, len(items)))
+                for item in items[:20]:
+                    _warn("  " + item)
+                if len(items) > 20:
+                    _warn("  ... and {} more (see the report).".format(len(items) - 20))
+        if not (corrupt or wrong_crs or missing):
+            _msg("No problems found.")
+
+        if write_report:
+            report = os.path.join(in_folder, "VERIFY_report.txt")
+            with open(report, "w", encoding="utf-8") as fh:
+                fh.write("Verify Outputs report\n")
+                fh.write("Folder: {}\n".format(in_folder))
+                fh.write("Rasters checked: {}\n".format(len(rasters)))
+                fh.write("Areas with a base mosaic: {}\n".format(len(base_seen)))
+                fh.write("Expected products: {}\n\n".format(", ".join(expected) or "(none)"))
+                for label, items in (("Corrupt or unreadable", corrupt),
+                                     ("CRS differs from EPSG:{}".format(expected_epsg), wrong_crs),
+                                     ("Missing expected products", missing)):
+                    fh.write("{}: {}\n".format(label, len(items)))
+                    for item in items:
+                        fh.write("  {}\n".format(item))
+                    fh.write("\n")
+            _msg("Report written to {}".format(report))
+        return
+
+
+class SuitabilityMask(object):
+    def __init__(self):
+        self.label = "09 - Suitability Mask"
+        self.description = ("Binary suitability mask per mine: 1 where the slope is at or below "
+                            "the threshold AND the annual solar radiation (SOLARUNI) is at or "
+                            "above the minimum, else 0, clipped to each mask polygon. Polygons "
+                            "sharing a name are treated as one mine. The output is one "
+                            "<Mine>_<SOURCE>_APT.tif per mine. Weighted overlay and exclusion "
+                            "masks remain outside this toolbox.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Results folder (with SLOPE and SOLARUNI rasters)", name="results_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_source = arcpy.Parameter(
+            displayName="Source", name="source_filter",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_source.filter.type = "ValueList"
+        p_source.filter.list = ["DEM", "DSM"]
+        p_source.value = "DEM"
+
+        p_mask = arcpy.Parameter(
+            displayName="Mask polygons (mines)", name="mask_layer",
+            datatype="GPFeatureLayer", parameterType="Required", direction="Input")
+        p_mask.filter.list = ["Polygon"]
+
+        p_field = arcpy.Parameter(
+            displayName="Mine name field", name="name_field",
+            datatype="Field", parameterType="Required", direction="Input")
+        p_field.parameterDependencies = ["mask_layer"]
+        p_field.filter.list = ["Text", "Short", "Long"]
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder", name="out_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_units = arcpy.Parameter(
+            displayName="Slope threshold units", name="slope_units",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_units.filter.type = "ValueList"
+        p_units.filter.list = ["degrees", "percent"]
+        p_units.value = "degrees"
+
+        p_slope = arcpy.Parameter(
+            displayName="Maximum suitable slope", name="slope_max",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_slope.value = 20
+
+        p_solar = arcpy.Parameter(
+            displayName="Minimum suitable solar radiation (kWh/m2)", name="solar_min",
+            datatype="GPDouble", parameterType="Required", direction="Input")
+        p_solar.value = 1400                   # the lower bound of SOLARUNI class 3
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_in, p_recurse, p_source, p_mask, p_field, p_out,
+                p_units, p_slope, p_solar, p_overwrite]
+
+    def isLicensed(self):
+        # Con and ExtractByMask need Spatial Analyst.
+        try:
+            return arcpy.CheckExtension("Spatial") == "Available"
+        except Exception:
+            return False
+
+    def updateMessages(self, parameters):
+        if parameters[7].value is not None and float(parameters[7].value) <= 0:
+            parameters[7].setErrorMessage("The slope threshold must be greater than 0.")
+        return
+
+    def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        prev_extent = arcpy.env.extent
+        prev_snap = arcpy.env.snapRaster
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+            arcpy.env.extent = prev_extent
+            arcpy.env.snapRaster = prev_snap
+
+    def _run(self, parameters, messages):
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        source = parameters[2].valueAsText
+        mask_layer = parameters[3].valueAsText
+        name_field = parameters[4].valueAsText
+        out_folder = parameters[5].valueAsText
+        slope_units = parameters[6].valueAsText
+        slope_max = float(parameters[7].value)
+        solar_min = float(parameters[8].value)
+        overwrite_existing = bool(parameters[9].value)
+
+        arcpy.env.overwriteOutput = overwrite_existing
+        if slope_units == "percent":
+            thr_deg = math.degrees(math.atan(slope_max / 100.0))
+            _msg("Slope threshold: {:g} percent = {:.2f} degrees.".format(slope_max, thr_deg))
+        else:
+            thr_deg = slope_max
+            _msg("Slope threshold: {:g} degrees.".format(thr_deg))
+        _msg("Solar minimum: {:g} kWh/m2 (SOLARUNI).".format(solar_min))
+
+        if arcpy.CheckExtension("Spatial") != "Available":
+            msg = "Spatial Analyst extension is not available. It is required for this tool."
+            _err(msg)
+            raise RuntimeError(msg)
+        arcpy.CheckOutExtension("Spatial")
+        try:
+            # Discover the SLOPE and SOLARUNI rasters per area (main tree, not Resample copies).
+            slope_by_area = {}
+            solar_by_area = {}
+            if recurse:
+                walker = os.walk(in_folder)
+            else:
+                only_files = [n for n in os.listdir(in_folder)
+                              if os.path.isfile(os.path.join(in_folder, n))]
+                walker = [(in_folder, [], only_files)]
+            for dirpath, dirs, files in walker:
+                dirs[:] = [d for d in dirs if d != RESAMPLE_DIRNAME]
+                for fn in files:
+                    if not fn.lower().endswith(".tif"):
+                        continue
+                    info = parse_source_and_product(fn)
+                    if info["area"] is None or info["source"] != source or info["reclass"]:
+                        continue
+                    if info["product"] == "SLOPE":
+                        slope_by_area[info["area"]] = os.path.join(dirpath, fn)
+                    elif info["product"] == "SOLARUNI":
+                        solar_by_area[info["area"]] = os.path.join(dirpath, fn)
+            areas = sorted(set(slope_by_area) & set(solar_by_area))
+            if not areas:
+                msg = ("No area has both a {0} SLOPE and a {0} SOLARUNI raster under '{1}'. Run "
+                       "Tools 3 and 4 first.").format(source, in_folder)
+                _err(msg)
+                raise ValueError(msg)
+            only_one = sorted((set(slope_by_area) ^ set(solar_by_area)))
+            if only_one:
+                _warn("Areas missing one of the two inputs (skipped for spatial matching): {}"
+                      .format(", ".join(only_one)))
+
+            # Group the mask polygons by mine name (same-name polygons are one mine).
+            aoi_sr = arcpy.Describe(mask_layer).spatialReference
+            mines = {}
+            with arcpy.da.SearchCursor(mask_layer, [name_field, "SHAPE@"]) as cursor:
+                for raw, shape in cursor:
+                    if shape is None or raw in (None, ""):
+                        _warn("Feature with no geometry or empty name; skipped.")
+                        continue
+                    mines.setdefault(sanitize_name(str(raw)), []).append(shape)
+            if not mines:
+                msg = "No usable mask polygons in '{}'.".format(mask_layer)
+                _err(msg)
+                raise ValueError(msg)
+            if not os.path.isdir(out_folder):
+                os.makedirs(out_folder)
+
+            created = 0
+            skipped = 0
+            failed = []
+            arcpy.SetProgressor("step", "Building suitability masks...", 0, len(mines), 1)
+            for mine, shapes in sorted(mines.items()):
+                arcpy.SetProgressorPosition()
+                out_path = os.path.join(out_folder, build_output_name(mine, source, "APT") + ".tif")
+                if os.path.exists(out_path) and not overwrite_existing:
+                    _msg("{}: exists, skipping.".format(mine))
+                    skipped += 1
+                    continue
+                try:
+                    area = self._area_for_mine(mine, shapes, areas, slope_by_area, aoi_sr)
+                    if area is None:
+                        raise ValueError("no SLOPE/SOLARUNI raster covers this mine")
+                    self._mask_for_mine(mine, shapes, slope_by_area[area], solar_by_area[area],
+                                        thr_deg, solar_min, aoi_sr, out_path)
+                    _msg("{}: mask from '{}' (slope <= {:.2f} deg AND solar >= {:g}) -> {}".format(
+                        mine, area, thr_deg, solar_min, os.path.basename(out_path)))
+                    created += 1
+                except Exception as exc:
+                    _warn("{}: failed: {}".format(mine, exc))
+                    failed.append(mine)
+
+            arcpy.ResetProgressor()
+            _msg("Done. Mines: {}. Masks created: {}. Skipped existing: {}. Failed: {}.".format(
+                len(mines), created, skipped, len(failed)))
+        finally:
+            arcpy.CheckInExtension("Spatial")
+        # Fail loud: if any mine failed, the tool result must be a failure, not SUCCESS.
+        if failed:
+            msg = "Suitability mask failed for: " + ", ".join(failed)
+            _err(msg)
+            raise RuntimeError(msg)
+        return
+
+    def _area_for_mine(self, mine, shapes, areas, slope_by_area, aoi_sr):
+        """Resolve which area raster covers a mine: by name first (the area named like the mine),
+        else by spatial matching (the raster whose extent contains the mine centroid)."""
+        if mine in areas:
+            return mine
+        for area in areas:
+            desc = arcpy.Describe(slope_by_area[area])
+            r_sr = desc.spatialReference
+            ext = desc.extent
+            for shape in shapes:
+                geom = shape if _same_crs(aoi_sr, r_sr) else shape.projectAs(r_sr)
+                c = geom.centroid
+                if ext.XMin <= c.X <= ext.XMax and ext.YMin <= c.Y <= ext.YMax:
+                    return area
+        return None
+
+    def _mask_for_mine(self, mine, shapes, slope_path, solar_path, thr_deg, solar_min,
+                       aoi_sr, out_path):
+        """Compute the binary mask over the mine polygons and write out_path. The analysis extent
+        is bounded to the polygons so only that window is computed, snapped to the slope grid."""
+        r_sr = arcpy.Describe(slope_path).spatialReference
+        if not _same_crs(r_sr, arcpy.Describe(solar_path).spatialReference):
+            raise ValueError("SLOPE and SOLARUNI rasters have different CRS")
+        geoms = [s if _same_crs(aoi_sr, r_sr) else s.projectAs(r_sr) for s in shapes]
+
+        union = geoms[0]
+        for g in geoms[1:]:
+            union = union.union(g)
+        mask_fc = "in_memory/_apt_mask"
+        if arcpy.Exists(mask_fc):
+            arcpy.management.Delete(mask_fc)
+        arcpy.management.CopyFeatures([union], mask_fc)
+
+        prev_extent = arcpy.env.extent
+        prev_snap = arcpy.env.snapRaster
+        try:
+            arcpy.env.snapRaster = slope_path
+            arcpy.env.extent = union.extent
+            slope_r = arcpy.sa.Raster(slope_path)
+            solar_r = arcpy.sa.Raster(solar_path)
+            apt = arcpy.sa.Con((slope_r <= thr_deg) & (solar_r >= solar_min), 1, 0)
+            _save_raster(arcpy.sa.ExtractByMask(apt, mask_fc), out_path)
+        finally:
+            arcpy.env.extent = prev_extent
+            arcpy.env.snapRaster = prev_snap
+            if arcpy.Exists(mask_fc):
+                arcpy.management.Delete(mask_fc)
+
+
 # ===========================================================================
 # Self tests (pure functions; numpy tests run only if numpy is importable).
 # Run: python LidarTerrainToolbox.pyt
@@ -3592,6 +3998,7 @@ def _run_self_tests():
         ("AreaA", "DEM", "SOLARUNI", False),         # solar, uniform sky model
         ("AreaA", "DSM", "SOLAROVCDIR", False),      # solar, overcast model, direct aux
         ("AreaA", "DEM", "CONT", False),             # contour lines (Tool 7)
+        ("Covas", "DEM", "APT", False),              # suitability mask (Tool 9)
     ]
     for area, source, product, reclass in cases:
         name = build_output_name(area, source, product, reclass)
