@@ -71,7 +71,7 @@ PROJECT_EPSG = 3763                                  # ETRS89 / PT-TM06, meters
 SOURCES = ("DEM", "DSM")
 PRODUCTS = ("SLOPE", "SLOPEP", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLAR",
             "SOLARUNI", "SOLAROVC", "SOLARUNIDIR", "SOLARUNIDIF", "SOLARUNIDUR",
-            "SOLAROVCDIR", "SOLAROVCDIF", "SOLAROVCDUR")
+            "SOLAROVCDIR", "SOLAROVCDIF", "SOLAROVCDUR", "CONT")
 RECLASS_SUFFIX = "RCL"
 MAX_NAME_LEN = 40                                    # margin for suffixes like _DEM_ASPECT_RCL
 RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
@@ -194,6 +194,8 @@ def _save_raster(raster, out_path):
         except Exception:
             if attempt == 2:
                 raise
+            import gc
+            gc.collect()          # long batches can exhaust handles/memory; reclaim before retrying
             time.sleep(2)
 
 
@@ -576,7 +578,8 @@ class Toolbox(object):
 # ===========================================================================
 # Tools
 # ===========================================================================
-#   01 BuildMosaicsByPolygon, 02 DeriveSurfaces, 03 SolarRadiation, 04 ReclassifyFactor.
+#   01 DownloadDGTData, 02 BuildMosaicsByPolygon, 03 DeriveSurfaces, 04 SolarRadiation,
+#   05 ReclassifyFactor, 06 Resample, 07 Contours.
 #   SolarRadiation uses arcpy.sa.RasterSolarRadiation (GPU); ReclassifyFactor imports numpy lazily.
 
 
@@ -1288,12 +1291,15 @@ class DownloadDGTData(object):
                 try:
                     with session.get(url, stream=True, timeout=120) as r:
                         if r.status_code in (401, 403):
-                            # Lost authorization or a forbidden token; re-auth once, then let the
-                            # next candidate URL (or the next cycle) try.
+                            # Lost authorization or a forbidden token; re-auth once per tile
+                            # (attempted at most once, even if it fails, so a dead auth service
+                            # is not hammered for every URL and cycle), then let the next
+                            # candidate URL (or the next cycle) try.
                             throttled = throttled or r.status_code == 403
                             last_reason = "HTTP {}".format(r.status_code)
-                            if not reauthed and self._reauthenticate(session):
+                            if not reauthed:
                                 reauthed = True
+                                self._reauthenticate(session)
                             continue
                         r.raise_for_status()
                         ctype = (r.headers.get("Content-Type") or "").lower()
@@ -1301,8 +1307,9 @@ class DownloadDGTData(object):
                         head = next(stream, b"")
                         if "text/html" in ctype or not _looks_like_asset(head):
                             last_reason = "not a tile (login page or unexpected content)"
-                            if not reauthed and self._reauthenticate(session):
+                            if not reauthed:
                                 reauthed = True
+                                self._reauthenticate(session)
                             continue
                         with open(tmp, "wb") as fh:
                             fh.write(head)
@@ -1391,7 +1398,10 @@ class DownloadDGTData(object):
             tifs = [os.path.join(sub, f) for f in sorted(os.listdir(sub))
                     if f.lower().endswith(".tif")]
             if tifs:
-                gdal.BuildVRT(os.path.join(folder, entry + ".vrt"), tifs)
+                vrt_path = os.path.join(folder, entry + ".vrt")
+                # gdal returns None on failure instead of raising; surface it.
+                if gdal.BuildVRT(vrt_path, tifs) is None:
+                    _warn("Could not build the VRT {}.".format(os.path.basename(vrt_path)))
 
     def execute(self, parameters, messages):
         import time
@@ -1791,6 +1801,21 @@ class BuildMosaicsByPolygon(object):
         This is the exact pairing for folders produced by Tool 1 (Download DGT Data), which names
         each folder by the area name field; no geometry or FID number is involved, and folders not
         downloaded yet are simply absent (their areas are skipped, to be built on a later re-run)."""
+        # Fail loud when two DIFFERENT area values sanitize to the same folder name (for example
+        # "Sao Joao" and "S. Joao"): both would silently read the same folder and one area's
+        # mosaic would be built from the other's tiles.
+        claimed = {}
+        for raw in set(str(r) for r in fid_to_area.values()):
+            claimed.setdefault(sanitize_name(raw), set()).add(raw)
+        collisions = {s: raws for s, raws in claimed.items() if len(raws) > 1}
+        if collisions:
+            detail = "; ".join("'{}' <- {}".format(s, ", ".join(sorted(raws)))
+                               for s, raws in sorted(collisions.items()))
+            msg = ("Different area names sanitize to the same folder name, so the by name mapping "
+                   "is ambiguous: {}. Rename the areas, or use the by geometry mapping.").format(detail)
+            _err(msg)
+            raise ValueError(msg)
+
         by_name = {name: full for name, full in data_folders}
         fid_to_folder = {}
         for fid, raw in fid_to_area.items():
@@ -1893,6 +1918,14 @@ class BuildMosaicsByPolygon(object):
         return fid_to_folder
 
     def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+
+    def _run(self, parameters, messages):
         in_aoi = parameters[0].valueAsText
         area_field = parameters[1].valueAsText
         lidar_root = parameters[2].valueAsText
@@ -2286,6 +2319,14 @@ class DeriveSurfaces(object):
         return
 
     def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+
+    def _run(self, parameters, messages):
         in_folder = parameters[0].valueAsText
         recurse = bool(parameters[1].value)
         out_folder = parameters[2].valueAsText
@@ -2355,7 +2396,10 @@ class DeriveSurfaces(object):
                 only_files = [n for n in os.listdir(in_folder)
                               if os.path.isfile(os.path.join(in_folder, n))]
                 walker = [(in_folder, [], only_files)]
-            for dirpath, _dirs, files in walker:
+            for dirpath, dirs, files in walker:
+                # Do not descend into the Resample tree: it holds same-named copies of the base
+                # mosaics at another cell size, which would be processed a second time.
+                dirs[:] = [d for d in dirs if d != RESAMPLE_DIRNAME]
                 for fn in files:
                     if not fn.lower().endswith(".tif"):
                         continue
@@ -2387,17 +2431,27 @@ class DeriveSurfaces(object):
                           "(check the output is not locked by an open map or another process)."
                           .format(area, source, exc))
                     failed.append("{} ({})".format(area, source))
+                    # A long run can exhaust process memory or handles (seen as ERROR 010240 on
+                    # every save from some point on, typically the ia.Hillshade). Reclaim what we
+                    # can and keep going; the summary tells the user to restart Pro if it persists.
+                    import gc
+                    gc.collect()
 
             arcpy.ResetProgressor()
             _msg("Done. Mosaics processed: {}. Surfaces created: {}. Failed: {}.".format(
                 total, created, len(failed)))
-            if failed:
-                _warn("Surfaces failed for {} mosaic(s); re-run to retry: {}".format(
-                    len(failed), ", ".join(failed)))
         finally:
             arcpy.CheckInExtension("Spatial")
             if ia_checked_out:
                 arcpy.CheckInExtension("ImageAnalyst")
+        # Fail loud: if any mosaic failed, the tool result must be a failure, not SUCCESS.
+        if failed:
+            msg = ("Surfaces failed for {} mosaic(s): {}. Re-run with overwrite off to retry just "
+                   "these. If many areas fail in a row late in a long run (ERROR 010240 on save), "
+                   "restart ArcGIS Pro first to free process memory, and check the free space on "
+                   "the scratch drive.").format(len(failed), ", ".join(failed))
+            _err(msg)
+            raise RuntimeError(msg)
         return
 
     def _surfaces_for_mosaic(self, path, area, source, out_folder, output_structure, wanted,
@@ -2569,6 +2623,14 @@ class Contours(object):
         return
 
     def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+
+    def _run(self, parameters, messages):
         in_folder = parameters[0].valueAsText
         recurse = bool(parameters[1].value)
         out_folder = parameters[2].valueAsText
@@ -2609,7 +2671,9 @@ class Contours(object):
                 only_files = [n for n in os.listdir(in_folder)
                               if os.path.isfile(os.path.join(in_folder, n))]
                 walker = [(in_folder, [], only_files)]
-            for dirpath, _dirs, files in walker:
+            for dirpath, dirs, files in walker:
+                # Skip our own Contours output and the Resample tree (same-named mosaic copies).
+                dirs[:] = [d for d in dirs if d != RESAMPLE_DIRNAME]
                 if os.path.basename(dirpath) == CONTOURS_DIRNAME:
                     continue
                 for fn in files:
@@ -2673,7 +2737,8 @@ class Contours(object):
                       smooth_dem_m, smooth_line_m, min_length_m):
         """Smooth the surface (Focal MEAN in map units, so it is resolution aware), contour, smooth
         the lines (PAEK, meters), flag the master contours and drop the short ones, then write
-        out_shp. Returns the contour feature count."""
+        out_shp. Returns the contour feature count. On failure the partial out_shp is deleted, so a
+        re-run does not skip a truncated layer, and the scratch temps are removed either way."""
         scratch = arcpy.env.scratchGDB
         tmp_lines = os.path.join(scratch, "cont_lines")
         tmp_smooth = os.path.join(scratch, "cont_smooth")
@@ -2681,39 +2746,52 @@ class Contours(object):
             if arcpy.Exists(tmp):
                 arcpy.management.Delete(tmp)
 
-        surface = dem_path
-        if smooth_dem_m and smooth_dem_m > 0:
-            # NbrCircle in MAP units keeps the smoothing scale in meters at any cell size.
-            surface = arcpy.sa.FocalStatistics(
-                dem_path, arcpy.sa.NbrCircle(smooth_dem_m, "MAP"), "MEAN")
+        try:
+            surface = dem_path
+            if smooth_dem_m and smooth_dem_m > 0:
+                # NbrCircle in MAP units keeps the smoothing scale in meters at any cell size.
+                surface = arcpy.sa.FocalStatistics(
+                    dem_path, arcpy.sa.NbrCircle(smooth_dem_m, "MAP"), "MEAN")
 
-        arcpy.sa.Contour(surface, tmp_lines, interval, base, z_factor)
+            arcpy.sa.Contour(surface, tmp_lines, interval, base, z_factor)
 
-        result = tmp_lines
-        if smooth_line_m and smooth_line_m > 0:
-            arcpy.cartography.SmoothLine(tmp_lines, tmp_smooth, "PAEK",
-                                         "{} Meters".format(smooth_line_m))
-            result = tmp_smooth
+            result = tmp_lines
+            if smooth_line_m and smooth_line_m > 0:
+                arcpy.cartography.SmoothLine(tmp_lines, tmp_smooth, "PAEK",
+                                             "{} Meters".format(smooth_line_m))
+                result = tmp_smooth
 
-        if min_length_m and min_length_m > 0:
-            with arcpy.da.UpdateCursor(result, ["SHAPE@LENGTH"]) as cur:
-                for (length,) in cur:
-                    if length is not None and length < min_length_m:
-                        cur.deleteRow()
+            if min_length_m and min_length_m > 0:
+                with arcpy.da.UpdateCursor(result, ["SHAPE@LENGTH"]) as cur:
+                    for (length,) in cur:
+                        if length is not None and length < min_length_m:
+                            cur.deleteRow()
 
-        if index_interval and index_interval > 0:
-            arcpy.management.AddField(result, "master", "SHORT")
-            with arcpy.da.UpdateCursor(result, ["Contour", "master"]) as cur:
-                for value, _m in cur:
-                    ratio = (value / index_interval) if value is not None else 0.0
-                    cur.updateRow((value, 1 if abs(ratio - round(ratio)) < 1e-6 else 0))
+            if index_interval and index_interval > 0:
+                arcpy.management.AddField(result, "master", "SHORT")
+                with arcpy.da.UpdateCursor(result, ["Contour", "master"]) as cur:
+                    for value, _m in cur:
+                        if value is None:
+                            cur.updateRow((value, 0))
+                            continue
+                        ratio = value / index_interval
+                        cur.updateRow((value, 1 if abs(ratio - round(ratio)) < 1e-6 else 0))
 
-        count = int(arcpy.management.GetCount(result)[0])
-        arcpy.management.CopyFeatures(result, out_shp)
-        for tmp in (tmp_lines, tmp_smooth):
-            if arcpy.Exists(tmp):
-                arcpy.management.Delete(tmp)
-        return count
+            count = int(arcpy.management.GetCount(result)[0])
+            arcpy.management.CopyFeatures(result, out_shp)
+            return count
+        except Exception:
+            # Never leave a truncated shapefile for a later run to skip as complete.
+            try:
+                if arcpy.Exists(out_shp):
+                    arcpy.management.Delete(out_shp)
+            except Exception:
+                pass
+            raise
+        finally:
+            for tmp in (tmp_lines, tmp_smooth):
+                if arcpy.Exists(tmp):
+                    arcpy.management.Delete(tmp)
 
 
 class ReclassifyFactor(object):
@@ -2773,7 +2851,7 @@ class ReclassifyFactor(object):
 
     def _write_legend(self, location, names):
         """Write the class matrix (legend) into a Reclass subfolder, listing the files there."""
-        lines = ["Dados reclassificados (Tool 04)",
+        lines = ["Dados reclassificados (Tool 05)",
                  "===============================",
                  "FONTE: DEM = Modelo Digital do Terreno; DSM = Modelo Digital de Superficie.",
                  "",
@@ -2786,6 +2864,14 @@ class ReclassifyFactor(object):
             fh.write("\n".join(lines) + "\n")
 
     def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+
+    def _run(self, parameters, messages):
         in_folder = parameters[0].valueAsText
         recurse = bool(parameters[1].value)
         factors = [v.strip().upper() for v in (parameters[2].valueAsText or "").split(";") if v.strip()]
@@ -3079,6 +3165,14 @@ class SolarRadiation(object):
         return slope, aspect
 
     def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+
+    def _run(self, parameters, messages):
         in_folder = parameters[0].valueAsText
         recurse = bool(parameters[1].value)
         out_folder = parameters[2].valueAsText
@@ -3098,8 +3192,8 @@ class SolarRadiation(object):
         reuse_surfaces = bool(parameters[16].value)
         grid_level = int(parameters[17].value)
         interval_mode = "INTERVAL" if bool(parameters[18].value) else "NO_INTERVAL"
-        interval_unit = parameters[19].valueAsText
-        interval = int(parameters[20].value)
+        interval_unit = parameters[19].valueAsText or "DAY"
+        interval = int(parameters[20].value or 14)   # optional param; guard a cleared value
 
         # Idempotency is handled by an explicit os.path.exists skip below, so overwrite is
         # left on to let the scratch resample step overwrite a stale temp cleanly.
@@ -3138,7 +3232,9 @@ class SolarRadiation(object):
             only_files = [n for n in os.listdir(in_folder)
                           if os.path.isfile(os.path.join(in_folder, n))]
             walker = [(in_folder, [], only_files)]
-        for dirpath, _dirs, files in walker:
+        for dirpath, dirs, files in walker:
+            # Do not descend into the Resample tree (same-named mosaic copies at another cell size).
+            dirs[:] = [d for d in dirs if d != RESAMPLE_DIRNAME]
             for fn in files:
                 if not fn.lower().endswith(".tif"):
                     continue
@@ -3337,6 +3433,14 @@ class Resample(object):
         return
 
     def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+
+    def _run(self, parameters, messages):
         in_folder = parameters[0].valueAsText
         recurse = bool(parameters[1].value)
         selected = set(str(s).upper() for s in (parameters[2].values or []))
@@ -3487,6 +3591,7 @@ def _run_self_tests():
         ("AreaA", "DEM", "SLOPEP", False),           # slope percent
         ("AreaA", "DEM", "SOLARUNI", False),         # solar, uniform sky model
         ("AreaA", "DSM", "SOLAROVCDIR", False),      # solar, overcast model, direct aux
+        ("AreaA", "DEM", "CONT", False),             # contour lines (Tool 7)
     ]
     for area, source, product, reclass in cases:
         name = build_output_name(area, source, product, reclass)
