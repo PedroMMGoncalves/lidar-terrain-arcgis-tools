@@ -190,7 +190,7 @@ One DEM and one DSM mosaic per area, merging all of that area's download folders
 | Skip areas with missing folders | On (default) skips areas whose folders are not all present yet. |
 | Verify folder extent against AOI polygon | On (default) checks each folder maps to the right area; runs only under `by FID number` mapping, since `by name` and `by geometry` are authoritative. |
 | Folder name prefix | Optional. Leave blank to auto-detect the prefix from the data folders. |
-| Tile resolution | Optional. Leave blank to auto-detect; set (for example `2m` or `50cm`) to pick one resolution when a folder holds more than one. |
+| Tile resolution | A checklist (`2m`, `50cm`). Blank auto-detects a single resolution (and fails loud on a mix). Pick one to select it when a folder holds both. Pick both to build each resolution into its own subtree (`out/2m/...` and `out/50cm/...`), same file names inside each, so the downstream tools point at one tree and work unchanged. |
 | Also build overlap clusters | Off by default. Also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, alongside the per area output. |
 | Report clusters only | Dry-run for clustering: lists the clusters and member counts without building any mosaic. |
 | Folder to area mapping | `by name` (default; the download folder whose name equals the sanitized area name, the exact pairing for Tool 1 output), `by geometry` (maps each area to the folder whose tile extent is centered on it, for folders not named by the area), or `by FID number` (the folder named with the area FID, the old plugin layout). |

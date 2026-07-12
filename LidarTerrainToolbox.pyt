@@ -1671,8 +1671,11 @@ class BuildMosaicsByPolygon(object):
             datatype="GPString", parameterType="Optional", direction="Input")
 
         p_res = arcpy.Parameter(
-            displayName="Tile resolution (leave blank to auto-detect, e.g. 2m or 50cm)", name="tile_resolution",
-            datatype="GPString", parameterType="Optional", direction="Input")
+            displayName="Tile resolution (blank auto-detects; both = one subfolder each)",
+            name="tile_resolution", datatype="GPString", parameterType="Optional",
+            direction="Input", multiValue=True)
+        p_res.filter.type = "ValueList"
+        p_res.filter.list = ["2m", "50cm"]
 
         p_clusters = arcpy.Parameter(
             displayName="Also build overlap clusters", name="build_clusters",
@@ -2018,7 +2021,7 @@ class BuildMosaicsByPolygon(object):
         skip_incomplete = bool(parameters[9].value)
         verify_extent = bool(parameters[10].value)
         folder_prefix = parameters[11].valueAsText
-        tile_resolution = (parameters[12].valueAsText or "").strip() or None
+        resolutions = [v.strip() for v in (parameters[12].values or []) if v and v.strip()]
         build_cluster_mosaics = bool(parameters[13].value)
         cluster_dry_run = bool(parameters[14].value)
         mapping_mode = parameters[15].valueAsText
@@ -2115,6 +2118,33 @@ class BuildMosaicsByPolygon(object):
                     raise ValueError(msg)
                 fid_to_folder[fid] = full
 
+        if len(resolutions) > 1:
+            # One output tree per resolution (out/<res>/...), same file names inside each, so
+            # the naming convention and every downstream tool work unchanged per tree.
+            for res in resolutions:
+                res_root = os.path.join(out_folder, res)
+                _msg("Resolution {}: building into {}.".format(res, res_root))
+                self._build_for_resolution(
+                    groups, fid_to_geom, fid_to_folder, products, res_root, output_structure,
+                    pixel_type, mosaic_method, overwrite_existing, skip_incomplete,
+                    verify_extent, mapping_mode, clip_mode, build_pyramids, res, aoi_sr,
+                    build_cluster_mosaics, cluster_dry_run)
+        else:
+            tile_resolution = resolutions[0] if resolutions else None
+            self._build_for_resolution(
+                groups, fid_to_geom, fid_to_folder, products, out_folder, output_structure,
+                pixel_type, mosaic_method, overwrite_existing, skip_incomplete,
+                verify_extent, mapping_mode, clip_mode, build_pyramids, tile_resolution, aoi_sr,
+                build_cluster_mosaics, cluster_dry_run)
+        return
+
+    def _build_for_resolution(self, groups, fid_to_geom, fid_to_folder, products, out_folder,
+                              output_structure, pixel_type, mosaic_method, overwrite_existing,
+                              skip_incomplete, verify_extent, mapping_mode, clip_mode,
+                              build_pyramids, tile_resolution, aoi_sr,
+                              build_cluster_mosaics, cluster_dry_run):
+        """Build the per area mosaics (and optional clusters) for one tile resolution into
+        out_folder. Called once per selected resolution, each with its own output tree."""
         total = len(groups)
         built_areas = 0
         present_areas = 0
