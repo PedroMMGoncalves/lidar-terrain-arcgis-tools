@@ -613,6 +613,37 @@ def _same_crs(sr_a, sr_b):
     return sr_a.exportToString() == sr_b.exportToString()
 
 
+_DATUM_WARNED = set()                                 # (from wkid/name, to wkid/name) pairs warned
+
+
+def _project_geom(geom, from_sr, to_sr):
+    """Project a geometry between CRS, deliberately WITHOUT a geographic (datum) transformation,
+    warning once per CRS pair when one would apply. Rationale: Geometry.projectAs with no
+    transformation applies no datum shift, only the projection change. That is correct for data
+    whose coordinates already sit on the target datum under a mislabeled CRS (common with
+    Portuguese layers tagged Lisboa Hayford-Gauss IGeoE, ESRI:102164, whose coordinates are
+    really ETRS89 TM06 plus the military false origin). Applying the Lisboa transformation to
+    such data would shift everything about 300 m. When the source really is on another datum the
+    user must fix the layer CRS instead; the warning makes the situation visible either way."""
+    if _same_crs(from_sr, to_sr):
+        return geom
+    key = (from_sr.factoryCode or from_sr.name, to_sr.factoryCode or to_sr.name)
+    if key not in _DATUM_WARNED:
+        _DATUM_WARNED.add(key)
+        try:
+            differs = arcpy.ListTransformations(from_sr, to_sr)
+        except Exception:
+            differs = []
+        if differs:
+            _warn("{} and {} are on different datums. Projecting WITHOUT a datum shift (the "
+                  "transformation {} is NOT applied). Verify the outputs align with the terrain; "
+                  "if they are offset by a few hundred meters, the layer CRS is likely correct "
+                  "and you should project the layer properly first. If instead the LAYER draws "
+                  "offset while the outputs align, the layer CRS is mislabeled; redefine it.".format(
+                      _crs_label(from_sr), _crs_label(to_sr), differs[0]))
+    return geom.projectAs(to_sr)
+
+
 def _is_data_folder(folder):
     """True if `folder` directly contains a tile or tile subfolder for either product, i.e.
     an immediate entry whose name starts with MDT or MDS (case insensitive). Cheap shallow
@@ -1200,7 +1231,7 @@ class DownloadDGTData(object):
                                arcpy.Point(xmax, ymax), arcpy.Point(xmax, ymin),
                                arcpy.Point(xmin, ymin)])
         poly = arcpy.Polygon(corners, aoi_sr)
-        ll = poly if _same_crs(aoi_sr, wgs84) else poly.projectAs(wgs84)
+        ll = _project_geom(poly, aoi_sr, wgs84)
         we = ll.extent
         return (we.XMin, we.YMin, we.XMax, we.YMax)
 
@@ -1863,7 +1894,7 @@ class BuildMosaicsByPolygon(object):
         for g in geoms:
             if g is None:
                 continue
-            gt = g if _same_crs(aoi_sr, tile_sr) else g.projectAs(tile_sr)
+            gt = _project_geom(g, aoi_sr, tile_sr)
             e = gt.extent
             if box is None:
                 box = [e.XMin, e.YMin, e.XMax, e.YMax]
@@ -1880,7 +1911,7 @@ class BuildMosaicsByPolygon(object):
         for g in geoms:
             if g is None:
                 continue
-            gt = g if _same_crs(aoi_sr, tile_sr) else g.projectAs(tile_sr)
+            gt = _project_geom(g, aoi_sr, tile_sr)
             union = gt if union is None else union.union(gt)
         if union is None:
             arcpy.management.CopyRaster(in_raster, out_raster)
@@ -1930,7 +1961,7 @@ class BuildMosaicsByPolygon(object):
         for fid, geom in fid_to_geom.items():
             if geom is None:
                 continue
-            projected = geom if _same_crs(aoi_sr, tile_sr) else geom.projectAs(tile_sr)
+            projected = _project_geom(geom, aoi_sr, tile_sr)
             fe = projected.extent
             fx = (fe.XMin + fe.XMax) / 2.0
             fy = (fe.YMin + fe.YMax) / 2.0
@@ -2142,7 +2173,7 @@ class BuildMosaicsByPolygon(object):
                     geom = fid_to_geom[f]
                     if geom is None:
                         continue
-                    geom_t = geom if _same_crs(aoi_sr, ref_tile_sr) else geom.projectAs(ref_tile_sr)
+                    geom_t = _project_geom(geom, aoi_sr, ref_tile_sr)
                     centroid = arcpy.PointGeometry(geom_t.centroid, ref_tile_sr)
                     if not folder_poly.contains(centroid):
                         _warn("Area '{}': folder for FID {} does not contain its AOI polygon "
@@ -3990,7 +4021,7 @@ class SuitabilityMask(object):
             ext, r_sr = _info(area)
             inside = 0
             for shape in shapes:
-                geom = shape if _same_crs(aoi_sr, r_sr) else shape.projectAs(r_sr)
+                geom = _project_geom(shape, aoi_sr, r_sr)
                 c = geom.centroid
                 if ext.XMin <= c.X <= ext.XMax and ext.YMin <= c.Y <= ext.YMax:
                     inside += 1
@@ -4021,7 +4052,7 @@ class SuitabilityMask(object):
         r_sr = arcpy.Describe(slope_path).spatialReference
         if not _same_crs(r_sr, arcpy.Describe(solar_path).spatialReference):
             raise ValueError("SLOPE and SOLARUNI rasters have different CRS")
-        geoms = [s if _same_crs(aoi_sr, r_sr) else s.projectAs(r_sr) for s in shapes]
+        geoms = [_project_geom(s, aoi_sr, r_sr) for s in shapes]
 
         union = geoms[0]
         for g in geoms[1:]:
