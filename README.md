@@ -29,7 +29,7 @@ This toolbox is the **factor engine only**. Any downstream analysis (suitability
 2. **Get the data.** Run **Tool 1, Download DGT Data** with your AOI layer and a name field (free CDD account needed), or point at LiDAR you already downloaded with the QGIS DGT CDD plugin.
 3. **Build the mosaics.** Run **Tool 2** on the download root to get one DEM and one DSM per area.
 4. **Derive the factors.** Run **Tool 3** (surfaces), **Tool 4** (solar), then **Tool 5** (reclassify) on the previous outputs.
-5. **Resample (optional).** Run **Tool 6**, for example 2 m to 5 m, to lighten later steps.
+5. **Utilities as needed.** **Tool 6** resamples (for example 2 m to 5 m), **Tool 7** draws cartographic contours, **Tool 8** verifies that everything is there and valid, and **Tool 9** builds a binary suitability mask per mine.
 
 Each tool reads the previous tool's output folder and writes with one consistent naming convention. Project CRS is EPSG:3763.
 
@@ -63,7 +63,7 @@ flowchart TD
     AOI --> T1
     LID --> T1
     T1["Tool 2<br/>Build Mosaics by Polygon"]
-    T1 --> M["Per area mosaics<br/>Area_DEM.tif / Area_DSM.tif<br/>(optional clip to AOI)"]
+    T1 --> M["Per area mosaics<br/>Area_DEM.tif / Area_DSM.tif<br/>(optional clip to AOI,<br/>tree per resolution)"]
     T1 -.-> CL["Clusters (optional)<br/>clusters/Cluster_NNN/<br/>contiguous areas merged"]
     M --> T2["Tool 3<br/>Generate Surfaces"]
     M --> T3["Tool 4<br/>Solar Radiation"]
@@ -86,6 +86,10 @@ flowchart TD
     S --> T9["Tool 9<br/>Suitability Mask"]
     SOL --> T9
     T9 --> APT["Per mine masks<br/>Mine_SOURCE_APT.tif (1/0)"]
+    M -.-> V8["Tool 8 (optional)<br/>Verify Outputs"]
+    S -.-> V8
+    SOL -.-> V8
+    V8 -.-> REP["VERIFY_report.txt<br/>integrity + completeness"]
     RCL --> EXT["Analysis<br/>(external to this toolbox)"]
     SOL --> EXT
     APT --> EXT
@@ -95,14 +99,14 @@ flowchart TD
     classDef data fill:#eaf2ff,stroke:#1f6feb,color:#0b2a5b;
     classDef ext fill:#f5f5f5,stroke:#999999,color:#333333,stroke-dasharray:4 3;
     class TDL,T1,T2,T3,T4,T9 tool;
-    class T5,CT opttool;
-    class AOI,LID,M,S,SOL,RCL,RS,CL,CO,APT data;
+    class T5,CT,V8 opttool;
+    class AOI,LID,M,S,SOL,RCL,RS,CL,CO,APT,REP data;
     class EXT ext;
 ```
 
 - **Tool 1** downloads the DGT LiDAR per AOI feature: it takes the feature envelope in WGS84 (a clean square for points) and searches the CDD STAC API by that bounding box. It offers two output layouts: one folder per area (named by a chosen field) with a product subfolder each (`MDT-2m`, `MDS-2m`, `MDT-50cm`, `MDS-50cm`, `LAZ`), ready for Tool 2, or a single flat folder with all tiles together. Tiles download one product at a time, in a fixed order, with each tile logged.
 - The DGT LiDAR is organized as one download folder per area of interest, holding the tiles in `MDT*` (terrain, DEM) and `MDS*` (surface, DSM) subfolders. Tool 1 names each folder by your chosen field; the QGIS plugin numbered it by the AOI feature FID; Tool 2 maps by name, by geometry, or by FID accordingly. The spatial selection (for example a buffer around the AOI) is applied upstream, so Tool 2 does no buffering or tile intersection.
-- **Tool 2** groups AOI features by area name, then maps each area to its download folder. By default it maps **by name** (the folder whose name equals the sanitized area name, the exact pairing for Tool 1 output); **by geometry** (the folder whose tile extent is centered on the area) and **by FID number** (the folder numbered with the area FID, the old plugin layout) are there for folders not named by the area. It merges each area's MDT and MDS tiles across its folders into one DEM and one DSM mosaic, deduplicating tiles by name, and can optionally **clip each mosaic to its AOI**, either to the extent (an exact, fast cut for a rectangular cartogram sheet) or to the true polygon shape (for irregular AOIs such as mine polygons). An optional clustering mode also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, written to a `clusters` subfolder, each with a `Cluster_NNN_members.txt` manifest.
+- **Tool 2** groups AOI features by area name, then maps each area to its download folder. By default it maps **by name** (the folder whose name equals the sanitized area name, the exact pairing for Tool 1 output); **by geometry** (the folder whose tile extent is centered on the area) and **by FID number** (the folder numbered with the area FID, the old plugin layout) are there for folders not named by the area. It merges each area's MDT and MDS tiles across its folders into one DEM and one DSM mosaic, deduplicating tiles by name, and can optionally **clip each mosaic to its AOI**, either to the extent (an exact, fast cut for a rectangular cartogram sheet) or to the true polygon shape (for irregular AOIs such as mine polygons). When both DGT resolutions are selected it builds one output tree per resolution (`out/2m`, `out/50cm`), same file names inside each. An optional clustering mode also aggregates contiguous areas (touching or overlapping AOI polygons) into one mosaic per cluster, written to a `clusters` subfolder, each with a `Cluster_NNN_members.txt` manifest.
 - **Tool 3** derives the selected surfaces with Spatial Analyst (and Image Analyst for the multidirectional hillshade). Slope is in degrees, and optionally percent; aspect uses the Esri convention with -1 for flat; curvature produces profile and plan.
 - **Tool 4** computes annual solar radiation (kWh/m2) on the DEM with RasterSolarRadiation (GPU accelerated), at the native 2 m baseline. You pick the diffuse model (uniform, overcast, or both) and can also output the direct, diffuse and direct duration rasters; the output names carry the model (`SOLARUNI`, `SOLAROVC`). A coarser solar cell size resamples the DEM first.
 - **Tool 5** reclassifies aspect, slope and the annual solar raster into fixed project suitability classes, in numpy with `[min, max)` semantics. Aspect yields two rasters: quadrants (`ASPECT_DIR`, N to NW plus flat) and solar suitability (`ASPECT_RCL`, south and flat best); slope and solar yield `SLOPE_RCL` and `SOLARUNI_RCL`. Each output, plus a legend (`RECLASS_legenda.txt`), goes to a `Reclass` subfolder next to the inputs.
@@ -110,7 +114,7 @@ flowchart TD
 - **Tool 7** (optional) generates cartographic contour lines from the DEM or DSM mosaics: it smooths the surface (Focal mean, given in meters so it is resolution independent), contours at the chosen equidistance, smooths the lines (PAEK), flags the master (index) contours and drops the short noise rings, writing one polyline shapefile per area to a `Contours` subfolder. Needs Spatial Analyst.
 - **Tool 8** verifies a results tree without writing anything (except an optional report): every `.tif` must have a valid GeoTIFF signature, open in arcpy, and match the expected EPSG; every area with a base mosaic must have the expected products. The `Resample` tree is checked for integrity but not completeness.
 - **Tool 9** builds the final binary suitability mask per mine: `1` where slope <= the threshold (given in degrees or percent) AND `SOLARUNI` >= the minimum (default 1400 kWh/m2, the lower bound of solar class 3), else `0`, computed on the area raster that covers each mine (matched by name, else spatially) and clipped to the mine polygons (same-name polygons are one mine). Output `<Mine>_<SOURCE>_APT.tif`. The weighted overlay and the REN/RAN/PDM exclusions remain outside this toolbox.
-- EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent check.
+- EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent checks and clips, deliberately without a datum shift (see [Limitations and notes](#limitations-and-notes)).
 
 ---
 
@@ -127,7 +131,7 @@ flowchart TD
 
 ## Data source
 
-The tools were built for the DGT LiDAR survey of mainland Portugal, *Levantamento LiDAR de Portugal Continental*, produced by the [Direção-Geral do Território (DGT)](https://www.dgterritorio.gov.pt/levantamento-lidar-de-portugal-continental-0). The survey provides a 10 points/m2 LAZ point cloud and the derived terrain model (MDT, the DEM) and surface model (MDS, the DSM) at 0.5 m and 2 m resolution as GeoTIFF, under an open data policy with no usage restrictions. This project used the 2 m models (`MDT-2m`, `MDS-2m`), but the tools are not tied to a resolution: Tool 2 mosaics any `MDT*` and `MDS*` tiles, so the 0.5 m models (`MDS-50cm-...`) work as well. When a download folder holds more than one resolution, set Tool 2's *Tile resolution* parameter (for example `2m` or `50cm`) to pick one; left blank it auto-detects a single resolution and fails loud on a mix, so a mosaic never blends cell sizes.
+The tools were built for the DGT LiDAR survey of mainland Portugal, *Levantamento LiDAR de Portugal Continental*, produced by the [Direção-Geral do Território (DGT)](https://www.dgterritorio.gov.pt/levantamento-lidar-de-portugal-continental-0). The survey provides a 10 points/m2 LAZ point cloud and the derived terrain model (MDT, the DEM) and surface model (MDS, the DSM) at 0.5 m and 2 m resolution as GeoTIFF, under an open data policy with no usage restrictions. This project used the 2 m models (`MDT-2m`, `MDS-2m`), but the tools are not tied to a resolution: Tool 2 mosaics any `MDT*` and `MDS*` tiles, so the 0.5 m models (`MDS-50cm-...`) work as well. When a download folder holds more than one resolution, Tool 2's *Tile resolution* checklist picks one (`2m` or `50cm`), or both to build each resolution into its own output subtree; left blank it auto-detects a single resolution and fails loud on a mix, so a mosaic never blends cell sizes.
 
 The data is distributed through the DGT Data Center (CDD), which requires a free registration: <https://cdd.dgterritorio.gov.pt/dgt-fe>.
 
@@ -195,7 +199,7 @@ One DEM and one DSM mosaic per area, merging all of that area's download folders
 | Report clusters only | Dry-run for clustering: lists the clusters and member counts without building any mosaic. |
 | Folder to area mapping | `by name` (default; the download folder whose name equals the sanitized area name, the exact pairing for Tool 1 output), `by geometry` (maps each area to the folder whose tile extent is centered on it, for folders not named by the area), or `by FID number` (the folder named with the area FID, the old plugin layout). |
 | Clip mosaic to AOI | `none` (default; full tile coverage), `extent` (bounds each mosaic to the AOI bounding box through the analysis extent, an exact and fast cut for a rectangular cartogram sheet), or `polygon` (cuts to the true vector shape of the area's polygons with core Clip, for irregular AOIs such as mine polygons; cells outside become NoData, a small extra clip pass per area). Per area output only, not the overlap clusters. |
-| Build pyramids and statistics | Off by default. On builds pyramids and statistics on each mosaic after writing (per area and clusters), so the large rasters display fast in ArcGIS Pro. Adds some time per mosaic. |
+| Build pyramids and statistics | Off by default. On builds pyramids and statistics on each mosaic after writing (per area and clusters), so the large rasters display fast in ArcGIS Pro. Also runs on mosaics skipped as existing, so a re-run with overwrite off just adds pyramids to mosaics built earlier. Adds some time per mosaic. |
 
 With **overlap clustering** on, Tool 2 also groups areas whose AOI polygons are contiguous (touch or overlap) into one mosaic per cluster, in parallel to the per area output, which is unchanged. Every area belongs to exactly one cluster (a non overlapping area is its own one member cluster). Clusters go to a `clusters` subfolder, named `Cluster_NNN` by the smallest member FID, each with a `Cluster_NNN_members.txt` manifest listing the member areas (the ids renumber if the AOI is edited, so the manifest is the authority). Tiles shared between areas are deduplicated by name. Run the dry-run first to see the clusters before the heavy build.
 
@@ -215,6 +219,8 @@ Topographic surfaces from the Tool 2 mosaics. Each surface has its own checkbox 
 | Hillshade type | `Multidirectional` (default, Image Analyst) or `Traditional`. |
 | Hillshade azimuth, altitude | Traditional hillshade only. |
 | Overwrite existing outputs | Off skips existing surfaces. |
+
+A mosaic whose surfaces fail (for example a locked output) is skipped with a warning and the batch continues; the tool then ends as failed listing the mosaics to re-run, which a re-run with overwrite off retries. If many areas fail in a row late in a long run (`ERROR 010240` on save), restart ArcGIS Pro to free process memory and re-run.
 
 ### Tool 4, Solar Radiation
 
@@ -421,6 +427,9 @@ This exercises name sanitization and collision handling, the output name build a
 | `... does not contain its AOI polygon centroid` | Under by-FID mapping, a folder maps to the wrong area | Switch Folder to area mapping to `by name` (the default) or `by geometry`, or fix the FID to folder alignment. |
 | `Spatial Analyst extension is not available` | Tool 3 has no Spatial Analyst license | Enable Spatial Analyst in *Project > Licensing*. |
 | `Multidirectional hillshade needs the Image Analyst extension` | Tool 3 multidirectional without Image Analyst | Enable Image Analyst, or choose Traditional, or turn hillshade off. |
+| `... are on different datums. Projecting WITHOUT a datum shift ...` | The AOI layer CRS declares a different datum than the tiles | See the datum note under Limitations: outputs aligned + layer drawn offset = mislabeled layer CRS (redefine it); outputs offset = project the layer properly first. |
+| `Different area names sanitize to the same folder name ...` | Two distinct names (for example `Covas-1` and `Covas 1`) collapse to one sanitized name | Rename the areas so the sanitized names differ, or use the by geometry mapping. |
+| `ERROR 010240: Could not save raster dataset ...` on many areas late in a long run | Process memory or handles exhausted after hundreds of rasters | Restart ArcGIS Pro and re-run with overwrite off; only the failed areas are redone. |
 
 ---
 
@@ -430,7 +439,7 @@ This exercises name sanitization and collision handling, the output name build a
 - **The downstream analysis is external** and not part of this toolbox.
 - **Folder to area mapping (Tool 2):** `by name` (the default) pairs each area with the folder of the same sanitized name and is immune to FID order. Only the `by FID number` mode requires the download folder number to equal the AOI feature FID (0 based shapefile FID); loading the AOI as a geodatabase feature class (1 based OBJECTID) then shifts that mapping, and the tool warns when the OID field is not `FID`.
 - **Memory (Tool 5):** each factor raster is read into memory for the numpy reclassification. The per area extents are tolerable; a very large raster can exceed memory, and the tool then aborts with a clear message.
-- **Datum reprojection:** `projectAs` uses the default transformation. Where no default geographic transformation exists between the input and project datums, it may need to be specified explicitly.
+- **Datum reprojection (deliberate behavior):** geometries are projected WITHOUT a geographic (datum) transformation, and the tools warn once per CRS pair when one would apply. This is correct for Portuguese layers whose CRS tag is wrong but whose coordinates already sit on ETRS89 (a real case: layers tagged Lisboa Hayford-Gauss IGeoE, ESRI:102164, whose coordinates are ETRS89 TM06 plus the military false origin; applying the Lisboa transformation would shift everything about 300 m). How to read the warning: if the OUTPUTS align with the terrain but the LAYER draws offset in the map, the layer CRS is mislabeled, redefine it; if the OUTPUTS are offset by a few hundred meters, the layer really is on another datum, project it properly first and re-run.
 - **Aspect Flat:** aspect uses -1 for flat. In Tool 5 the optional flat class wins over any class interval that happens to contain -1.
 
 ---
