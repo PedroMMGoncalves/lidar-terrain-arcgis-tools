@@ -3892,7 +3892,8 @@ class SuitabilityMask(object):
 
     def getParameterInfo(self):
         p_in = arcpy.Parameter(
-            displayName="Results folder (with SLOPE and SOLARUNI rasters)", name="results_folder",
+            displayName="Results folder (with SLOPE or SLOPEP, and SOLARUNI rasters)",
+            name="results_folder",
             datatype="DEFolder", parameterType="Required", direction="Input")
 
         p_recurse = arcpy.Parameter(
@@ -3927,7 +3928,7 @@ class SuitabilityMask(object):
             datatype="GPString", parameterType="Required", direction="Input")
         p_units.filter.type = "ValueList"
         p_units.filter.list = ["degrees", "percent"]
-        p_units.value = "degrees"
+        p_units.value = "percent"          # the suitability rule is defined in percent; needs SLOPEP
 
         p_slope = arcpy.Parameter(
             displayName="Maximum suitable slope", name="slope_max",
@@ -3984,12 +3985,16 @@ class SuitabilityMask(object):
         overwrite_existing = bool(parameters[9].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
+        # The unit picks the slope raster and the comparison is done in its native units, so no
+        # conversion: percent compares the SLOPEP raster (Tool 3 slope in percent) against a
+        # percent threshold; degrees compares the SLOPE raster against a degree threshold.
         if slope_units == "percent":
-            thr_deg = math.degrees(math.atan(slope_max / 100.0))
-            _msg("Slope threshold: {:g} percent = {:.2f} degrees.".format(slope_max, thr_deg))
+            slope_product = "SLOPEP"
         else:
-            thr_deg = slope_max
-            _msg("Slope threshold: {:g} degrees.".format(thr_deg))
+            slope_product = "SLOPE"
+        thr = slope_max
+        _msg("Slope threshold: {:g} {} (compared against the {} {} raster).".format(
+            slope_max, slope_units, source, slope_product))
         _msg("Solar minimum: {:g} kWh/m2 (SOLARUNI).".format(solar_min))
 
         if arcpy.CheckExtension("Spatial") != "Available":
@@ -4015,7 +4020,7 @@ class SuitabilityMask(object):
                     info = parse_source_and_product(fn)
                     if info["area"] is None or info["source"] != source or info["reclass"]:
                         continue
-                    if info["product"] == "SLOPE":
+                    if info["product"] == slope_product:
                         target = slope_by_area
                     elif info["product"] == "SOLARUNI":
                         target = solar_by_area
@@ -4029,8 +4034,9 @@ class SuitabilityMask(object):
                     target[info["area"]] = path
             areas = sorted(set(slope_by_area) & set(solar_by_area))
             if not areas:
-                msg = ("No area has both a {0} SLOPE and a {0} SOLARUNI raster under '{1}'. Run "
-                       "Tools 3 and 4 first.").format(source, in_folder)
+                msg = ("No area has both a {0} {1} and a {0} SOLARUNI raster under '{2}'. Run "
+                       "Tools 3 and 4 first (for a percent threshold, Tool 3 must output slope "
+                       "in percent).").format(source, slope_product, in_folder)
                 _err(msg)
                 raise ValueError(msg)
             only_one = sorted((set(slope_by_area) ^ set(solar_by_area)))
@@ -4084,9 +4090,9 @@ class SuitabilityMask(object):
                     if area is None:
                         raise ValueError("no SLOPE/SOLARUNI raster covers this mine")
                     self._mask_for_mine(mine, shapes, slope_by_area[area], solar_by_area[area],
-                                        thr_deg, solar_min, aoi_sr, out_path)
-                    _msg("{}: mask from '{}' (slope <= {:.2f} deg AND solar >= {:g}) -> {}".format(
-                        mine, area, thr_deg, solar_min, os.path.basename(out_path)))
+                                        thr, solar_min, aoi_sr, out_path)
+                    _msg("{}: mask from '{}' (slope <= {:g} {} AND solar >= {:g}) -> {}".format(
+                        mine, area, thr, slope_units, solar_min, os.path.basename(out_path)))
                     created += 1
                 except Exception as exc:
                     _warn("{}: failed: {}".format(mine, exc))
@@ -4143,13 +4149,14 @@ class SuitabilityMask(object):
                       "NoData in the mask.".format(mine, len(shapes) - inside, len(shapes), chosen))
         return chosen
 
-    def _mask_for_mine(self, mine, shapes, slope_path, solar_path, thr_deg, solar_min,
+    def _mask_for_mine(self, mine, shapes, slope_path, solar_path, thr, solar_min,
                        aoi_sr, out_path):
         """Compute the binary mask over the mine polygons and write out_path. The analysis extent
-        is bounded to the polygons so only that window is computed, snapped to the slope grid."""
+        is bounded to the polygons so only that window is computed, snapped to the slope grid.
+        thr is compared against the slope raster in its own units (degrees or percent)."""
         r_sr = arcpy.Describe(slope_path).spatialReference
         if not _same_crs(r_sr, arcpy.Describe(solar_path).spatialReference):
-            raise ValueError("SLOPE and SOLARUNI rasters have different CRS")
+            raise ValueError("slope and SOLARUNI rasters have different CRS")
         geoms = [_project_geom(s, aoi_sr, r_sr) for s in shapes]
 
         union = geoms[0]
@@ -4167,7 +4174,7 @@ class SuitabilityMask(object):
             arcpy.env.extent = union.extent
             slope_r = arcpy.sa.Raster(slope_path)
             solar_r = arcpy.sa.Raster(solar_path)
-            apt = arcpy.sa.Con((slope_r <= thr_deg) & (solar_r >= solar_min), 1, 0)
+            apt = arcpy.sa.Con((slope_r <= thr) & (solar_r >= solar_min), 1, 0)
             _save_raster(arcpy.sa.ExtractByMask(apt, mask_fc), out_path)
         finally:
             arcpy.env.extent = prev_extent
