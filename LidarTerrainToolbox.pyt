@@ -71,7 +71,7 @@ PROJECT_EPSG = 3763                                  # ETRS89 / PT-TM06, meters
 SOURCES = ("DEM", "DSM")
 PRODUCTS = ("SLOPE", "SLOPEP", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLAR",
             "SOLARUNI", "SOLAROVC", "SOLARUNIDIR", "SOLARUNIDIF", "SOLARUNIDUR",
-            "SOLAROVCDIR", "SOLAROVCDIF", "SOLAROVCDUR", "CONT", "APT")
+            "SOLAROVCDIR", "SOLAROVCDIF", "SOLAROVCDUR", "CONT", "APT", "APTCLS")
 RECLASS_SUFFIX = "RCL"
 MAX_NAME_LEN = 40                                    # margin for suffixes like _DEM_ASPECT_RCL
 RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
@@ -3719,9 +3719,10 @@ class Resample(object):
                 if target_cell < native:
                     _warn("{} ({}): target {:g} m is finer than native {:g} m; upsampling adds no "
                           "real detail.".format(area, token, target_cell, native))
-                # Categorical rasters (reclassified, and the binary APT mask) must use nearest,
-                # or interpolation would produce fractional class values.
-                method = "NEAREST" if (info["reclass"] or info["product"] == "APT") else "BILINEAR"
+                # Categorical rasters (reclassified, and the APT/APTCLS suitability rasters) must
+                # use nearest, or interpolation would produce fractional class values.
+                method = ("NEAREST" if (info["reclass"] or info["product"] in ("APT", "APTCLS"))
+                          else "BILINEAR")
                 arcpy.management.Resample(path, out_path, "{0} {0}".format(target_cell), method)
                 _msg("{} ({}): resampled {:g} m -> {:g} m ({}, {}) -> {}".format(
                     area, token, native, target_cell, method, _crs_label(sr), fn))
@@ -3766,9 +3767,9 @@ class VerifyOutputs(object):
             displayName="Expected products per area", name="expected_products",
             datatype="GPString", parameterType="Optional", direction="Input", multiValue=True)
         p_expected.filter.type = "ValueList"
-        # CONT is a shapefile and APT is per mine in its own folder, so neither can be found by
+        # CONT is a shapefile and APT/APTCLS are per mine in their own folder, so none can be found by
         # the per area .tif completeness check; offering them would always report missing.
-        p_expected.filter.list = [p for p in PRODUCTS if p not in ("CONT", "APT")]
+        p_expected.filter.list = [p for p in PRODUCTS if p not in ("CONT", "APT", "APTCLS")]
         p_expected.value = ["SLOPE", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLARUNI"]
 
         p_epsg = arcpy.Parameter(
@@ -3886,8 +3887,11 @@ class SuitabilityMask(object):
                             "above the minimum, else 0 (cells that are NoData in either input "
                             "stay NoData), clipped to each mask polygon. Polygons sharing a name "
                             "are treated as one mine. The output is one <Mine>_<SOURCE>_APT.tif "
-                            "per mine. Weighted overlay and exclusion masks remain outside this "
-                            "toolbox.")
+                            "per mine. Optionally a second raster <Mine>_<SOURCE>_APTCLS.tif is "
+                            "written: the binary mask multiplied by the annual solar radiation in "
+                            "suitability classes 1 to 6, so the suitable cells keep their solar "
+                            "class (3 to 6) and the rest is 0. Weighted overlay and exclusion "
+                            "masks remain outside this toolbox.")
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -3940,13 +3944,19 @@ class SuitabilityMask(object):
             datatype="GPDouble", parameterType="Required", direction="Input")
         p_solar.value = 1400                   # the lower bound of SOLARUNI class 3
 
+        p_classified = arcpy.Parameter(
+            displayName="Also output solar-class suitability (mask x solar class 1 to 6)",
+            name="output_classified", datatype="GPBoolean", parameterType="Optional",
+            direction="Input")
+        p_classified.value = True
+
         p_overwrite = arcpy.Parameter(
             displayName="Overwrite existing outputs", name="overwrite_existing",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
         return [p_in, p_recurse, p_source, p_mask, p_field, p_out,
-                p_units, p_slope, p_solar, p_overwrite]
+                p_units, p_slope, p_solar, p_classified, p_overwrite]
 
     def isLicensed(self):
         # Con and ExtractByMask need Spatial Analyst.
@@ -3982,7 +3992,8 @@ class SuitabilityMask(object):
         slope_units = parameters[6].valueAsText
         slope_max = float(parameters[7].value)
         solar_min = float(parameters[8].value)
-        overwrite_existing = bool(parameters[9].value)
+        classified = bool(parameters[9].value)
+        overwrite_existing = bool(parameters[10].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
         # The unit picks the slope raster and the comparison is done in its native units, so no
@@ -4081,7 +4092,11 @@ class SuitabilityMask(object):
             for mine, shapes in sorted(mines.items()):
                 arcpy.SetProgressorPosition()
                 out_path = os.path.join(out_folder, build_output_name(mine, source, "APT") + ".tif")
-                if os.path.exists(out_path) and not overwrite_existing:
+                class_path = (os.path.join(out_folder, build_output_name(mine, source, "APTCLS")
+                              + ".tif") if classified else None)
+                outputs_done = os.path.exists(out_path) and (not classified
+                                                             or os.path.exists(class_path))
+                if outputs_done and not overwrite_existing:
                     _msg("{}: exists, skipping.".format(mine))
                     skipped += 1
                     continue
@@ -4090,9 +4105,12 @@ class SuitabilityMask(object):
                     if area is None:
                         raise ValueError("no SLOPE/SOLARUNI raster covers this mine")
                     self._mask_for_mine(mine, shapes, slope_by_area[area], solar_by_area[area],
-                                        thr, solar_min, aoi_sr, out_path)
+                                        thr, solar_min, aoi_sr, out_path, class_path)
+                    outs = os.path.basename(out_path)
+                    if class_path:
+                        outs += ", " + os.path.basename(class_path)
                     _msg("{}: mask from '{}' (slope <= {:g} {} AND solar >= {:g}) -> {}".format(
-                        mine, area, thr, slope_units, solar_min, os.path.basename(out_path)))
+                        mine, area, thr, slope_units, solar_min, outs))
                     created += 1
                 except Exception as exc:
                     _warn("{}: failed: {}".format(mine, exc))
@@ -4150,10 +4168,15 @@ class SuitabilityMask(object):
         return chosen
 
     def _mask_for_mine(self, mine, shapes, slope_path, solar_path, thr, solar_min,
-                       aoi_sr, out_path):
+                       aoi_sr, out_path, class_path=None):
         """Compute the binary mask over the mine polygons and write out_path. The analysis extent
         is bounded to the polygons so only that window is computed, snapped to the slope grid.
-        thr is compared against the slope raster in its own units (degrees or percent)."""
+        thr is compared against the slope raster in its own units (degrees or percent).
+
+        When class_path is given, also write the binary mask multiplied by the annual solar
+        radiation reclassified into the suitability classes 1 to 6 (SOLAR_RCL_CLASSES, the same
+        breaks as Tool 5), so suitable cells keep their solar class (3 to 6) and the rest is 0.
+        NoData stays NoData in both outputs."""
         r_sr = arcpy.Describe(slope_path).spatialReference
         if not _same_crs(r_sr, arcpy.Describe(solar_path).spatialReference):
             raise ValueError("slope and SOLARUNI rasters have different CRS")
@@ -4176,6 +4199,14 @@ class SuitabilityMask(object):
             solar_r = arcpy.sa.Raster(solar_path)
             apt = arcpy.sa.Con((slope_r <= thr) & (solar_r >= solar_min), 1, 0)
             _save_raster(arcpy.sa.ExtractByMask(apt, mask_fc), out_path)
+            if class_path:
+                # Result 2: the binary mask times the solar radiation in classes 1 to 6. The
+                # breaks mirror Tool 5 (SOLAR_RCL_CLASSES); on continuous radiation a cell landing
+                # exactly on a class boundary is negligible.
+                remap = arcpy.sa.RemapRange([[lo, hi, cls] for (cls, lo, hi) in SOLAR_RCL_CLASSES])
+                solar_cls = arcpy.sa.Reclassify(solar_r, "Value", remap, "NODATA")
+                apt_cls = apt * solar_cls
+                _save_raster(arcpy.sa.ExtractByMask(apt_cls, mask_fc), class_path)
         finally:
             arcpy.env.extent = prev_extent
             arcpy.env.snapRaster = prev_snap
@@ -4245,6 +4276,7 @@ def _run_self_tests():
         ("AreaA", "DSM", "SOLAROVCDIR", False),      # solar, overcast model, direct aux
         ("AreaA", "DEM", "CONT", False),             # contour lines (Tool 7)
         ("Covas", "DEM", "APT", False),              # suitability mask (Tool 9)
+        ("Covas", "DEM", "APTCLS", False),           # suitability graded by solar class (Tool 9)
     ]
     for area, source, product, reclass in cases:
         name = build_output_name(area, source, product, reclass)
