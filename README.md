@@ -47,7 +47,7 @@ Five tools form the pipeline, run in order, with the input and output folders al
 6. **Resample** (optional): resample the named rasters to a coarser cell size, for example 2 m to 5 m, into a `Resample` folder grouped by area.
 7. **Contours** (optional): cartographic contour lines from the DEM or DSM mosaics, with a chosen equidistance and a master (index) interval, smoothed for high resolution LiDAR, into a `Contours` subfolder.
 8. **Verify Outputs**: read-only integrity check of a results tree; flags corrupt or unreadable rasters, a CRS other than the expected EPSG, and missing expected products per area, with an optional report file.
-9. **Suitability Mask**: binary mask per mine, 1 where the slope is at or below a threshold (degrees or percent) and the annual solar radiation is at or above a minimum, clipped to each mine polygon.
+9. **Suitability Mask**: binary mask per mine, 1 where the slope is at or below a threshold (degrees or percent) and the annual solar radiation is at or above a minimum, clipped to each mine polygon; optionally also a second raster with the suitable cells graded by solar class (1 to 6).
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -85,7 +85,7 @@ flowchart TD
     T4 --> RCL["Reclass subfolder<br/>ASPECT_DIR, ASPECT_RCL,<br/>SLOPE_RCL, SOLARUNI_RCL<br/>(+ legenda)"]
     S --> T9["Tool 9<br/>Suitability Mask"]
     SOL --> T9
-    T9 --> APT["Per mine masks<br/>Mine_SOURCE_APT.tif (1/0)"]
+    T9 --> APT["Per mine masks<br/>Mine_SOURCE_APT.tif (1/0)<br/>+ optional APTCLS (solar class 3-6)"]
     M -.-> V8["Tool 8 (optional)<br/>Verify Outputs"]
     S -.-> V8
     SOL -.-> V8
@@ -113,7 +113,7 @@ flowchart TD
 - **Tool 6** (optional) resamples the selected data types to a target cell size with core Resample, writing to a `Resample` folder grouped by area; continuous rasters use bilinear, reclassified (`_RCL`) rasters use nearest. Typical use is 2 m to 5 m to lighten the later steps.
 - **Tool 7** (optional) generates cartographic contour lines from the DEM or DSM mosaics: it smooths the surface (Focal mean, given in meters so it is resolution independent), contours at the chosen equidistance, smooths the lines (PAEK), flags the master (index) contours and drops the short noise rings, writing one polyline shapefile per area to a `Contours` subfolder. Needs Spatial Analyst.
 - **Tool 8** verifies a results tree without writing anything (except an optional report): every `.tif` must have a valid GeoTIFF signature, open in arcpy, and match the expected EPSG; every area with a base mosaic must have the expected products. The `Resample` tree is checked for integrity but not completeness.
-- **Tool 9** builds the final binary suitability mask per mine: `1` where slope <= the threshold (given in degrees or percent) AND `SOLARUNI` >= the minimum (default 1400 kWh/m2, the lower bound of solar class 3), else `0`, computed on the area raster that covers each mine (matched by name, else spatially) and clipped to the mine polygons (same-name polygons are one mine). Output `<Mine>_<SOURCE>_APT.tif`. The weighted overlay and the REN/RAN/PDM exclusions remain outside this toolbox.
+- **Tool 9** builds the final binary suitability mask per mine: `1` where slope <= the threshold AND `SOLARUNI` >= the minimum (default 1400 kWh/m2, the lower bound of solar class 3), else `0`, computed on the area raster that covers each mine (matched by name, else spatially) and clipped to the mine polygons (same-name polygons are one mine). The slope threshold unit picks the slope raster and the comparison runs in its own units: `percent` reads the `SLOPEP` raster, `degrees` reads `SLOPE`. Output `<Mine>_<SOURCE>_APT.tif`, and optionally `<Mine>_<SOURCE>_APTCLS.tif`, the mask multiplied by the annual solar radiation reclassified into classes 1 to 6, so suitable cells keep their solar class (3 to 6) and the rest is 0. When an input exists in more than one resolution tree, it uses the finest available for both slope and solar. The weighted overlay and the REN/RAN/PDM exclusions remain outside this toolbox.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent checks and clips, deliberately without a datum shift (see [Limitations and notes](#limitations-and-notes)).
 
 ---
@@ -323,18 +323,19 @@ The final binary mask per mine: `1` = suitable (gentle slope AND enough solar), 
 
 | Parameter | Description |
 | --- | --- |
-| Results folder | The tree with the `SLOPE` and `SOLARUNI` rasters (Tools 3 and 4 outputs; the `Resample` tree is not scanned, point at it directly to use resampled inputs). |
+| Results folder | The tree with the slope (`SLOPE` or `SLOPEP`) and `SOLARUNI` rasters (Tools 3 and 4 outputs; the `Resample` tree is not scanned, point at it directly to use resampled inputs). |
 | Recurse subfolders | On (default). |
 | Source | `DEM` (default) or `DSM`. |
 | Mask polygons (mines) | Polygon layer; polygons sharing a name are treated as one mine. |
 | Mine name field | Names each output (sanitized). |
-| Output folder | One `<Mine>_<SOURCE>_APT.tif` per mine. |
-| Slope threshold units | `degrees` (default) or `percent` (converted internally; 20 percent = 11.31 degrees). |
+| Output folder | One `<Mine>_<SOURCE>_APT.tif` per mine (plus `_APTCLS.tif` if the class output is on). |
+| Slope threshold units | `percent` (default) reads the `SLOPEP` raster; `degrees` reads the `SLOPE` raster. The comparison runs in the raster's own units, with no conversion, so pick the unit that matches the slope raster you produced in Tool 3. |
 | Maximum suitable slope | Default 20. Slope at or below it is suitable. |
 | Minimum suitable solar radiation | Default 1400 kWh/m2, the lower bound of solar class 3 (so classes 3 to 6 are suitable, 1 and 2 are not). |
+| Also output solar-class suitability | On by default. Also writes `<Mine>_<SOURCE>_APTCLS.tif`, the binary mask multiplied by the solar radiation in classes 1 to 6 (the same breaks as Tool 5, computed in place from `SOLARUNI` so Tool 5 need not have run). Suitable cells keep their solar class (3 to 6), the rest is 0. |
 | Overwrite existing outputs | Off skips existing masks. |
 
-Each mine is matched to the area raster that covers it, by name first (an area named like the mine) and spatially otherwise (the raster whose extent contains the most polygon centroids), so it works on per area results and on cluster results; a warning is issued when part of a mine falls outside the chosen raster. The computation is bounded to the mine polygons (snapped to the slope grid) and clipped to their shape with Extract By Mask. Cells that are NoData in either input stay NoData in the mask (only cells with data become 1 or 0).
+Each mine is matched to the area raster that covers it, by name first (an area named like the mine) and spatially otherwise (the raster whose extent contains the most polygon centroids), so it works on per area results and on cluster results; a warning is issued when part of a mine falls outside the chosen raster. When the results folder holds more than one resolution tree (for example the `2m` and `50cm` trees Tool 2 builds), it uses the finest resolution present for both the slope and the solar of each area, the same one for both so a mine never mixes grids, and reports a single summary line. The computation is bounded to the mine polygons (snapped to the slope grid) and clipped to their shape with Extract By Mask. Cells that are NoData in either input stay NoData in the mask (only cells with data become 1 or 0).
 
 ---
 
@@ -347,10 +348,10 @@ A single convention links the tools:
 - Solar: `{Area}_{SOURCE}_SOLARUNI` or `_SOLAROVC` (global, by diffuse model), with `_SOLARUNIDIR` / `_SOLARUNIDIF` / `_SOLARUNIDUR` (and the `_SOLAROVC` equivalents) for the optional direct, diffuse and duration rasters.
 - Reclassified (Tool 5): the suitability rasters go to a `Reclass` subfolder. The surface name plus `_RCL` (`SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`), and the aspect quadrants as `{Area}_{SOURCE}_ASPECT_DIR`.
 - Contours (Tool 7): `{Area}_{SOURCE}_CONT.shp` in a `Contours` subfolder, with `Contour` (elevation) and `master` (1/0) fields.
-- Suitability mask (Tool 9): `{Mine}_{SOURCE}_APT.tif` (1 = suitable, 0 = not), one per mine.
+- Suitability mask (Tool 9): `{Mine}_{SOURCE}_APT.tif` (1 = suitable, 0 = not), and optionally `{Mine}_{SOURCE}_APTCLS.tif` (the same mask graded by solar class 3 to 6, 0 elsewhere), one per mine.
 - Cluster: `Cluster_NNN_{SOURCE}` (overlap clustering), numbered by the smallest member FID; a `Cluster_NNN_members.txt` lists the member areas.
 
-The `.tif` extension is added on write. Area names are sanitized for ArcGIS and the file system (accents and c cedilla folded to ASCII, separators to underscore). If two different areas sanitize to the same name they get a numeric suffix; several AOI polygons of the **same** area are merged into one output.
+The `.tif` extension is added on write. Area names are sanitized for ArcGIS and the file system (accents and c cedilla folded to ASCII, separators to underscore). A leading Carta Militar sheet code is closed up with its quadrant letters (`1-A Valença` becomes `1A_Valenca`). A name starting with a digit keeps that digit for file output (valid on disk); the `M_` prefix that a geodatabase dataset needs is added only when the target is a geodatabase. If two different areas sanitize to the same name they get a numeric suffix; several AOI polygons of the **same** area are merged into one output.
 
 | Stage | Example output |
 | --- | --- |
