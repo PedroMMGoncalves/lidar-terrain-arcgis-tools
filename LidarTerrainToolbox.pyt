@@ -213,7 +213,27 @@ def _save_raster(raster, out_path):
 # Helpers (single source of truth for naming, sanitization, validation)
 # ===========================================================================
 
-def sanitize_name(raw_name):
+def _merge_sheet_code(s):
+    """Join a leading Carta Militar 1:50000 sheet code with its quadrant letters.
+
+    The sheet designation arrives with a separator, for example "1-A Valenca" which
+    step 2 of sanitize_name turns into "1_A_Valenca". The cartographic convention writes
+    the code closed up: "1A_Valenca". A multi sheet mosaic keeps the underscore between
+    sheets: "25_CD_29_A_..." becomes "25CD_29A_...".
+
+    Only a genuine leading run of "<digits>_<1-2 uppercase letters>" groups is affected,
+    matched from the start and required to end at an underscore or the string end. So an
+    ordinary name whose number runs into a lowercase word, like "Area_16_Artigo", never
+    matches and is returned unchanged.
+    """
+    m = re.match(r"^(\d+_[A-Z]{1,2}(?:_\d+_[A-Z]{1,2})*)(?=_|$)", s)
+    if not m:
+        return s
+    prefix = re.sub(r"(\d)_([A-Z]{1,2})", r"\1\2", m.group(1))
+    return prefix + s[m.end():]
+
+
+def sanitize_name(raw_name, to_geodatabase=False):
     """Convert an Area attribute value into a name safe for ArcGIS and the file system.
 
     Steps (per spec 3.1):
@@ -221,8 +241,14 @@ def sanitize_name(raw_name):
       2. Replace whitespace and separators with underscore.
       3. Remove anything that is not [A-Za-z0-9_].
       4. Collapse repeated underscores and trim.
-      5. If it starts with a digit, prefix M_.
-      6. Truncate to MAX_NAME_LEN.
+      5. Merge a leading cartographic sheet code with its quadrant letters, so
+         "1-A Valenca" becomes "1A_Valenca" (see _merge_sheet_code).
+      6. Only when to_geodatabase is True and the result starts with a digit, prefix M_.
+         A geodatabase dataset name cannot start with a digit, but a file on disk can, so
+         the default (file output) keeps the clean name. Every tool here writes .tif
+         files, so the default is what they all use; the flag is there for a future
+         caller that writes into a .gdb.
+      7. Truncate to MAX_NAME_LEN.
 
     Collision handling is NOT done here. The caller keeps a set of used names and
     calls dedupe_name (spec 3.7). Logs via AddMessage when it changes a name.
@@ -244,7 +270,9 @@ def sanitize_name(raw_name):
         _err(msg)
         raise ValueError(msg)
 
-    if s[0].isdigit():
+    s = _merge_sheet_code(s)
+
+    if to_geodatabase and s[0].isdigit():
         s = "M_" + s
     if len(s) > MAX_NAME_LEN:
         s = s[:MAX_NAME_LEN].strip("_")
@@ -4176,7 +4204,18 @@ def _run_self_tests():
     check("c cedilha to c", sanitize_name("Mação") == "Macao")
     check("spaces to underscore", sanitize_name("Area Norte") == "Area_Norte")
     check("hyphen separator to underscore", sanitize_name("Sao-Chico") == "Sao_Chico")
-    check("leading digit prefixed", sanitize_name("2 Areas").startswith("M_"))
+    check("leading digit kept for file output", sanitize_name("2 Areas") == "2_Areas")
+    check("leading digit prefixed for geodatabase",
+          sanitize_name("2 Areas", to_geodatabase=True).startswith("M_"))
+    check("sheet code merged", sanitize_name("1-A Valença") == "1A_Valenca")
+    check("sheet code merged (two digit sheet)",
+          sanitize_name("10-A Celorico de Basto") == "10A_Celorico_de_Basto")
+    check("multi sheet code merged",
+          sanitize_name("25-CD 29-A Rosmaninhal Segura Retorta") == "25CD_29A_Rosmaninhal_Segura_Retorta")
+    check("number running into a word is not merged",
+          sanitize_name("Area 16 Artigo 1452 EDM") == "Area_16_Artigo_1452_EDM")
+    check("sheet code merged then prefixed for geodatabase",
+          sanitize_name("1-A Valença", to_geodatabase=True) == "M_1A_Valenca")
     check("collapses repeated underscores", "__" not in sanitize_name("Area   Norte"))
     check("truncated to limit", len(sanitize_name("A" * 100)) <= MAX_NAME_LEN)
     check_raises("empty result raises", lambda: sanitize_name("***"))
