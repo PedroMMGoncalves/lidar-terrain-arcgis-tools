@@ -4014,9 +4014,12 @@ class SuitabilityMask(object):
             raise RuntimeError(msg)
         arcpy.CheckOutExtension("Spatial")
         try:
-            # Discover the SLOPE and SOLARUNI rasters per area (main tree, not Resample copies).
-            slope_by_area = {}
-            solar_by_area = {}
+            # Discover the slope and SOLARUNI rasters per area (main tree, not Resample copies).
+            # The same product can appear in more than one resolution tree (Tool 2 builds one per
+            # resolution, e.g. 2m and 50cm), so collect every candidate now and pick the finest
+            # resolution per area below, the same one for slope and solar.
+            slope_cand = {}
+            solar_cand = {}
             if recurse:
                 walker = os.walk(in_folder)
             else:
@@ -4032,25 +4035,39 @@ class SuitabilityMask(object):
                     if info["area"] is None or info["source"] != source or info["reclass"]:
                         continue
                     if info["product"] == slope_product:
-                        target = slope_by_area
+                        slope_cand.setdefault(info["area"], []).append(os.path.join(dirpath, fn))
                     elif info["product"] == "SOLARUNI":
-                        target = solar_by_area
-                    else:
-                        continue
-                    path = os.path.join(dirpath, fn)
-                    prev = target.get(info["area"])
-                    if prev and prev != path:
-                        _warn("Duplicate {} raster for area '{}': using {} over {}.".format(
-                            info["product"], info["area"], path, prev))
-                    target[info["area"]] = path
-            areas = sorted(set(slope_by_area) & set(solar_by_area))
-            if not areas:
+                        solar_cand.setdefault(info["area"], []).append(os.path.join(dirpath, fn))
+
+            if not (set(slope_cand) & set(solar_cand)):
                 msg = ("No area has both a {0} {1} and a {0} SOLARUNI raster under '{2}'. Run "
                        "Tools 3 and 4 first (for a percent threshold, Tool 3 must output slope "
                        "in percent).").format(source, slope_product, in_folder)
                 _err(msg)
                 raise ValueError(msg)
-            only_one = sorted((set(slope_by_area) ^ set(solar_by_area)))
+
+            # Pick the finest resolution present for both inputs, per area.
+            slope_by_area = {}
+            solar_by_area = {}
+            cell_cache = {}
+            multi = []                 # areas that had the inputs in more than one resolution
+            mixed = []                 # areas with no resolution shared by slope and solar
+            for area in set(slope_cand) & set(solar_cand):
+                sp, so, cell = self._pick_finest_pair(slope_cand[area], solar_cand[area], cell_cache)
+                slope_by_area[area] = sp
+                solar_by_area[area] = so
+                if len(slope_cand[area]) > 1 or len(solar_cand[area]) > 1:
+                    multi.append(area)
+                if cell is None:
+                    mixed.append(area)
+            areas = sorted(slope_by_area)
+            if multi:
+                _msg("{} area(s) had the inputs in more than one resolution; used the finest "
+                     "available (smallest cell size) for each.".format(len(multi)))
+            if mixed:
+                _warn("Slope and SOLARUNI shared no resolution for: {}. Used the finest of each; "
+                      "verify these.".format(", ".join(sorted(mixed))))
+            only_one = sorted(set(slope_cand) ^ set(solar_cand))
             if only_one:
                 _warn("Areas missing one of the two inputs (skipped for spatial matching): {}"
                       .format(", ".join(only_one)))
@@ -4127,6 +4144,27 @@ class SuitabilityMask(object):
             _err(msg)
             raise RuntimeError(msg)
         return
+
+    def _cell(self, path, cache):
+        """Mean cell width of a raster, cached by path (a light header read)."""
+        if path not in cache:
+            cache[path] = arcpy.Raster(path).meanCellWidth
+        return cache[path]
+
+    def _pick_finest_pair(self, slope_paths, solar_paths, cache):
+        """Choose the slope and SOLARUNI rasters from the finest resolution present for BOTH
+        (the smallest cell size shared by the two), so a mine never mixes grids. Returns
+        (slope_path, solar_path, cell). When there is no shared resolution, returns the finest
+        of each with cell None, so the caller can flag it."""
+        sl = sorted((self._cell(p, cache), p) for p in slope_paths)
+        so = sorted((self._cell(p, cache), p) for p in solar_paths)
+        so_by_cell = {}
+        for c, p in so:
+            so_by_cell.setdefault(round(c, 3), p)      # finest first wins on a genuine duplicate
+        for c, p in sl:
+            if round(c, 3) in so_by_cell:
+                return p, so_by_cell[round(c, 3)], c
+        return sl[0][1], so[0][1], None
 
     def _area_for_mine(self, mine, shapes, areas, slope_by_area, aoi_sr, ext_cache):
         """Resolve which area raster covers a mine: by name first (the area named like the mine),
