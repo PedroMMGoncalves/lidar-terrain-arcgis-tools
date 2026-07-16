@@ -374,6 +374,8 @@ Merge the per area class rasters of a product into **one raster covering every a
 
 The tool logs the merged grid size in cells before writing, and warns when it exceeds about 2 billion, so merging the native 0.5 m or 2 m rasters instead of the 5 m ones is an informed choice rather than a surprise. It fails loud when the rasters of a product do not all share one CRS, one cell size and one NoData value, since mosaicking a mix would silently resample or let one raster's NoData collar read as another's data, and again after writing when the merged grid is smaller than the union of the inputs, since that means areas were dropped.
 
+After writing, the tool builds statistics and a **raster attribute table** on each merged raster (best effort). gdal leaves no attribute table, and on a large mosaic ArcGIS Pro then enumerates the class values from a pyramid sample and can miss a class entirely (typically the `0` that fills most of a suitability mask), so the symbology looks empty of it even though the data is present. The attribute table lists the exact values and counts, so the class symbology is correct at once. Older mosaics from before this change display the same way until you run **Build Raster Attribute Table** on them.
+
 > **`0` and NoData are not the same thing.** `0` means "surveyed, not suitable"; NoData means "outside the area, never looked at". Declaring `0` as NoData makes them indistinguishable, and you lose the denominator: the suitable share of an area can no longer be computed from that raster alone. Keep it off unless the deliverable is meant to show only the suitable ground. On same source scattered data the areas do not overlap, so it is only a display and counting flag on the output.
 
 ### Tool 11, Vectorize Class Rasters

@@ -202,6 +202,21 @@ def _build_pyramids_stats(path):
         _warn("Could not build pyramids/statistics for {}: {}".format(os.path.basename(path), exc))
 
 
+def _build_class_rat(path):
+    """Build statistics and a raster attribute table on a merged class raster, so ArcGIS lists its
+    exact class values in the symbology. gdal writes the mosaic without a raster attribute table; on
+    a large raster ArcGIS then enumerates the values from a pyramid sample and can miss a class (for
+    example the 0 that fills most of a suitability mask), so the layer looks empty of it. The
+    attribute table gives the exact values and counts instead. Best effort: a failure here does not
+    invalidate the raster, so it warns instead of raising."""
+    try:
+        arcpy.management.CalculateStatistics(path)
+        arcpy.management.BuildRasterAttributeTable(path, "Overwrite")
+    except Exception as exc:
+        _warn("Could not build statistics/attribute table for {}: {}".format(
+            os.path.basename(path), exc))
+
+
 def _save_raster(raster, out_path):
     """Save a Spatial Analyst / Image Analyst raster result, deleting the partial output on error.
     Retries a few times when the existing output cannot be deleted or is locked (often a transient
@@ -4748,6 +4763,8 @@ class MergeClasses(object):
                         "dropped during the merge; the output is incomplete.".format(
                             token, src, chk.width, chk.height, ncols, nrows))
                 del chk
+                # gdal leaves no attribute table, which breaks the class symbology in Pro; add one.
+                _build_class_rat(out_path)
                 _msg("{} ({}): merged -> {} ({:.1f} MB)".format(
                     token, src, os.path.basename(out_path),
                     os.path.getsize(out_path) / (1024.0 * 1024.0)))
