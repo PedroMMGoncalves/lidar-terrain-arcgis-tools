@@ -456,6 +456,30 @@ def _find_base_mosaics(root, recurse, allowed_sources, skip_dirs=(RESAMPLE_DIRNA
     return mosaics
 
 
+def _resample_all_types():
+    """The full list of resample data-type tokens, from the naming convention: the sources, the
+    products (except CONT, which is a shapefile), and the _RCL reclassified variants. One place,
+    used by the tool's dropdown and by the present-types scan."""
+    return (list(SOURCES) + [p for p in PRODUCTS if p != "CONT"]
+            + [p + "_" + RECLASS_SUFFIX for p in RECLASSIFIED_PRODUCTS])
+
+
+def _present_type_tokens(folder, recurse, skip_dirs, allowed):
+    """The subset of `allowed` type tokens that actually have a raster under `folder`. Reads file
+    names only (no raster is opened), so it is cheap enough to fill a dialog dropdown from the real
+    contents instead of the full static list. Pure (os + string parsing), so it is unit tested."""
+    allowed_set = set(allowed)
+    present = set()
+    try:
+        for _dirpath, fn in _walk_tifs(folder, recurse, skip_dirs):
+            tok = _resample_type_token(parse_source_and_product(fn))
+            if tok in allowed_set:
+                present.add(tok)
+    except OSError:
+        pass
+    return present
+
+
 def _as_class_id(value):
     """Coerce a class_id to int, failing loud on anything that is not a whole
     number. Silently truncating (for example 1.4 to 1) would merge distinct
@@ -3632,10 +3656,15 @@ class Resample(object):
     def __init__(self):
         self.label = "06 - Resample"
         self.description = ("Resample the named factor rasters (mosaics and surfaces) to a target "
-                            "cell size, in batch, selecting which data types to process. Outputs go "
-                            "to a 'Resample' folder inside the results root, grouped by area, with the "
-                            "file names unchanged. Continuous rasters use bilinear; reclassified "
-                            "(_RCL) rasters use nearest so the ordinal classes are preserved.")
+                            "cell size, in batch, selecting which data types to process. The type "
+                            "list is filled from what actually exists under the folder you pick, so "
+                            "you can point it at the whole project root and it finds every product "
+                            "wherever it was written. Outputs go to a 'Resample' folder inside that "
+                            "root, grouped by area, file names unchanged, so everything lands in one "
+                            "place. When a product exists in more than one resolution, one is chosen "
+                            "per the resolution setting. Continuous rasters use bilinear; the class "
+                            "rasters (_RCL, APT, APTCLS, ASPECT_DIR) and aspect use nearest, or "
+                            "MAJORITY when you set it, to preserve the classes.")
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -3652,11 +3681,9 @@ class Resample(object):
             displayName="Data types to resample", name="types",
             datatype="GPString", parameterType="Required", direction="Input", multiValue=True)
         p_types.filter.type = "ValueList"
-        # Derived from the tuples so new products (slope percent, solar variants) appear
-        # automatically; the _RCL variants are the products Tool 05 reclassifies. CONT is a
-        # shapefile (Tool 7), so it is excluded, there is no contour raster to resample.
-        p_types.filter.list = (list(SOURCES) + [p for p in PRODUCTS if p != "CONT"]
-                               + [p + "_" + RECLASS_SUFFIX for p in RECLASSIFIED_PRODUCTS])
+        # The full list, from the naming convention (updateParameters narrows it to what is really
+        # under the chosen folder). CONT is a shapefile (Tool 7), so it has no raster to resample.
+        p_types.filter.list = _resample_all_types()
         p_types.value = ["DEM", "DSM"]
 
         p_cell = arcpy.Parameter(
@@ -3671,24 +3698,63 @@ class Resample(object):
         p_method.filter.list = ["auto", "NEAREST", "MAJORITY", "BILINEAR", "CUBIC"]
         p_method.value = "auto"          # bilinear for continuous, nearest for categorical
 
+        p_res_policy = arcpy.Parameter(
+            displayName="Source resolution when a product exists in several", name="res_policy",
+            datatype="GPString", parameterType="Optional", direction="Input")
+        p_res_policy.filter.type = "ValueList"
+        p_res_policy.filter.list = ["finest", "coarsest"]
+        p_res_policy.value = "finest"    # matches the Suitability Mask, which also picks the finest
+
         p_overwrite = arcpy.Parameter(
             displayName="Overwrite existing outputs", name="overwrite_existing",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
-        return [p_in, p_recurse, p_types, p_cell, p_method, p_overwrite]
+        return [p_in, p_recurse, p_types, p_cell, p_method, p_res_policy, p_overwrite]
 
     def isLicensed(self):
         # Core Data Management Resample, no extension needed.
         return True
 
     def updateParameters(self, parameters):
+        # Fill the type list from what is actually under the chosen folder, so the dialog offers
+        # only products that exist there (point at the project root and it shows everything that
+        # was generated). Rescan only when the folder or recurse just changed, to keep the dialog
+        # snappy; the run rediscovers from disk anyway. Falls back to the full list on an empty or
+        # unreadable folder, so nothing is ever hidden by mistake.
+        p_in, p_recurse, p_types = parameters[0], parameters[1], parameters[2]
+        if (p_in.altered or p_recurse.altered) and p_in.valueAsText:
+            present = _present_type_tokens(p_in.valueAsText, bool(p_recurse.value),
+                                           (RESAMPLE_DIRNAME,), _resample_all_types())
+            p_types.filter.list = [t for t in _resample_all_types() if t in present] or \
+                _resample_all_types()
+            if p_types.values:
+                keep = [v for v in p_types.values if v in set(p_types.filter.list)]
+                p_types.value = keep
         return
 
     def updateMessages(self, parameters):
         if parameters[3].value is not None and float(parameters[3].value) <= 0:
             parameters[3].setErrorMessage("Target cell size must be a positive number of meters.")
         return
+
+    def _pick_by_resolution(self, found, res_policy):
+        """Keep one raster per (area, token) when it exists in several resolutions, chosen by cell
+        size (finest = smallest, coarsest = largest). Returns (kept_list, deduped_count)."""
+        by_key = {}
+        for item in found:
+            _path, info, token = item
+            by_key.setdefault((info["area"], token), []).append(item)
+        kept = []
+        deduped = 0
+        for group in by_key.values():
+            if len(group) == 1:
+                kept.append(group[0])
+                continue
+            ordered = sorted(group, key=lambda it: arcpy.Raster(it[0]).meanCellWidth)
+            kept.append(ordered[0] if res_policy == "finest" else ordered[-1])
+            deduped += len(group) - 1
+        return kept, deduped
 
     def execute(self, parameters, messages):
         # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
@@ -3704,7 +3770,8 @@ class Resample(object):
         selected = set(str(s).upper() for s in (parameters[2].values or []))
         target_cell = float(parameters[3].value)
         method_choice = (parameters[4].valueAsText or "auto")
-        overwrite_existing = bool(parameters[5].value)
+        res_policy = (parameters[5].valueAsText or "finest")
+        overwrite_existing = bool(parameters[6].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -3721,19 +3788,33 @@ class Resample(object):
 
         # Discover the named rasters of the selected types, never descending into the Resample
         # output folder so a re-run does not resample its own outputs.
-        rasters = []
+        found = []
         for dirpath, fn in _walk_tifs(in_folder, recurse, (RESAMPLE_DIRNAME,)):
             info = parse_source_and_product(fn)
             token = _resample_type_token(info)
             if token is None or token not in selected:
                 continue
-            rasters.append((os.path.join(dirpath, fn), info, token))
+            found.append((os.path.join(dirpath, fn), info, token))
 
-        if not rasters:
+        if not found:
             msg = "No rasters of the selected types ({}) found in '{}'.".format(
                 ", ".join(sorted(selected)), in_folder)
             _err(msg)
             raise ValueError(msg)
+
+        # No silent skips: name the selected types that had no raster under the folder.
+        missing = sorted(selected - {t for _p, _i, t in found})
+        if missing:
+            _warn("Selected but not found under '{}': {}. Nothing was resampled for them."
+                  .format(in_folder, ", ".join(missing)))
+
+        # The same product can exist in more than one resolution (a 2m and a 50cm tree) and would
+        # otherwise write to the same output name, colliding. Group by (area, token) and keep one
+        # per the resolution policy, so a run over the whole project root consolidates cleanly.
+        rasters, deduped = self._pick_by_resolution(found, res_policy)
+        if deduped:
+            _msg("{} product(s) existed in more than one resolution; kept the {} of each."
+                 .format(deduped, res_policy))
 
         _msg("Resampling {} raster(s) to {:g} m into '{}'.".format(len(rasters), target_cell, out_root))
         total = len(rasters)
@@ -4945,6 +5026,16 @@ def _run_self_tests():
               [(a, s) for _p, a, s in base] == [("AreaA", "DEM")])
         check_raises("_find_base_mosaics fails loud when none match",
                      lambda: _find_base_mosaics(tmpdir, True, ("DSM",)))
+        # _present_type_tokens: only the types with a real raster under the folder, so the dialog
+        # offers what exists. The Resample copy is skipped, the SLOPE_RCL in Reclass is included.
+        present = _present_type_tokens(tmpdir, True, (RESAMPLE_DIRNAME,), _resample_all_types())
+        check("_present_type_tokens sees the base, surface and reclass, not the resample copy",
+              present == {"DEM", "SLOPE", "SLOPE_RCL"})
+        check("_present_type_tokens is empty for a missing folder",
+              _present_type_tokens(os.path.join(tmpdir, "nope"), True, (), _resample_all_types())
+              == set())
+        check("_resample_all_types has no CONT and carries the _RCL variants",
+              "CONT" not in _resample_all_types() and "SOLARUNI_RCL" in _resample_all_types())
     finally:
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
