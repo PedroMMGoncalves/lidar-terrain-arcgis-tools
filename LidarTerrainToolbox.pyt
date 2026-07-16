@@ -4664,6 +4664,16 @@ class MergeClasses(object):
                           "denser writer or a finer cell size will not. Consider merging the 5 m "
                           "rasters, not the native ones.".format(token, src, cells))
                 self._merge(paths, out_path, token, src, zero_nodata)
+                # Fail loud on a silent drop: BuildVRT used to skip inputs whose CRS WKT was not
+                # byte identical, shrinking the grid without an error. Verify the output covers the
+                # expected union grid (targetAlignedPixels can shift it by up to one cell).
+                chk = arcpy.Raster(out_path)
+                if chk.width < ncols - 1 or chk.height < nrows - 1:
+                    raise RuntimeError(
+                        "{} ({}): merged grid is {} x {} but the inputs span {} x {}. Inputs were "
+                        "dropped during the merge; the output is incomplete.".format(
+                            token, src, chk.width, chk.height, ncols, nrows))
+                del chk
                 _msg("{} ({}): merged -> {} ({:.1f} MB)".format(
                     token, src, os.path.basename(out_path),
                     os.path.getsize(out_path) / (1024.0 * 1024.0)))
@@ -4683,15 +4693,21 @@ class MergeClasses(object):
         return
 
     def _merge(self, paths, out_path, token, src, zero_nodata):
-        """Write the merged raster. GDAL builds a VRT over the inputs and translates it to a
-        sparse LZW BigTIFF, so the mostly empty country wide grid costs almost nothing. Without
-        osgeo, fall back to arcpy, which writes every block.
+        """Write the merged raster with gdal.Warp onto one aligned grid, a sparse LZW BigTIFF, so
+        the mostly empty country wide grid costs almost nothing. Without osgeo, fall back to arcpy,
+        which writes every block.
+
+        Warp, not BuildVRT: BuildVRT skips any input whose CRS WKT is not byte identical to the
+        first input's, even when it is the same CRS, and only warns. On the per area rasters, whose
+        WKT varies slightly, that silently dropped most areas and destroyed the merge. Warp
+        tolerates the WKT variants, snaps every area onto one grid (targetAlignedPixels) and
+        preserves every class exactly. Nearest keeps the values categorical; the sources' own
+        NoData is passed as src and dst NoData, so the empty collar stays NoData and the grid is
+        sparse.
 
         zero_nodata declares the 0 class as NoData, flagged on the OUTPUT after the merge (both
-        engines), so the sources' own NoData is preserved. A 0 that won an overlap is then hidden
-        rather than never having competed; on scattered, same source data the areas do not overlap,
-        so this is moot in practice. Overlaps resolve deterministically to the LAST raster in the
-        sorted list on both engines.
+        engines), so the sources' own NoData is preserved. On scattered, same source data the areas
+        do not overlap, so an overlap winner is moot in practice.
         """
         try:
             from osgeo import gdal
@@ -4706,26 +4722,27 @@ class MergeClasses(object):
             self._merge_arcpy(paths, out_path, zero_nodata, token, src)
             return
 
-        tmp_vrt = out_path[:-4] + "_tmp.vrt"
-        try:
-            # Keep the sources' intrinsic NoData: srcNodata would REPLACE it, so the real NoData
-            # collar of each clipped raster (9999 in the _RCL rasters) would be read as data. Build
-            # the VRT normally, translate, then flag 0 as NoData on the output afterwards.
-            # gdal returns None on failure instead of raising; surface it.
-            if gdal.BuildVRT(tmp_vrt, paths) is None:
-                raise RuntimeError("gdal.BuildVRT returned None")
-            opts = ["BIGTIFF=YES", "COMPRESS=LZW", "TILED=YES", "SPARSE_OK=TRUE"]
-            out_ds = gdal.Translate(out_path, tmp_vrt, creationOptions=opts)
-            if out_ds is None:
-                raise RuntimeError("gdal.Translate returned None")
-            if zero_nodata:
-                # Overlaps were already resolved treating 0 as a value, so a 0 that won an overlap
-                # is now hidden rather than never having competed, same as the arcpy fallback.
-                out_ds.GetRasterBand(1).SetNoDataValue(0)
-            out_ds = None                          # flush and close
-        finally:
-            if os.path.exists(tmp_vrt):
-                os.remove(tmp_vrt)
+        ref = gdal.Open(paths[0])
+        nd = ref.GetRasterBand(1).GetNoDataValue()
+        gt = ref.GetGeoTransform()
+        xres, yres = abs(gt[1]), abs(gt[5])
+        ref = None
+        if nd is None:
+            # Fail loud: without a NoData the empty collar would be written as data.
+            raise RuntimeError("{} ({}): source '{}' has no NoData value; cannot merge without "
+                               "painting the collar as data.".format(
+                                   token, src, os.path.basename(paths[0])))
+
+        opts = ["BIGTIFF=YES", "COMPRESS=LZW", "TILED=YES", "SPARSE_OK=TRUE"]
+        # gdal returns None on failure instead of raising; surface it.
+        out_ds = gdal.Warp(out_path, paths, xRes=xres, yRes=yres, targetAlignedPixels=True,
+                           resampleAlg="near", srcNodata=nd, dstNodata=nd, multithread=True,
+                           creationOptions=opts)
+        if out_ds is None:
+            raise RuntimeError("gdal.Warp returned None")
+        if zero_nodata:
+            out_ds.GetRasterBand(1).SetNoDataValue(0)
+        out_ds = None                              # flush and close
 
     def _merge_arcpy(self, paths, out_path, zero_nodata, token, src):
         """Fallback merge with core MosaicToNewRaster. Pixel type and band count come from the
