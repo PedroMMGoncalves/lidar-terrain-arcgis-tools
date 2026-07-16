@@ -220,6 +220,36 @@ def _save_raster(raster, out_path):
             time.sleep(2)
 
 
+# The fixed NoData for the categorical suitability masks. 255 is never a class of APT {0,1} or
+# APTCLS {0,3,4,5,6}, so it cannot collide with real data, and being fixed it is identical across
+# every mine, which lets the per mine rasters merge cleanly.
+CLASS_MASK_NODATA = 255
+
+
+def _save_class_mask(raster, out_path):
+    """Save a categorical suitability mask (APT / APTCLS) forcing 8 bit unsigned storage and a
+    fixed NoData of 255. Left to itself, raster.save() lets ArcGIS pick the pixel type and NoData
+    from the content; on a small or degenerate mine (for example one that is entirely suitable, so
+    the only value present is 1) it can pick a NoData that equals a real class (0 or 1), and every
+    cell of that class then reads as empty. This must happen at creation, while ExtractByMask still
+    marks the outside of the mask as true NoData: a raster already written with a colliding NoData
+    cannot be recovered, because the class value and NoData are then indistinguishable.
+
+    Folds the NoData onto 255 in an 8 bit array, then writes it back declaring 255 as NoData, the
+    same deterministic technique the Tool 06 scrub uses. NumPyArrayToRaster drops the CRS, so it is
+    restored with DefineProjection."""
+    import numpy as np
+    sr = raster.spatialReference
+    lower_left = arcpy.Point(raster.extent.XMin, raster.extent.YMin)
+    cell_w, cell_h = raster.meanCellWidth, raster.meanCellHeight
+    arr = arcpy.RasterToNumPyArray(raster, nodata_to_value=CLASS_MASK_NODATA).astype(np.uint8)
+    with _CleanupOnError(out_path):
+        arcpy.NumPyArrayToRaster(arr, lower_left, cell_w, cell_h,
+                                 value_to_nodata=CLASS_MASK_NODATA).save(out_path)
+    if sr is not None and sr.name not in (None, "", "Unknown"):
+        arcpy.management.DefineProjection(out_path, sr)
+
+
 # ===========================================================================
 # Helpers (single source of truth for naming, sanitization, validation)
 # ===========================================================================
@@ -4439,7 +4469,7 @@ class SuitabilityMask(object):
             slope_r = arcpy.sa.Raster(slope_path)
             solar_r = arcpy.sa.Raster(solar_path)
             apt = arcpy.sa.Con((slope_r <= thr) & (solar_r >= solar_min), 1, 0)
-            _save_raster(arcpy.sa.ExtractByMask(apt, mask_fc), out_path)
+            _save_class_mask(arcpy.sa.ExtractByMask(apt, mask_fc), out_path)
             if class_path:
                 # Result 2: the binary mask times the solar radiation in classes 1 to 6. The
                 # breaks mirror Tool 5 (SOLAR_RCL_CLASSES); on continuous radiation a cell landing
@@ -4447,7 +4477,7 @@ class SuitabilityMask(object):
                 remap = arcpy.sa.RemapRange([[lo, hi, cls] for (cls, lo, hi) in SOLAR_RCL_CLASSES])
                 solar_cls = arcpy.sa.Reclassify(solar_r, "Value", remap, "NODATA")
                 apt_cls = apt * solar_cls
-                _save_raster(arcpy.sa.ExtractByMask(apt_cls, mask_fc), class_path)
+                _save_class_mask(arcpy.sa.ExtractByMask(apt_cls, mask_fc), class_path)
         finally:
             arcpy.env.extent = prev_extent
             arcpy.env.snapRaster = prev_snap
@@ -4521,18 +4551,28 @@ def _group_class_rasters(in_folder, recurse, source, selected):
 
 
 def _assert_uniform_grid(paths, label):
-    """Fail loud unless every raster shares one CRS and one cell size. Mosaicking a mix would
-    silently resample or reproject, and the merged classes would be wrong rather than obviously
-    broken. Returns (spatial_reference, cell_size, extent) of the union."""
+    """Fail loud unless every raster shares one CRS, one cell size and one NoData value. Mosaicking
+    a mix of CRS or cell size would silently resample or reproject; a mix of NoData values would let
+    one raster's NoData collar be read as another's data (and vice versa), which silently corrupts
+    the merge. A missing NoData is also rejected, since the empty collar would then be written as
+    data. Returns (spatial_reference, cell_size, extent) of the union."""
     sr = None
     cell = None
+    nodata = None
     xmin = ymin = xmax = ymax = None
     for p in paths:
         d = arcpy.Describe(p)
         r_sr = d.spatialReference
-        r_cell = arcpy.Raster(p).meanCellWidth
+        r = arcpy.Raster(p)
+        r_cell = r.meanCellWidth
+        r_nd = r.noDataValue
+        if r_nd is None:
+            msg = ("{}: '{}' has no NoData value; its empty collar would merge as data. Rebuild it "
+                   "with a NoData value (Tools 05/09).".format(label, os.path.basename(p)))
+            _err(msg)
+            raise ValueError(msg)
         if sr is None:
-            sr, cell = r_sr, r_cell
+            sr, cell, nodata = r_sr, r_cell, r_nd
         else:
             if not _same_crs(sr, r_sr):
                 msg = ("{}: '{}' is {} but the others are {}. Merge one CRS at a time."
@@ -4543,6 +4583,13 @@ def _assert_uniform_grid(paths, label):
                 msg = ("{}: '{}' has a {:g} m cell but the others have {:g} m. Resample them to a "
                        "common cell size first (Tool 06)."
                        .format(label, os.path.basename(p), r_cell, cell))
+                _err(msg)
+                raise ValueError(msg)
+            if abs(r_nd - nodata) > 1e-6:
+                msg = ("{}: '{}' has NoData {:g} but the others have {:g}. A mixed NoData corrupts "
+                       "the merge, since one raster's NoData collar reads as another's data. "
+                       "Rebuild the class rasters with a consistent NoData (Tool 09)."
+                       .format(label, os.path.basename(p), r_nd, nodata))
                 _err(msg)
                 raise ValueError(msg)
         e = d.extent
