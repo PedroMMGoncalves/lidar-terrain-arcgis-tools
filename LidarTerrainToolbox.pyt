@@ -3756,6 +3756,40 @@ class Resample(object):
             deduped += len(group) - 1
         return kept, deduped
 
+    def _restrict_to_source_classes(self, src_path, out_path):
+        """Set to NoData any cell of the resampled raster whose value is not a class present in the
+        source. ArcGIS Resample with MAJORITY can read an 8-bit mask's NoData region and stamp
+        out-of-range values along the boundary; this scrubs them so only real classes survive.
+        Returns the count of cells scrubbed (0 leaves the raster untouched)."""
+        import numpy as np
+        src = arcpy.Raster(src_path)
+        src_nd = src.noDataValue
+        valid = set(int(v) for v in np.unique(arcpy.RasterToNumPyArray(src)))
+        if src_nd is not None:
+            valid.discard(int(src_nd))
+
+        out = arcpy.Raster(out_path)
+        out_nd = int(out.noDataValue) if out.noDataValue is not None else 255
+        lower_left = arcpy.Point(out.extent.XMin, out.extent.YMin)
+        cell_w, cell_h = out.meanCellWidth, out.meanCellHeight
+        sr = out.spatialReference
+        arr = arcpy.RasterToNumPyArray(out, nodata_to_value=out_nd)
+        bad = ~np.isin(arr, list(valid))
+        n = int(bad.sum())
+        if n == 0:
+            return 0
+
+        arr[bad] = out_nd
+        del out                                   # release the handle before replacing the file
+        tmp = os.path.join(os.path.dirname(out_path), "_scrub_" + os.path.basename(out_path))
+        arcpy.NumPyArrayToRaster(arr, lower_left, cell_w, cell_h,
+                                 value_to_nodata=out_nd).save(tmp)
+        arcpy.management.Delete(out_path)         # removes the .tif and its sidecars
+        arcpy.management.Rename(tmp, out_path)
+        if sr is not None and sr.name not in (None, "", "Unknown"):
+            arcpy.management.DefineProjection(out_path, sr)
+        return n
+
     def execute(self, parameters, messages):
         # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
         prev_overwrite = arcpy.env.overwriteOutput
@@ -3824,6 +3858,7 @@ class Resample(object):
         failed = []
         interpolated = []              # categorical rasters an explicit method would interpolate
         incompatible = []              # continuous rasters skipped because MAJORITY needs integer
+        cleaned_total = 0              # boundary garbage cells scrubbed from class rasters
         arcpy.SetProgressor("step", "Resampling rasters...", 0, total, 1)
         for path, info, token in rasters:
             arcpy.SetProgressorPosition()
@@ -3874,8 +3909,18 @@ class Resample(object):
                     if no_interp and method in ("BILINEAR", "CUBIC"):
                         interpolated.append("{} ({})".format(area, token))
                 arcpy.management.Resample(path, out_path, "{0} {0}".format(target_cell), method)
-                _msg("{} ({}): resampled {:g} m -> {:g} m ({}, {}) -> {}".format(
-                    area, token, native, target_cell, method, _crs_label(sr), fn))
+                # MAJORITY resample of an 8-bit mask can read the NoData region and stamp
+                # out-of-range garbage (4, 27, 207) along the boundary. For an integer class raster
+                # scrub any value the source does not have back to NoData. A clean raster is a
+                # no-op. Continuous rasters (float) are left alone.
+                cleaned = 0
+                if is_integer_pixel_type(src.pixelType) and no_interp:
+                    cleaned = self._restrict_to_source_classes(path, out_path)
+                    if cleaned:
+                        cleaned_total += cleaned
+                _msg("{} ({}): resampled {:g} m -> {:g} m ({}, {}) -> {}{}".format(
+                    area, token, native, target_cell, method, _crs_label(sr), fn,
+                    ", scrubbed {} boundary cell(s)".format(cleaned) if cleaned else ""))
                 created += 1
             except Exception as exc:
                 _delete_partial_raster(out_path)
@@ -3886,6 +3931,9 @@ class Resample(object):
         _msg("Done. Selected rasters: {}. Resampled: {}. Copied (already at target): {}. "
              "Skipped existing: {}. Skipped (MAJORITY needs integer): {}. Failed: {}.".format(
                  total, created, copied_native, skipped_existing, len(incompatible), len(failed)))
+        if cleaned_total:
+            _msg("Scrubbed {} boundary cell(s) of resample garbage (out-of-class values set to "
+                 "NoData) across the class rasters.".format(cleaned_total))
         if interpolated:
             # The user asked for it explicitly, so this is a warning, not a failure.
             _warn("{} class or aspect raster(s) were resampled with {}, which interpolates: it "
