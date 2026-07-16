@@ -4480,6 +4480,23 @@ def class_products():
     return list(CATEGORICAL_PRODUCTS) + [p + "_" + RECLASS_SUFFIX for p in RECLASSIFIED_PRODUCTS]
 
 
+def _fill_class_product_list(p_in, p_recurse, p_products):
+    """Fill a products multi-value list from the class rasters actually under the chosen folder, so
+    the dialog offers only products that exist there instead of the full static list. Shared by
+    Tools 10 and 11, which offer the same list and both discover with _group_class_rasters (no
+    skip dir, so the Resample folder is included). Rescans only when the folder or recurse just
+    changed, to keep the dialog snappy; the run rediscovers from disk anyway. Falls back to the
+    full list on an empty or unreadable folder, so nothing is ever hidden by mistake, and prunes a
+    selection that the new folder no longer offers."""
+    if (p_in.altered or p_recurse.altered) and p_in.valueAsText:
+        present = _present_type_tokens(p_in.valueAsText, bool(p_recurse.value), (),
+                                       class_products())
+        p_products.filter.list = [t for t in class_products() if t in present] or class_products()
+        if p_products.values:
+            keep = [v for v in p_products.values if v in set(p_products.filter.list)]
+            p_products.value = keep
+
+
 def _group_class_rasters(in_folder, recurse, source, selected):
     """Discover the class rasters under in_folder and group them by (source, product).
 
@@ -4598,8 +4615,13 @@ class MergeClasses(object):
                 p_overwrite]
 
     def isLicensed(self):
-        # GDAL Translate, or core MosaicToNewRaster as the fallback. No extension.
+        # GDAL Warp, or core MosaicToNewRaster as the fallback. No extension.
         return True
+
+    def updateParameters(self, parameters):
+        # Offer only the class products that actually exist under the chosen folder.
+        _fill_class_product_list(parameters[0], parameters[1], parameters[3])
+        return
 
     def execute(self, parameters, messages):
         # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
@@ -4829,6 +4851,11 @@ class VectorizeClasses(object):
     def isLicensed(self):
         # RasterToPolygon and CalculateGeometryAttributes are core. No extension.
         return True
+
+    def updateParameters(self, parameters):
+        # Offer only the class products that actually exist under the chosen folder.
+        _fill_class_product_list(parameters[0], parameters[1], parameters[3])
+        return
 
     def execute(self, parameters, messages):
         prev_overwrite = arcpy.env.overwriteOutput

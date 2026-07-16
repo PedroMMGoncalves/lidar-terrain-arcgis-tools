@@ -362,7 +362,7 @@ Merge the per area class rasters of a product into **one raster covering every a
 | Results folder | The tree with the class rasters. Point at the `Resample` folder to merge the 5 m generalized rasters. |
 | Recurse subfolders | On (default). |
 | Source | `DEM` (default), `DSM`, or `BOTH`. |
-| Class products to merge | Multi-select, derived from the naming convention: `APT`, `APTCLS`, `ASPECT_DIR`, `SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`. Default `APT`, `APTCLS`. |
+| Class products to merge | Multi-select. The dialog lists only the class products actually found under the folder (`APT`, `APTCLS`, `ASPECT_DIR`, `SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`), not the full set; it falls back to the full list on an empty or unreadable folder. Default `APT`, `APTCLS`. |
 | Output folder | Where the merged rasters go. |
 | Output name prefix | Names the output (sanitized); default `Todas`. Output `<Prefix>_<SOURCE>_<PRODUCT>.tif`. |
 | Treat the 0 class as NoData | Off by default. On declares `0` as NoData in the output, so the not suitable cells stop drawing and stop counting. No pixel is rewritten, it is a metadata flag. See the note below. |
@@ -385,7 +385,7 @@ Convert the class rasters to polygons, with **every area merged into one shapefi
 | Results folder | The tree with the class rasters. |
 | Recurse subfolders | On (default). |
 | Source | `DEM` (default), `DSM`, or `BOTH`. |
-| Class products to vectorize | Multi-select, same list as Tool 10. Default `APT`, `APTCLS`, `ASPECT_DIR`. |
+| Class products to vectorize | Multi-select, same behavior as Tool 10: the dialog lists only the class products actually found under the folder. Default `APT`, `APTCLS`, `ASPECT_DIR`. |
 | Output folder | Where the shapefiles go. |
 | Output name prefix | Names the output (sanitized); default `Todas`. Output `<Prefix>_<SOURCE>_<PRODUCT>.shp`. |
 | Simplify polygons | Off by default, so the outline follows the cell edges exactly. On smooths the staircase, at the cost of the areas no longer matching the cell count exactly. |
