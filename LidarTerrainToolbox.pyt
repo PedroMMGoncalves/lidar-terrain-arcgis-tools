@@ -52,7 +52,7 @@ try:
 except ImportError:
     # Lets the pure helpers and the self tests run outside ArcGIS. Under ArcGIS,
     # arcpy is always importable. numpy is imported lazily inside ReclassifyFactor
-    # (Tool 3) so this module loads without numpy when only the pure tests are run.
+    # (Tool 05) so this module loads without numpy when only the pure tests are run.
     arcpy = None
 
 try:
@@ -75,6 +75,11 @@ PRODUCTS = ("SLOPE", "SLOPEP", "ASPECT", "ASPECT_DIR", "HILLSHADE", "PROFC", "PL
 # Products whose values are classes, not a continuous measure: interpolating them would invent
 # fractional classes, so they resample with nearest or majority, never bilinear or cubic.
 CATEGORICAL_PRODUCTS = ("ASPECT_DIR", "APT", "APTCLS")
+# ASPECT is continuous but must not be interpolated either: it is circular (averaging 355 and 5
+# degrees gives 180, so north reads as south) and carries -1 for flat as a sentinel (interpolating
+# it invents azimuths that fall in no class). Nearest keeps it honest; the right way to change its
+# cell size is to recompute aspect from a resampled DEM.
+CIRCULAR_PRODUCTS = ("ASPECT",)
 # The products Tool 05 reclassifies, so the _RCL variants exist for exactly these.
 RECLASSIFIED_PRODUCTS = ("SLOPE", "ASPECT", "SOLARUNI")
 RECLASS_SUFFIX = "RCL"
@@ -287,6 +292,21 @@ def sanitize_name(raw_name, to_geodatabase=False):
     return s
 
 
+def find_sanitize_collisions(raw_names):
+    """Map each sanitized name that more than one distinct raw name collapses to, to the sorted
+    set of those raw names. Empty when there is no collision.
+
+    Used where different inputs must NOT silently merge into one output (a download folder, a
+    mosaic mapping, a mine mask), unlike output names that may be deduped. Pure, so it is tested.
+    """
+    by_sane = {}
+    for raw in raw_names:
+        if raw in (None, ""):
+            continue
+        by_sane.setdefault(sanitize_name(str(raw)), set()).add(str(raw).strip())
+    return {name: sorted(raws) for name, raws in by_sane.items() if len(raws) > 1}
+
+
 def dedupe_name(base, used):
     """Return a name not present in `used`, appending _2, _3, ... on collision.
 
@@ -391,6 +411,48 @@ def _resample_type_token(info):
     if info["reclass"]:
         token = token + "_" + RECLASS_SUFFIX
     return token
+
+
+def _walk_tifs(root, recurse, skip_dirs=()):
+    """Yield (dirpath, filename) for every .tif under root, pruning skip_dirs (case insensitive).
+
+    One place for the recurse/no-recurse walk that eight discovery loops used to inline, and one
+    place for the pruning, so the skip policy is a visible argument instead of a per tool decision
+    (which had drifted between case sensitive and case insensitive). Pass the subfolders a tool
+    must not descend into, for example RESAMPLE_DIRNAME to avoid re-processing resampled copies.
+    """
+    skip = {d.lower() for d in skip_dirs}
+    if recurse:
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d.lower() not in skip]
+            for fn in files:
+                if fn.lower().endswith(".tif"):
+                    yield dirpath, fn
+    else:
+        for fn in os.listdir(root):
+            if fn.lower().endswith(".tif") and os.path.isfile(os.path.join(root, fn)):
+                yield root, fn
+
+
+def _find_base_mosaics(root, recurse, allowed_sources, skip_dirs=(RESAMPLE_DIRNAME,)):
+    """Discover the base mosaics (a name with a source and no product) whose source is allowed.
+
+    Returns a list of (path, area, source); raises the shared fail-loud error when none is found.
+    Used by the surface, solar and contour tools, which all consume base mosaics the same way.
+    """
+    mosaics = []
+    for dirpath, fn in _walk_tifs(root, recurse, skip_dirs):
+        info = parse_source_and_product(fn)
+        if info["source"] is None or info["product"] is not None or info["area"] is None:
+            continue
+        if info["source"] not in allowed_sources:
+            continue
+        mosaics.append((os.path.join(dirpath, fn), info["area"], info["source"]))
+    if not mosaics:
+        msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), root)
+        _err(msg)
+        raise ValueError(msg)
+    return mosaics
 
 
 def _as_class_id(value):
@@ -582,8 +644,9 @@ def detect_folder_prefix(names):
 def reclassify_array(arr, classes, nodata_out, flat_value=None, flat_class=None):
     """Apply [min, max) class intervals to a numpy float array, returning an int32 array.
 
-    classes is the sorted list of (class_id, lo, hi) returned by validate_value_table. The
-    class with the largest hi is inclusive at the top ([lo, hi]); all others are [lo, hi).
+    classes is a list of (class_id, lo, hi), one of the fixed scheme constants (validated by
+    validate_value_table, in the tests and once at the start of the reclassify run). The class
+    with the largest hi is inclusive at the top ([lo, hi]); all others are [lo, hi).
     A class_id may repeat across rows (the Aspect North split) and works naturally. Cells in
     no class, and NaN cells (input NoData), become nodata_out. If flat_value is not None,
     cells equal to it map to flat_class (the Aspect Flat = -1 case); this override runs after
@@ -629,8 +692,7 @@ class Toolbox(object):
 # ===========================================================================
 # Tools
 # ===========================================================================
-#   01 DownloadDGTData, 02 BuildMosaicsByPolygon, 03 DeriveSurfaces, 04 SolarRadiation,
-#   05 ReclassifyFactor, 06 Resample, 07 Contours, 08 VerifyOutputs, 09 SuitabilityMask.
+#   The ordered tool list and their numbers live in Toolbox.__init__ above (single source).
 #   SolarRadiation uses arcpy.sa.RasterSolarRadiation (GPU); ReclassifyFactor imports numpy lazily.
 
 
@@ -982,14 +1044,6 @@ def _asset_extension(mime):
     return DGT_ASSET_EXT.get(mime.strip().lower(), ".bin")
 
 
-def _square_bbox(xmin, ymin, xmax, ymax):
-    """Expand a bbox to a square (side is the larger dimension), keeping the center."""
-    cx = (xmin + xmax) / 2.0
-    cy = (ymin + ymax) / 2.0
-    half = max(xmax - xmin, ymax - ymin) / 2.0
-    return (cx - half, cy - half, cx + half, cy + half)
-
-
 def divide_bbox(bbox, max_km2=DGT_MAX_CHUNK_KM2):
     """Split a WGS84 bbox (min_lon, min_lat, max_lon, max_lat) into a grid of sub bboxes, each
     at most about max_km2, so a single search stays under the service area or item limit.
@@ -1303,7 +1357,8 @@ class DownloadDGTData(object):
         """Download an assets dict into dest_root. With flat=False (the per area layout) each
         product goes in its own subfolder, dest_root/<collection>/<tile>; with flat=True every
         tile lands directly in dest_root. Tiles download grouped by product in a stable order
-        (DGT_DOWNLOAD_ORDER), not mixed, and each tile is logged. Returns (ok, skip, fail). The
+        (DGT_DOWNLOAD_ORDER), not mixed, and each tile is logged. Returns (ok, skip, fail, failed
+        list). The
         subfolders mirror the DGT products (MDT-2m, MDS-2m, MDT-50cm, MDS-50cm, LAZ) and the
         mosaic tool reads MDT*/MDS*."""
         import time
@@ -1561,11 +1616,13 @@ class DownloadDGTData(object):
         source = in_aoi          # the layer cursor honors the active selection (all when none)
         total_ok = total_skip = total_fail = 0
         features = []                             # (area, wgs84 bbox)
+        raw_names = []
         with arcpy.da.SearchCursor(source, ["SHAPE@", name_field]) as cursor:
             for shape, raw_name in cursor:
                 if shape is None or raw_name in (None, ""):
                     _warn("Feature with no geometry or empty name; skipped.")
                     continue
+                raw_names.append(raw_name)
                 features.append((sanitize_name(str(raw_name)),
                                  self._feature_bbox(shape, shape.type, point_size, aoi_sr, wgs84)))
         if not features:
@@ -1573,6 +1630,19 @@ class DownloadDGTData(object):
             msg = "No features to download."
             _err(msg)
             raise ValueError(msg)
+
+        # Fail loud when two different feature names sanitize to the same folder name: their tiles
+        # would merge into one folder and the second manifest would overwrite the first, silently.
+        if per_feature:
+            collisions = find_sanitize_collisions(raw_names)
+            if collisions:
+                session.close()
+                detail = "; ".join("'{}' <- {}".format(n, ", ".join(r))
+                                   for n, r in sorted(collisions.items()))
+                msg = ("Different feature names sanitize to the same folder name, so their tiles "
+                       "would merge into one folder: {}. Rename the features.".format(detail))
+                _err(msg)
+                raise ValueError(msg)
 
         if per_feature:
             # One folder per feature (the recurrence).
@@ -2559,32 +2629,9 @@ class DeriveSurfaces(object):
 
             allowed_sources = SOURCES if source_filter == "BOTH" else (source_filter,)
 
-            # Discover base mosaics (source set, product None) matching the source filter.
-            mosaics = []
-            if recurse:
-                walker = os.walk(in_folder)
-            else:
-                only_files = [n for n in os.listdir(in_folder)
-                              if os.path.isfile(os.path.join(in_folder, n))]
-                walker = [(in_folder, [], only_files)]
-            for dirpath, dirs, files in walker:
-                # Do not descend into the Resample tree: it holds same-named copies of the base
-                # mosaics at another cell size, which would be processed a second time.
-                dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
-                for fn in files:
-                    if not fn.lower().endswith(".tif"):
-                        continue
-                    info = parse_source_and_product(fn)
-                    if info["source"] is None or info["product"] is not None or info["area"] is None:
-                        continue                          # not a base mosaic, skip
-                    if info["source"] not in allowed_sources:
-                        continue
-                    mosaics.append((os.path.join(dirpath, fn), info["area"], info["source"]))
-
-            if not mosaics:
-                msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), in_folder)
-                _err(msg)
-                raise ValueError(msg)
+            # Do not descend into the Resample tree: it holds same-named copies of the base
+            # mosaics at another cell size, which would be processed a second time.
+            mosaics = _find_base_mosaics(in_folder, recurse, allowed_sources)
 
             total = len(mosaics)
             created = 0
@@ -2834,33 +2881,9 @@ class Contours(object):
         try:
             allowed_sources = SOURCES if source_filter == "BOTH" else (source_filter,)
 
-            # Discover base mosaics (source set, product None), skipping the Contours subfolders.
-            mosaics = []
-            if recurse:
-                walker = os.walk(in_folder)
-            else:
-                only_files = [n for n in os.listdir(in_folder)
-                              if os.path.isfile(os.path.join(in_folder, n))]
-                walker = [(in_folder, [], only_files)]
-            for dirpath, dirs, files in walker:
-                # Skip our own Contours output and the Resample tree (same-named mosaic copies).
-                dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
-                if os.path.basename(dirpath) == CONTOURS_DIRNAME:
-                    continue
-                for fn in files:
-                    if not fn.lower().endswith(".tif"):
-                        continue
-                    info = parse_source_and_product(fn)
-                    if info["source"] is None or info["product"] is not None or info["area"] is None:
-                        continue
-                    if info["source"] not in allowed_sources:
-                        continue
-                    mosaics.append((os.path.join(dirpath, fn), info["area"], info["source"]))
-
-            if not mosaics:
-                msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), in_folder)
-                _err(msg)
-                raise ValueError(msg)
+            # Skip our own Contours output and the Resample tree (same-named mosaic copies).
+            mosaics = _find_base_mosaics(in_folder, recurse, allowed_sources,
+                                         (RESAMPLE_DIRNAME, CONTOURS_DIRNAME))
 
             total = len(mosaics)
             created = 0
@@ -3062,6 +3085,11 @@ class ReclassifyFactor(object):
 
         arcpy.env.overwriteOutput = overwrite_existing
 
+        # Validate the fixed schemes before writing anything: a bad edit to the class constants
+        # (a gap or an overlap between different ids) would otherwise make silent 9999 holes.
+        for scheme in (ASPECT_DIR_CLASSES, ASPECT_RCL_CLASSES, SLOPE_RCL_CLASSES, SOLAR_RCL_CLASSES):
+            validate_value_table(scheme)
+
         wanted = set()
         if "ASPECT" in factors:
             wanted.add("ASPECT")
@@ -3074,25 +3102,15 @@ class ReclassifyFactor(object):
             _err(msg)
             raise ValueError(msg)
 
-        # Discover the source rasters (not already reclassified); skip our own subfolder.
+        # Discover the source rasters (not already reclassified). Skip our own Reclass subfolder;
+        # the Resample tree is deliberately NOT skipped, so resampled factors can be reclassified.
         rasters = []
-        if recurse:
-            walker = os.walk(in_folder)
-        else:
-            only_files = [n for n in os.listdir(in_folder)
-                          if os.path.isfile(os.path.join(in_folder, n))]
-            walker = [(in_folder, [], only_files)]
-        for dirpath, _dirs, files in walker:
-            if os.path.basename(dirpath) == RECLASS_DIRNAME:
+        for dirpath, fn in _walk_tifs(in_folder, recurse, (RECLASS_DIRNAME,)):
+            info = parse_source_and_product(fn)
+            if (info["product"] not in wanted or info["area"] is None
+                    or info["source"] is None or info["reclass"]):
                 continue
-            for fn in files:
-                if not fn.lower().endswith(".tif"):
-                    continue
-                info = parse_source_and_product(fn)
-                if (info["product"] not in wanted or info["area"] is None
-                        or info["source"] is None or info["reclass"]):
-                    continue
-                rasters.append((os.path.join(dirpath, fn), info["area"], info["source"], info["product"]))
+            rasters.append((os.path.join(dirpath, fn), info["area"], info["source"], info["product"]))
 
         if not rasters:
             msg = "No factor rasters ({}) found in '{}'.".format(", ".join(sorted(wanted)), in_folder)
@@ -3145,6 +3163,16 @@ class ReclassifyFactor(object):
         created = 0
         skipped = 0
         src = arcpy.Raster(path)
+        # A single band annual total is required. A multiband SOLARUNI is Tool 4 run with the
+        # time-interval option on (one band per interval, not the annual total); reclassifying it
+        # against the annual breaks would silently produce nonsense, so fail loud.
+        if int(getattr(src, "bandCount", 1) or 1) != 1:
+            msg = ("{} ({}): {} has {} bands. This tool needs a single band raster; a multiband "
+                   "SOLARUNI comes from Tool 4 with time intervals on, which is not the annual "
+                   "total. Re-run Tool 4 without the interval option."
+                   .format(area, source, product, src.bandCount))
+            _err(msg)
+            raise ValueError(msg)
         sr = src.spatialReference
         sr_defined = not (sr is None or sr.name in (None, "", "Unknown"))
         if not sr_defined:
@@ -3293,7 +3321,7 @@ class SolarRadiation(object):
         p_out_duration.value = True
 
         p_reuse = arcpy.Parameter(
-            displayName="Reuse Tool 2 slope and aspect (native runs only)", name="reuse_surfaces",
+            displayName="Reuse Tool 3 slope and aspect (native runs only)", name="reuse_surfaces",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_reuse.value = False
 
@@ -3346,7 +3374,7 @@ class SolarRadiation(object):
         return
 
     def _reuse_slope_aspect(self, mosaic_path, area, source, native, sr):
-        """Find the Tool 02 SLOPE and ASPECT rasters next to the mosaic, to pass as
+        """Find the Tool 03 SLOPE and ASPECT rasters next to the mosaic, to pass as
         in_slope_raster / in_aspect_raster. Returns (slope, aspect) or (None, None).
 
         Only returned when both exist and match the DEM cell size and CRS, since
@@ -3433,31 +3461,8 @@ class SolarRadiation(object):
         start_date = "1/1/{}".format(year)
         end_date = "12/31/{}".format(year)
 
-        # Discover base mosaics (source set, product None) matching the source filter.
-        mosaics = []
-        if recurse:
-            walker = os.walk(in_folder)
-        else:
-            only_files = [n for n in os.listdir(in_folder)
-                          if os.path.isfile(os.path.join(in_folder, n))]
-            walker = [(in_folder, [], only_files)]
-        for dirpath, dirs, files in walker:
-            # Do not descend into the Resample tree (same-named mosaic copies at another cell size).
-            dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
-            for fn in files:
-                if not fn.lower().endswith(".tif"):
-                    continue
-                info = parse_source_and_product(fn)
-                if info["source"] is None or info["product"] is not None or info["area"] is None:
-                    continue
-                if info["source"] not in allowed_sources:
-                    continue
-                mosaics.append((os.path.join(dirpath, fn), info["area"], info["source"]))
-
-        if not mosaics:
-            msg = "No base mosaics ({}) found in '{}'.".format("/".join(allowed_sources), in_folder)
-            _err(msg)
-            raise ValueError(msg)
+        # Do not descend into the Resample tree (same-named mosaic copies at another cell size).
+        mosaics = _find_base_mosaics(in_folder, recurse, allowed_sources)
 
         total = len(mosaics)
         runs = total * len(models)
@@ -3532,7 +3537,7 @@ class SolarRadiation(object):
                             kwargs["interval_unit"] = interval_unit
                             kwargs["interval"] = interval
 
-                        # Reuse the Tool 02 slope/aspect only on a native run, so the grids
+                        # Reuse the Tool 03 slope/aspect only on a native run, so the grids
                         # match; a resampled surface uses the tool's internal slope/aspect.
                         in_slope = None
                         if reuse_surfaces and not did_resample:
@@ -3681,22 +3686,12 @@ class Resample(object):
         # Discover the named rasters of the selected types, never descending into the Resample
         # output folder so a re-run does not resample its own outputs.
         rasters = []
-        if recurse:
-            walker = os.walk(in_folder)
-        else:
-            only_files = [n for n in os.listdir(in_folder)
-                          if os.path.isfile(os.path.join(in_folder, n))]
-            walker = [(in_folder, [], only_files)]
-        for dirpath, dirs, files in walker:
-            dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
-            for fn in files:
-                if not fn.lower().endswith(".tif"):
-                    continue
-                info = parse_source_and_product(fn)
-                token = _resample_type_token(info)
-                if token is None or token not in selected:
-                    continue
-                rasters.append((os.path.join(dirpath, fn), info, token))
+        for dirpath, fn in _walk_tifs(in_folder, recurse, (RESAMPLE_DIRNAME,)):
+            info = parse_source_and_product(fn)
+            token = _resample_type_token(info)
+            if token is None or token not in selected:
+                continue
+            rasters.append((os.path.join(dirpath, fn), info, token))
 
         if not rasters:
             msg = "No rasters of the selected types ({}) found in '{}'.".format(
@@ -3740,14 +3735,15 @@ class Resample(object):
                 if target_cell < native:
                     _warn("{} ({}): target {:g} m is finer than native {:g} m; upsampling adds no "
                           "real detail.".format(area, token, target_cell, native))
-                categorical = info["reclass"] or info["product"] in CATEGORICAL_PRODUCTS
+                # Class rasters and the circular aspect must not be interpolated (see the
+                # constants); everything else is a continuous measure and takes bilinear.
+                no_interp = (info["reclass"] or info["product"] in CATEGORICAL_PRODUCTS
+                             or info["product"] in CIRCULAR_PRODUCTS)
                 if method_choice == "auto":
-                    # Categorical rasters must use nearest, or interpolation would produce
-                    # fractional class values.
-                    method = "NEAREST" if categorical else "BILINEAR"
+                    method = "NEAREST" if no_interp else "BILINEAR"
                 else:
                     method = method_choice
-                    if categorical and method in ("BILINEAR", "CUBIC"):
+                    if no_interp and method in ("BILINEAR", "CUBIC"):
                         interpolated.append("{} ({})".format(area, token))
                 arcpy.management.Resample(path, out_path, "{0} {0}".format(target_cell), method)
                 _msg("{} ({}): resampled {:g} m -> {:g} m ({}, {}) -> {}".format(
@@ -3764,9 +3760,11 @@ class Resample(object):
                  total, created, copied_native, skipped_existing, len(failed)))
         if interpolated:
             # The user asked for it explicitly, so this is a warning, not a failure.
-            _warn("{} categorical raster(s) were resampled with {}, which interpolates and can "
-                  "invent class values that are not in the legend: {}. Use MAJORITY or NEAREST "
-                  "for these.".format(len(interpolated), method_choice, ", ".join(interpolated)))
+            _warn("{} class or aspect raster(s) were resampled with {}, which interpolates: it "
+                  "invents class values that are not in the legend, and for aspect it averages "
+                  "across the 0/360 wrap and the -1 flat sentinel. Affected: {}. Use MAJORITY or "
+                  "NEAREST for these.".format(len(interpolated), method_choice,
+                                              ", ".join(interpolated)))
         if failed:
             msg = "Resample failed for: " + ", ".join(failed)
             _err(msg)
@@ -3825,21 +3823,14 @@ class VerifyOutputs(object):
         expected_epsg = int(parameters[3].value)
         write_report = bool(parameters[4].value)
 
-        if recurse:
-            walker = os.walk(in_folder)
-        else:
-            only_files = [n for n in os.listdir(in_folder)
-                          if os.path.isfile(os.path.join(in_folder, n))]
-            walker = [(in_folder, [], only_files)]
-
+        # Verify scans everything, including the Resample tree (integrity, not completeness),
+        # so no directory is pruned; under_resample is derived per file from the path.
         rasters = []                       # (path, info dict, under_resample)
-        for dirpath, _dirs, files in walker:
+        for dirpath, fn in _walk_tifs(in_folder, recurse):
             parts = os.path.normpath(os.path.relpath(dirpath, in_folder)).split(os.sep)
             under_resample = RESAMPLE_DIRNAME in parts
-            for fn in files:
-                if fn.lower().endswith(".tif"):
-                    rasters.append((os.path.join(dirpath, fn), parse_source_and_product(fn),
-                                    under_resample))
+            rasters.append((os.path.join(dirpath, fn), parse_source_and_product(fn),
+                            under_resample))
         if not rasters:
             msg = "No .tif rasters found in '{}'.".format(in_folder)
             _err(msg)
@@ -4051,24 +4042,14 @@ class SuitabilityMask(object):
             # resolution per area below, the same one for slope and solar.
             slope_cand = {}
             solar_cand = {}
-            if recurse:
-                walker = os.walk(in_folder)
-            else:
-                only_files = [n for n in os.listdir(in_folder)
-                              if os.path.isfile(os.path.join(in_folder, n))]
-                walker = [(in_folder, [], only_files)]
-            for dirpath, dirs, files in walker:
-                dirs[:] = [d for d in dirs if d.lower() != RESAMPLE_DIRNAME.lower()]
-                for fn in files:
-                    if not fn.lower().endswith(".tif"):
-                        continue
-                    info = parse_source_and_product(fn)
-                    if info["area"] is None or info["source"] != source or info["reclass"]:
-                        continue
-                    if info["product"] == slope_product:
-                        slope_cand.setdefault(info["area"], []).append(os.path.join(dirpath, fn))
-                    elif info["product"] == "SOLARUNI":
-                        solar_cand.setdefault(info["area"], []).append(os.path.join(dirpath, fn))
+            for dirpath, fn in _walk_tifs(in_folder, recurse, (RESAMPLE_DIRNAME,)):
+                info = parse_source_and_product(fn)
+                if info["area"] is None or info["source"] != source or info["reclass"]:
+                    continue
+                if info["product"] == slope_product:
+                    slope_cand.setdefault(info["area"], []).append(os.path.join(dirpath, fn))
+                elif info["product"] == "SOLARUNI":
+                    solar_cand.setdefault(info["area"], []).append(os.path.join(dirpath, fn))
 
             if not (set(slope_cand) & set(solar_cand)):
                 msg = ("No area has both a {0} {1} and a {0} SOLARUNI raster under '{2}'. Run "
@@ -4102,6 +4083,18 @@ class SuitabilityMask(object):
             if only_one:
                 _warn("Areas missing one of the two inputs (skipped for spatial matching): {}"
                       .format(", ".join(only_one)))
+
+            # A single band SOLARUNI (the annual total) is required. A multiband one is Tool 4 with
+            # the time-interval option on, whose per-interval values would make almost nothing pass
+            # the threshold, silently. Check once, fail loud with the offending area.
+            for area in areas:
+                bands = int(getattr(arcpy.Raster(solar_by_area[area]), "bandCount", 1) or 1)
+                if bands != 1:
+                    msg = ("SOLARUNI for '{}' has {} bands, so it is not the annual total (Tool 4 "
+                           "was run with time intervals on). Re-run Tool 4 without the interval "
+                           "option.".format(area, bands))
+                    _err(msg)
+                    raise ValueError(msg)
 
             # Group the mask polygons by mine name (same-name polygons are one mine). Fail loud
             # when two DIFFERENT names sanitize to the same output name: their polygons would
@@ -4317,26 +4310,17 @@ def _group_class_rasters(in_folder, recurse, source, selected):
     points at the folder it wants.
     """
     groups = {}
-    if recurse:
-        walker = os.walk(in_folder)
-    else:
-        only_files = [n for n in os.listdir(in_folder)
-                      if os.path.isfile(os.path.join(in_folder, n))]
-        walker = [(in_folder, [], only_files)]
-    for dirpath, dirs, files in walker:
-        for fn in files:
-            if not fn.lower().endswith(".tif"):
-                continue
-            info = parse_source_and_product(fn)
-            if info["area"] is None or info["source"] is None:
-                continue
-            if source != "BOTH" and info["source"] != source:
-                continue
-            token = _resample_type_token(info)
-            if token is None or token not in selected:
-                continue
-            groups.setdefault((info["source"], token), []).append(
-                (os.path.join(dirpath, fn), info["area"]))
+    for dirpath, fn in _walk_tifs(in_folder, recurse):
+        info = parse_source_and_product(fn)
+        if info["area"] is None or info["source"] is None:
+            continue
+        if source != "BOTH" and info["source"] != source:
+            continue
+        token = _resample_type_token(info)
+        if token is None or token not in selected:
+            continue
+        groups.setdefault((info["source"], token), []).append(
+            (os.path.join(dirpath, fn), info["area"]))
     return groups
 
 
@@ -4524,10 +4508,11 @@ class MergeClasses(object):
         sparse LZW BigTIFF, so the mostly empty country wide grid costs almost nothing. Without
         osgeo, fall back to arcpy, which writes every block.
 
-        zero_nodata declares the 0 class as NoData. No pixel is rewritten: GDAL marks 0 as NoData
-        on the sources, so it is also transparent where two rasters overlap and can never hide a
-        real class; arcpy can only stamp it on the output afterwards, which is why the fallback
-        warns.
+        zero_nodata declares the 0 class as NoData, flagged on the OUTPUT after the merge (both
+        engines), so the sources' own NoData is preserved. A 0 that won an overlap is then hidden
+        rather than never having competed; on scattered, same source data the areas do not overlap,
+        so this is moot in practice. Overlaps resolve deterministically to the LAST raster in the
+        sorted list on both engines.
         """
         try:
             from osgeo import gdal
@@ -4544,22 +4529,29 @@ class MergeClasses(object):
 
         tmp_vrt = out_path[:-4] + "_tmp.vrt"
         try:
-            # srcNodata makes 0 transparent in the sources, so it never wins an overlap; VRTNodata
-            # carries the flag into the VRT and on into the GeoTIFF.
-            kwargs = {"srcNodata": 0, "VRTNodata": 0} if zero_nodata else {}
+            # Keep the sources' intrinsic NoData: srcNodata would REPLACE it, so the real NoData
+            # collar of each clipped raster (9999 in the _RCL rasters) would be read as data. Build
+            # the VRT normally, translate, then flag 0 as NoData on the output afterwards.
             # gdal returns None on failure instead of raising; surface it.
-            if gdal.BuildVRT(tmp_vrt, paths, **kwargs) is None:
+            if gdal.BuildVRT(tmp_vrt, paths) is None:
                 raise RuntimeError("gdal.BuildVRT returned None")
             opts = ["BIGTIFF=YES", "COMPRESS=LZW", "TILED=YES", "SPARSE_OK=TRUE"]
-            if gdal.Translate(out_path, tmp_vrt, creationOptions=opts) is None:
+            out_ds = gdal.Translate(out_path, tmp_vrt, creationOptions=opts)
+            if out_ds is None:
                 raise RuntimeError("gdal.Translate returned None")
+            if zero_nodata:
+                # Overlaps were already resolved treating 0 as a value, so a 0 that won an overlap
+                # is now hidden rather than never having competed, same as the arcpy fallback.
+                out_ds.GetRasterBand(1).SetNoDataValue(0)
+            out_ds = None                          # flush and close
         finally:
             if os.path.exists(tmp_vrt):
                 os.remove(tmp_vrt)
 
     def _merge_arcpy(self, paths, out_path, zero_nodata, token, src):
         """Fallback merge with core MosaicToNewRaster. Pixel type and band count come from the
-        first input; the classes are integers, so FIRST is a safe overlap rule."""
+        first input. LAST matches the GDAL path (later raster in the sorted list wins an overlap),
+        so the two engines agree; on same source scattered data the areas do not overlap anyway."""
         first = arcpy.Raster(paths[0])
         arcpy.management.MosaicToNewRaster(
             input_rasters=paths,
@@ -4568,14 +4560,8 @@ class MergeClasses(object):
             coordinate_system_for_the_raster=arcpy.Describe(paths[0]).spatialReference,
             pixel_type=_MOSAIC_PIXEL_TYPES.get(first.pixelType, "16_BIT_SIGNED"),
             number_of_bands=1,
-            mosaic_method="FIRST")
+            mosaic_method="LAST")
         if zero_nodata:
-            # Only after the fact here, unlike the GDAL path: the mosaic already resolved the
-            # overlaps treating 0 as a value, so a 0 that won an overlap is now hidden rather
-            # than never having competed.
-            _warn("{} ({}): on the arcpy fallback the 0 class is flagged NoData only after the "
-                  "mosaic, so where two rasters overlap a 0 may have won before being hidden. "
-                  "The GDAL path does not have this problem.".format(token, src))
             arcpy.management.SetRasterProperties(out_path, nodata=[[1, 0]])
 
 
@@ -4715,12 +4701,35 @@ class VectorizeClasses(object):
     def _vectorize_group(self, items, out_shp, simplify, drop_zero, token, src):
         """Polygonize every area's raster and append them into one shapefile, then compute the
         polygon areas. drop_zero skips the not suitable class. Returns the polygon count."""
+        # Fail loud when the same area is present more than once (for example the native Reclass
+        # raster and its Resample copy under one root). Vectorizing both would put that ground in
+        # the shapefile twice and double count AREA_M2, which is exactly what this tool is for.
+        seen = {}
+        for path, area in items:
+            seen.setdefault(area, []).append(path)
+        dups = {a: p for a, p in seen.items() if len(p) > 1}
+        if dups:
+            detail = "; ".join("'{}' x{}".format(a, len(p)) for a, p in sorted(dups.items()))
+            msg = ("{} ({}): the same area appears more than once, so AREA_M2 would double count: "
+                   "{}. Point at a single tree (for example only the Resample folder), not a root "
+                   "that holds both the native and the resampled copy.".format(token, src, detail))
+            _err(msg)
+            raise ValueError(msg)
+        # One projected CRS across the group: a mixed CRS would append geometries from different
+        # systems into one shapefile. Unlike the merge tool, a mixed cell size is fine here, since
+        # each polygon area is computed from its own geometry, not from a shared grid.
         sr = arcpy.Describe(items[0][0]).spatialReference
         if sr is None or sr.type != "Projected":
             msg = ("{} ({}): the rasters must be in a projected CRS to compute areas in meters; "
                    "found {}.".format(token, src, _crs_label(sr)))
             _err(msg)
             raise ValueError(msg)
+        for path, area in items[1:]:
+            if not _same_crs(sr, arcpy.Describe(path).spatialReference):
+                msg = ("{} ({}): '{}' is in a different CRS than the others. Vectorize one CRS at "
+                       "a time.".format(token, src, os.path.basename(path)))
+                _err(msg)
+                raise ValueError(msg)
 
         if arcpy.Exists(out_shp):
             arcpy.management.Delete(out_shp)
@@ -4808,6 +4817,14 @@ def _run_self_tests():
     check("collision appends next free suffix", dedupe_name("AreaA", used) == "AreaA_3")
     check("no collision unchanged", dedupe_name("AreaB", used) == "AreaB")
 
+    print("find_sanitize_collisions")
+    _col = find_sanitize_collisions(["Covas-1", "Covas 1", "Lousal"])
+    check("distinct raws colliding are reported",
+          _col == {"Covas_1": ["Covas 1", "Covas-1"]})
+    check("no collision returns empty", find_sanitize_collisions(["Lousal", "Jales"]) == {})
+    check("same raw repeated is not a collision",
+          find_sanitize_collisions(["Jales", "Jales"]) == {})
+
     print("build_output_name / parse_source_and_product round trip")
     cases = [
         ("Sao_Domingos", "DEM", "SLOPE", False),
@@ -4848,6 +4865,41 @@ def _run_self_tests():
           _rcl["product"] == "ASPECT" and _rcl["reclass"] and _rcl["area"] == "Covas")
     check("area ending in a product word not misparsed",
           parse_source_and_product("Vale_ASPECT_DEM_SLOPE.tif")["area"] == "Vale_ASPECT")
+
+    print("_walk_tifs / _find_base_mosaics")
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="lidar_walk_")
+    try:
+        def _touch(*parts):
+            p = os.path.join(tmpdir, *parts)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").close()
+        _touch("AreaA_DEM.tif")
+        _touch("AreaA_DEM_SLOPE.tif")
+        _touch("notes.txt")                                  # ignored, not a .tif
+        _touch(RESAMPLE_DIRNAME, "AreaA", "AreaA_DEM.tif")   # resampled copy
+        _touch(RECLASS_DIRNAME, "AreaA_DEM_SLOPE_RCL.tif")   # reclassified
+        _touch("cont", "AreaA_DEM_CONT_placeholder.tif")     # in a would-be Contours dir
+        all_found = {fn for _d, fn in _walk_tifs(tmpdir, True)}
+        check("_walk_tifs finds every tif, skips non tif",
+              all_found == {"AreaA_DEM.tif", "AreaA_DEM_SLOPE.tif",
+                            "AreaA_DEM_SLOPE_RCL.tif", "AreaA_DEM_CONT_placeholder.tif"})
+        skipped = {fn for _d, fn in _walk_tifs(tmpdir, True, (RESAMPLE_DIRNAME,))}
+        check("_walk_tifs prunes the skip dir (case insensitive)",
+              "AreaA_DEM_SLOPE_RCL.tif" in skipped and len(skipped) == 4
+              and all("resample" not in _d.lower() for _d, _fn in
+                      _walk_tifs(tmpdir, True, (RESAMPLE_DIRNAME.upper(),))))
+        check("_walk_tifs non recurse stays at the root",
+              {fn for _d, fn in _walk_tifs(tmpdir, False)}
+              == {"AreaA_DEM.tif", "AreaA_DEM_SLOPE.tif"})
+        base = _find_base_mosaics(tmpdir, True, SOURCES, (RESAMPLE_DIRNAME,))
+        check("_find_base_mosaics returns the base mosaic only (no surface, no resample copy)",
+              [(a, s) for _p, a, s in base] == [("AreaA", "DEM")])
+        check_raises("_find_base_mosaics fails loud when none match",
+                     lambda: _find_base_mosaics(tmpdir, True, ("DSM",)))
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     print("class_products / is_integer_pixel_type")
     _cp = class_products()
@@ -4891,6 +4943,17 @@ def _run_self_tests():
     check_raises("bool class_id raises", lambda: validate_value_table([(True, 0, 10)]))
     check("whole number float class_id accepted",
           validate_value_table([(1.0, 0, 10), (2.0, 10, 20)]) is not None)
+    # The fixed suitability schemes are the one place to edit the classes; validate them so a
+    # typo (a gap, an overlap between different ids) fails the tests instead of silently making
+    # 9999 holes at run time.
+    check("ASPECT_DIR scheme is a valid tiling",
+          validate_value_table(ASPECT_DIR_CLASSES) is not None)
+    check("ASPECT_RCL scheme is a valid tiling",
+          validate_value_table(ASPECT_RCL_CLASSES) is not None)
+    check("SLOPE_RCL scheme is a valid tiling",
+          validate_value_table(SLOPE_RCL_CLASSES) is not None)
+    check("SOLAR_RCL scheme is a valid tiling",
+          validate_value_table(SOLAR_RCL_CLASSES) is not None)
 
     print("build_area_groups")
     groups = build_area_groups([(3, "Cortes Pereira"), (4, "Cortes Pereira"), (0, "Alcaria Queimada")])
@@ -5012,8 +5075,6 @@ def _run_self_tests():
     check("geotiff head is a valid asset", _looks_like_asset(b"II*\x00\x08\x00"))
     check("laz head is a valid asset", _looks_like_asset(b"LASF\x00\x00"))
     check("html login page is not an asset", not _looks_like_asset(b"<!DOCTYPE html>"))
-    check("square bbox from a rectangle",
-          _square_bbox(0.0, 0.0, 4.0, 2.0) == (0.0, -1.0, 4.0, 3.0))
     check("small bbox is not split", len(divide_bbox((-8.0, 39.0, -7.99, 39.01))) == 1)
     check("large bbox is split into a grid", len(divide_bbox((-8.0, 39.0, -7.0, 39.5))) > 1)
     _action, _fields = parse_login_form(

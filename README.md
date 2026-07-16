@@ -295,7 +295,7 @@ Resample the named rasters to a coarser cell size (for example 2 m to 5 m), in b
 | Resampling method | `auto` (default) picks per type: bilinear for continuous, nearest for the class rasters. Or force one: `MAJORITY`, `NEAREST`, `BILINEAR`, `CUBIC`. |
 | Overwrite existing outputs | Off skips existing resampled rasters. |
 
-In `auto` the method is chosen per type: bilinear for continuous rasters, nearest for the class rasters (`_RCL`, `APT`, `APTCLS`, `ASPECT_DIR`) so the ordinal classes are preserved. **To generalize a class raster, force `MAJORITY`**: nearest only subsamples and keeps the speckle, while majority gives each output cell the most common class in the window, which is what actually simplifies the data (going from 0.5 m to 5 m, each output cell summarizes 100 input cells). Forcing an interpolating method (`BILINEAR`, `CUBIC`) on a class raster is allowed but warned about at the end of the run, since it invents class values that are not in the legend. A raster already at the target cell size is copied through unchanged, so the `Resample` folder stays a complete set; a target finer than the native cell size warns, since upsampling adds no real detail.
+In `auto` the method is chosen per type: bilinear for continuous rasters, nearest for the class rasters (`_RCL`, `APT`, `APTCLS`, `ASPECT_DIR`) so the ordinal classes are preserved, and nearest for `ASPECT` too, which is continuous but circular (averaging 355 and 5 degrees gives 180, turning north into south) and carries -1 for flat as a sentinel that must not be averaged. **To generalize a class raster, force `MAJORITY`**: nearest only subsamples and keeps the speckle, while majority gives each output cell the most common class in the window, which is what actually simplifies the data (going from 0.5 m to 5 m, each output cell summarizes 100 input cells). Forcing an interpolating method (`BILINEAR`, `CUBIC`) on a class raster is allowed but warned about at the end of the run, since it invents class values that are not in the legend. A raster already at the target cell size is copied through unchanged, so the `Resample` folder stays a complete set; a target finer than the native cell size warns, since upsampling adds no real detail.
 
 ### Tool 7, Contours
 
@@ -394,7 +394,7 @@ Each polygon carries `AREA_NAME` (the area or mine it came from), `GRIDCODE` (th
 > Two things to get right before summing the areas:
 >
 > - **Point it at the 5 m rasters.** Vectorizing a 0.5 m raster produces millions of stair step polygons: a huge shapefile that is slow to draw and no more informative. Generalize first with Tool 6 (`MAJORITY`, 5 m), then vectorize.
-> - **Do not vectorize two inputs that cover the same ground** (for example two AOI sets that overlap): that ground lands in the shapefile twice, and summing `AREA_M2` counts it twice. Merge the rasters first, then vectorize the merged result, so each cell of ground appears exactly once.
+> - **Do not vectorize two inputs that cover the same ground** (for example two AOI sets that overlap): that ground lands in the shapefile twice, and summing `AREA_M2` counts it twice. Merge the rasters first, then vectorize the merged result, so each cell of ground appears exactly once. The tool fails loud when the same area name appears more than once in a product group (for example a native `Reclass` raster and its `Resample` copy under one root), so point it at a single tree.
 
 ---
 
@@ -496,6 +496,9 @@ This exercises name sanitization and collision handling, the output name build a
 | `the merged grid is ... cells` warning (Tool 10) | The areas are far apart, so the merged raster spans their whole bounding box | Expected, and harmless on the sparse BigTIFF path. If it worries you, merge the 5 m rasters rather than the native ones. |
 | `... is not an integer raster, so it cannot be polygonized` (Tool 11) | A continuous surface was selected | Vectorize only the class rasters (`APT`, `APTCLS`, `ASPECT_DIR`, `_RCL`). |
 | `... has a X m cell but the others have Y m` (Tool 10) | The product exists at more than one resolution under the folder | Point at a single resolution tree, or resample them to a common cell size with Tool 6 first. |
+| `Different feature names sanitize to the same folder name` (Tool 1) | Two AOI features (for example `Covas-1` and `Covas 1`) collapse to one folder name | Rename the features so the sanitized names differ, before downloading. |
+| `SOLARUNI for ... has N bands` (Tool 5 or 9) | Tool 4 was run with the time-interval option on, so SOLARUNI is per interval, not the annual total | Re-run Tool 4 with the interval option off (a single annual total). |
+| `the same area appears more than once, so AREA_M2 would double count` (Tool 11) | The folder holds two copies of an area's raster (the native `Reclass` and the `Resample` copy) | Point Tool 11 at a single tree, typically the `Resample` folder with the 5 m rasters. |
 
 ---
 
