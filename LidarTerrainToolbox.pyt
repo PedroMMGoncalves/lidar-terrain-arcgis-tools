@@ -3774,7 +3774,10 @@ class Resample(object):
         cell_w, cell_h = out.meanCellWidth, out.meanCellHeight
         sr = out.spatialReference
         arr = arcpy.RasterToNumPyArray(out, nodata_to_value=out_nd)
-        bad = ~np.isin(arr, list(valid))
+        # Flag ONLY cells holding a real value that is not a source class. Exclude the NoData
+        # background (already out_nd); counting it would balloon the number to the whole frame
+        # even though nothing real was touched.
+        bad = ~np.isin(arr, list(valid)) & (arr != out_nd)
         n = int(bad.sum())
         if n == 0:
             return 0
