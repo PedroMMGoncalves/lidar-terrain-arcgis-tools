@@ -235,19 +235,24 @@ def _save_class_mask(raster, out_path):
     marks the outside of the mask as true NoData: a raster already written with a colliding NoData
     cannot be recovered, because the class value and NoData are then indistinguishable.
 
-    Folds the NoData onto 255 in an 8 bit array, then writes it back declaring 255 as NoData, the
-    same deterministic technique the Tool 06 scrub uses. NumPyArrayToRaster drops the CRS, so it is
-    restored with DefineProjection."""
-    import numpy as np
-    sr = raster.spatialReference
-    lower_left = arcpy.Point(raster.extent.XMin, raster.extent.YMin)
-    cell_w, cell_h = raster.meanCellWidth, raster.meanCellHeight
-    arr = arcpy.RasterToNumPyArray(raster, nodata_to_value=CLASS_MASK_NODATA).astype(np.uint8)
-    with _CleanupOnError(out_path):
-        arcpy.NumPyArrayToRaster(arr, lower_left, cell_w, cell_h,
-                                 value_to_nodata=CLASS_MASK_NODATA).save(out_path)
-    if sr is not None and sr.name not in (None, "", "Unknown"):
-        arcpy.management.DefineProjection(out_path, sr)
+    CopyRaster forces the pixel type and NoData deterministically: the masked cells are written as
+    255 and flagged, the {0,1} / {0,3,4,5,6} data is preserved, and the storage is 8 bit unsigned
+    for every mine. (NumPyArrayToRaster was avoided here: it promotes to 16 bit whenever the array
+    holds both 0 and the 255 NoData, which is most mines, so the per mine masks would not share one
+    pixel type.) CopyRaster keeps the CRS, so no reprojection is needed."""
+    for attempt in range(3):
+        try:
+            with _CleanupOnError(out_path):
+                arcpy.management.CopyRaster(raster, out_path, pixel_type="8_BIT_UNSIGNED",
+                                            nodata_value=CLASS_MASK_NODATA)
+            return
+        except Exception:
+            if attempt == 2:
+                raise
+            import gc
+            import time
+            gc.collect()
+            time.sleep(2)
 
 
 # ===========================================================================
