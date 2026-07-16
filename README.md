@@ -364,11 +364,14 @@ Merge the per area class rasters of a product into **one raster covering every a
 | Class products to merge | Multi-select, derived from the naming convention: `APT`, `APTCLS`, `ASPECT_DIR`, `SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`. Default `APT`, `APTCLS`. |
 | Output folder | Where the merged rasters go. |
 | Output name prefix | Names the output (sanitized); default `Todas`. Output `<Prefix>_<SOURCE>_<PRODUCT>.tif`. |
+| Treat the 0 class as NoData | Off by default. On declares `0` as NoData in the output, so the not suitable cells stop drawing and stop counting. No pixel is rewritten, it is a metadata flag. See the note below. |
 | Overwrite existing outputs | Off skips existing merged rasters. |
 
 **Why sparse matters.** Areas of interest are usually scattered (in this project, mines from Valença to Faro), so the merged grid has to span their whole bounding box while only a tiny fraction carries data. At 5 m that is billions of cells and >99.9% NoData, past the 4 GB limit of a classic TIFF. The tool writes it with GDAL as a **sparse, LZW compressed, tiled BigTIFF** (`SPARSE_OK=TRUE`, `BIGTIFF=YES`): the all-NoData blocks are never written, so the file stays small and the run stays quick. Without gdal (`osgeo`) it falls back to core `MosaicToNewRaster`, which writes every block; the tool warns that this is slow, can be very large, and does not guarantee BigTIFF above 4 GB.
 
 The tool logs the merged grid size in cells before writing, and warns when it exceeds about 2 billion, so merging the native 0.5 m or 2 m rasters instead of the 5 m ones is an informed choice rather than a surprise. It fails loud when the rasters of a product do not all share one CRS or one cell size, since mosaicking a mix would silently resample.
+
+> **`0` and NoData are not the same thing.** `0` means "surveyed, not suitable"; NoData means "outside the area, never looked at". Declaring `0` as NoData makes them indistinguishable, and you lose the denominator: the suitable share of an area can no longer be computed from that raster alone. Keep it off unless the deliverable is meant to show only the suitable ground. On the GDAL path the flag is set on the sources, so a `0` is also transparent where two rasters overlap and can never hide a real class; the arcpy fallback can only stamp it on the output afterwards and warns about that difference.
 
 ### Tool 11, Vectorize Classes
 
@@ -383,11 +386,15 @@ Convert the class rasters to polygons, with **every area merged into one shapefi
 | Output folder | Where the shapefiles go. |
 | Output name prefix | Names the output (sanitized); default `Todas`. Output `<Prefix>_<SOURCE>_<PRODUCT>.shp`. |
 | Simplify polygons | Off by default, so the outline follows the cell edges exactly. On smooths the staircase, at the cost of the areas no longer matching the cell count exactly. |
+| Drop the 0 class polygons | Off by default. On keeps only the suitable polygons. Same caveat as Tool 10: you lose the total area of each mine, so the suitable share can no longer be computed from the output alone. |
 | Overwrite existing outputs | Off skips existing shapefiles. |
 
-Each polygon carries `AREA_NAME` (the area or mine it came from), `GRIDCODE` (the class value) and `AREA_M2` (the polygon area in square meters, computed with Calculate Geometry Attributes; the CRS must be projected, which EPSG:3763 is). **Every polygon is kept, including the not suitable `0`**, so the suitable share of each area can be computed rather than only the suitable patches. NoData cells produce no polygon, so the outline of each area is its clipped mosaic.
+Each polygon carries `AREA_NAME` (the area or mine it came from), `GRIDCODE` (the class value) and `AREA_M2` (the polygon area in square meters, computed with Calculate Geometry Attributes; the CRS must be projected, which EPSG:3763 is). By default **every polygon is kept, including the not suitable `0`**, so the suitable share of each area can be computed rather than only the suitable patches. NoData cells produce no polygon, so the outline of each area is its clipped mosaic.
 
-> Point Tool 11 at the **5 m** rasters. Vectorizing a 0.5 m raster produces millions of stair step polygons: a huge shapefile that is slow to draw and no more informative. Generalize first with Tool 6 (`MAJORITY`, 5 m), then vectorize.
+> Two things to get right before summing the areas:
+>
+> - **Point it at the 5 m rasters.** Vectorizing a 0.5 m raster produces millions of stair step polygons: a huge shapefile that is slow to draw and no more informative. Generalize first with Tool 6 (`MAJORITY`, 5 m), then vectorize.
+> - **Do not vectorize two inputs that cover the same ground** (for example two AOI sets that overlap): that ground lands in the shapefile twice, and summing `AREA_M2` counts it twice. Merge the rasters first, then vectorize the merged result, so each cell of ground appears exactly once.
 
 ---
 

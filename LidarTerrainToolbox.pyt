@@ -4421,12 +4421,18 @@ class MergeClasses(object):
             datatype="GPString", parameterType="Required", direction="Input")
         p_prefix.value = "Todas"
 
+        p_zero_nodata = arcpy.Parameter(
+            displayName="Treat the 0 class as NoData", name="zero_nodata",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_zero_nodata.value = False        # 0 (surveyed, not suitable) is a real class, not NoData
+
         p_overwrite = arcpy.Parameter(
             displayName="Overwrite existing outputs", name="overwrite_existing",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
-        return [p_in, p_recurse, p_source, p_products, p_out, p_prefix, p_overwrite]
+        return [p_in, p_recurse, p_source, p_products, p_out, p_prefix, p_zero_nodata,
+                p_overwrite]
 
     def isLicensed(self):
         # GDAL Translate, or core MosaicToNewRaster as the fallback. No extension.
@@ -4449,10 +4455,15 @@ class MergeClasses(object):
         selected = set(str(s).upper() for s in (parameters[3].values or []))
         out_folder = parameters[4].valueAsText
         prefix = sanitize_name(parameters[5].valueAsText)
-        overwrite_existing = bool(parameters[6].value)
+        zero_nodata = bool(parameters[6].value)
+        overwrite_existing = bool(parameters[7].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
         arcpy.env.compression = "LZW"
+        if zero_nodata:
+            _msg("The 0 class is declared NoData in the output. Note that 0 (surveyed, not "
+                 "suitable) and NoData (outside the area) then look the same, so the suitable "
+                 "share of an area can no longer be computed from this raster alone.")
 
         groups = _group_class_rasters(in_folder, recurse, source, selected)
         if not groups:
@@ -4489,7 +4500,7 @@ class MergeClasses(object):
                           "apart, and is almost all NoData. Sparse BigTIFF handles it, but a "
                           "denser writer or a finer cell size will not. Consider merging the 5 m "
                           "rasters, not the native ones.".format(token, src, cells))
-                self._merge(paths, out_path, token, src)
+                self._merge(paths, out_path, token, src, zero_nodata)
                 _msg("{} ({}): merged -> {} ({:.1f} MB)".format(
                     token, src, os.path.basename(out_path),
                     os.path.getsize(out_path) / (1024.0 * 1024.0)))
@@ -4508,10 +4519,16 @@ class MergeClasses(object):
             raise RuntimeError(msg)
         return
 
-    def _merge(self, paths, out_path, token, src):
+    def _merge(self, paths, out_path, token, src, zero_nodata):
         """Write the merged raster. GDAL builds a VRT over the inputs and translates it to a
         sparse LZW BigTIFF, so the mostly empty country wide grid costs almost nothing. Without
-        osgeo, fall back to arcpy, which writes every block."""
+        osgeo, fall back to arcpy, which writes every block.
+
+        zero_nodata declares the 0 class as NoData. No pixel is rewritten: GDAL marks 0 as NoData
+        on the sources, so it is also transparent where two rasters overlap and can never hide a
+        real class; arcpy can only stamp it on the output afterwards, which is why the fallback
+        warns.
+        """
         try:
             from osgeo import gdal
         except ImportError:
@@ -4522,13 +4539,16 @@ class MergeClasses(object):
                   "is written densely, which for scattered areas is slow and can be very large, "
                   "and a BigTIFF above 4 GB is not guaranteed. Install gdal for the sparse path."
                   .format(token, src))
-            self._merge_arcpy(paths, out_path)
+            self._merge_arcpy(paths, out_path, zero_nodata, token, src)
             return
 
         tmp_vrt = out_path[:-4] + "_tmp.vrt"
         try:
+            # srcNodata makes 0 transparent in the sources, so it never wins an overlap; VRTNodata
+            # carries the flag into the VRT and on into the GeoTIFF.
+            kwargs = {"srcNodata": 0, "VRTNodata": 0} if zero_nodata else {}
             # gdal returns None on failure instead of raising; surface it.
-            if gdal.BuildVRT(tmp_vrt, paths) is None:
+            if gdal.BuildVRT(tmp_vrt, paths, **kwargs) is None:
                 raise RuntimeError("gdal.BuildVRT returned None")
             opts = ["BIGTIFF=YES", "COMPRESS=LZW", "TILED=YES", "SPARSE_OK=TRUE"]
             if gdal.Translate(out_path, tmp_vrt, creationOptions=opts) is None:
@@ -4537,7 +4557,7 @@ class MergeClasses(object):
             if os.path.exists(tmp_vrt):
                 os.remove(tmp_vrt)
 
-    def _merge_arcpy(self, paths, out_path):
+    def _merge_arcpy(self, paths, out_path, zero_nodata, token, src):
         """Fallback merge with core MosaicToNewRaster. Pixel type and band count come from the
         first input; the classes are integers, so FIRST is a safe overlap rule."""
         first = arcpy.Raster(paths[0])
@@ -4549,6 +4569,14 @@ class MergeClasses(object):
             pixel_type=_MOSAIC_PIXEL_TYPES.get(first.pixelType, "16_BIT_SIGNED"),
             number_of_bands=1,
             mosaic_method="FIRST")
+        if zero_nodata:
+            # Only after the fact here, unlike the GDAL path: the mosaic already resolved the
+            # overlaps treating 0 as a value, so a 0 that won an overlap is now hidden rather
+            # than never having competed.
+            _warn("{} ({}): on the arcpy fallback the 0 class is flagged NoData only after the "
+                  "mosaic, so where two rasters overlap a 0 may have won before being hidden. "
+                  "The GDAL path does not have this problem.".format(token, src))
+            arcpy.management.SetRasterProperties(out_path, nodata=[[1, 0]])
 
 
 class VectorizeClasses(object):
@@ -4603,12 +4631,18 @@ class VectorizeClasses(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_simplify.value = False           # off: the outline follows the cell edges exactly
 
+        p_drop_zero = arcpy.Parameter(
+            displayName="Drop the 0 class polygons", name="drop_zero",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_drop_zero.value = False          # 0 (surveyed, not suitable) is a real class
+
         p_overwrite = arcpy.Parameter(
             displayName="Overwrite existing outputs", name="overwrite_existing",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
-        return [p_in, p_recurse, p_source, p_products, p_out, p_prefix, p_simplify, p_overwrite]
+        return [p_in, p_recurse, p_source, p_products, p_out, p_prefix, p_simplify, p_drop_zero,
+                p_overwrite]
 
     def isLicensed(self):
         # RasterToPolygon and CalculateGeometryAttributes are core. No extension.
@@ -4629,9 +4663,14 @@ class VectorizeClasses(object):
         out_folder = parameters[4].valueAsText
         prefix = sanitize_name(parameters[5].valueAsText)
         simplify = "SIMPLIFY" if bool(parameters[6].value) else "NO_SIMPLIFY"
-        overwrite_existing = bool(parameters[7].value)
+        drop_zero = bool(parameters[7].value)
+        overwrite_existing = bool(parameters[8].value)
 
         arcpy.env.overwriteOutput = True     # the in_memory scratch is rewritten per raster
+        if drop_zero:
+            _msg("Dropping the 0 class polygons. Only the suitable area is kept, so the total "
+                 "area of each mine is no longer in the output and the suitable share cannot be "
+                 "computed from it alone.")
 
         groups = _group_class_rasters(in_folder, recurse, source, selected)
         if not groups:
@@ -4655,7 +4694,7 @@ class VectorizeClasses(object):
                 skipped += 1
                 continue
             try:
-                n = self._vectorize_group(sorted(items), out_shp, simplify, token, src)
+                n = self._vectorize_group(sorted(items), out_shp, simplify, drop_zero, token, src)
                 _msg("{} ({}): {} polygon(s) from {} area(s) -> {}".format(
                     token, src, n, len(items), os.path.basename(out_shp)))
                 created += 1
@@ -4673,9 +4712,9 @@ class VectorizeClasses(object):
             raise RuntimeError(msg)
         return
 
-    def _vectorize_group(self, items, out_shp, simplify, token, src):
+    def _vectorize_group(self, items, out_shp, simplify, drop_zero, token, src):
         """Polygonize every area's raster and append them into one shapefile, then compute the
-        polygon areas. Returns the polygon count."""
+        polygon areas. drop_zero skips the not suitable class. Returns the polygon count."""
         sr = arcpy.Describe(items[0][0]).spatialReference
         if sr is None or sr.type != "Projected":
             msg = ("{} ({}): the rasters must be in a projected CRS to compute areas in meters; "
@@ -4707,6 +4746,8 @@ class VectorizeClasses(object):
             with arcpy.da.SearchCursor(tmp, ["SHAPE@", "gridcode"]) as reader:
                 with arcpy.da.InsertCursor(out_shp, ["SHAPE@", "AREA_NAME", "GRIDCODE"]) as writer:
                     for shape, gridcode in reader:
+                        if drop_zero and gridcode == 0:
+                            continue
                         writer.insertRow((shape, area, gridcode))
         if arcpy.Exists(tmp):
             arcpy.management.Delete(tmp)
