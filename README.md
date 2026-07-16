@@ -30,6 +30,7 @@ This toolbox is the **factor engine only**. Any downstream analysis (suitability
 3. **Build the mosaics.** Run **Tool 2** on the download root to get one DEM and one DSM per area.
 4. **Derive the factors.** Run **Tool 3** (surfaces), **Tool 4** (solar), then **Tool 5** (reclassify) on the previous outputs.
 5. **Utilities as needed.** **Tool 6** resamples (for example 2 m to 5 m), **Tool 7** draws cartographic contours, **Tool 8** verifies that everything is there and valid, and **Tool 9** builds a binary suitability mask per mine.
+6. **Deliver.** **Tool 10** merges the class rasters of a product into one BigTIFF, and **Tool 11** turns them into one shapefile per product with every area together and the areas computed.
 
 Each tool reads the previous tool's output folder and writes with one consistent naming convention. Project CRS is EPSG:3763.
 
@@ -37,7 +38,7 @@ Each tool reads the previous tool's output folder and writes with one consistent
 
 ## Summary
 
-Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. Four more are utilities you can run on the outputs:
+Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. Six more are utilities you can run on the outputs:
 
 1. **Download DGT Data**: download the LiDAR tiles from the DGT CDD portal, organized one folder per AOI feature (with a product subfolder each) or as a single flat folder, ready for the mosaic tool.
 2. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
@@ -48,6 +49,8 @@ Five tools form the pipeline, run in order, with the input and output folders al
 7. **Contours** (optional): cartographic contour lines from the DEM or DSM mosaics, with a chosen equidistance and a master (index) interval, smoothed for high resolution LiDAR, into a `Contours` subfolder.
 8. **Verify Outputs**: read-only integrity check of a results tree; flags corrupt or unreadable rasters, a CRS other than the expected EPSG, and missing expected products per area, with an optional report file.
 9. **Suitability Mask**: binary mask per mine, 1 where the slope is at or below a threshold (degrees or percent) and the annual solar radiation is at or above a minimum, clipped to each mine polygon; optionally also a second raster with the suitable cells graded by solar class (1 to 6).
+10. **Merge Classes** (optional): merge the per area class rasters of a product into one raster covering every area, written as a sparse LZW BigTIFF so a scattered set of areas does not blow up.
+11. **Vectorize Classes** (optional): convert the class rasters to polygons, every area merged into one shapefile per product, with the area name, the class value and the polygon area in square meters.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -90,17 +93,25 @@ flowchart TD
     S -.-> V8
     SOL -.-> V8
     V8 -.-> REP["VERIFY_report.txt<br/>integrity + completeness"]
+    APT -.-> T10["Tool 10 (optional)<br/>Merge Classes"]
+    RCL -.-> T10
+    T10 -.-> BIG["One raster per product<br/>Prefix_SOURCE_PRODUCT.tif<br/>sparse LZW BigTIFF"]
+    APT -.-> T11["Tool 11 (optional)<br/>Vectorize Classes"]
+    RCL -.-> T11
+    T11 -.-> SHP["One shapefile per product<br/>all areas together<br/>AREA_NAME, GRIDCODE, AREA_M2"]
     RCL --> EXT["Analysis<br/>(external to this toolbox)"]
     SOL --> EXT
     APT --> EXT
+    SHP -.-> EXT
+    BIG -.-> EXT
 
     classDef tool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff;
     classDef opttool fill:#1f6feb,stroke:#0d3b8a,color:#ffffff,stroke-dasharray:5 3;
     classDef data fill:#eaf2ff,stroke:#1f6feb,color:#0b2a5b;
     classDef ext fill:#f5f5f5,stroke:#999999,color:#333333,stroke-dasharray:4 3;
     class TDL,T1,T2,T3,T4,T9 tool;
-    class T5,CT,V8 opttool;
-    class AOI,LID,M,S,SOL,RCL,RS,CL,CO,APT,REP data;
+    class T5,CT,V8,T10,T11 opttool;
+    class AOI,LID,M,S,SOL,RCL,RS,CL,CO,APT,REP,BIG,SHP data;
     class EXT ext;
 ```
 
@@ -114,6 +125,8 @@ flowchart TD
 - **Tool 7** (optional) generates cartographic contour lines from the DEM or DSM mosaics: it smooths the surface (Focal mean, given in meters so it is resolution independent), contours at the chosen equidistance, smooths the lines (PAEK), flags the master (index) contours and drops the short noise rings, writing one polyline shapefile per area to a `Contours` subfolder. Needs Spatial Analyst.
 - **Tool 8** verifies a results tree without writing anything (except an optional report): every `.tif` must have a valid GeoTIFF signature, open in arcpy, and match the expected EPSG; every area with a base mosaic must have the expected products. The `Resample` tree is checked for integrity but not completeness.
 - **Tool 9** builds the final binary suitability mask per mine: `1` where slope <= the threshold AND `SOLARUNI` >= the minimum (default 1400 kWh/m2, the lower bound of solar class 3), else `0`, computed on the area raster that covers each mine (matched by name, else spatially) and clipped to the mine polygons (same-name polygons are one mine). The slope threshold unit picks the slope raster and the comparison runs in its own units: `percent` reads the `SLOPEP` raster, `degrees` reads `SLOPE`. Output `<Mine>_<SOURCE>_APT.tif`, and optionally `<Mine>_<SOURCE>_APTCLS.tif`, the mask multiplied by the annual solar radiation reclassified into classes 1 to 6, so suitable cells keep their solar class (3 to 6) and the rest is 0. When an input exists in more than one resolution tree, it uses the finest available for both slope and solar. The weighted overlay and the REN/RAN/PDM exclusions remain outside this toolbox.
+- **Tool 10** (optional) merges the per area class rasters of each selected product into one raster covering every area (`<Prefix>_<SOURCE>_<PRODUCT>.tif`). Only class rasters are merged, never a continuous surface. Because the areas of interest are scattered, the merged grid spans their whole bounding box and is almost all NoData, so it is written with GDAL as a **sparse, LZW compressed BigTIFF**: the empty blocks are never written and cost nothing. Without gdal (`osgeo`) it falls back to core `MosaicToNewRaster`, which writes every block, and warns accordingly.
+- **Tool 11** (optional) polygonizes the class rasters and merges **every area into one shapefile per product**, carrying the area name, the class value and the polygon area in square meters. For scattered areas this is the container that stays small and answers "how many hectares are suitable" directly, which a merged raster cannot.
 - EPSG is explicit in code and in the logs. Mosaics inherit the tiles CRS (EPSG:3763); the AOI layer, which may be in a different CRS, is projected only for the extent checks and clips, deliberately without a datum shift (see [Limitations and notes](#limitations-and-notes)).
 
 ---
@@ -124,7 +137,8 @@ flowchart TD
 - **Spatial Analyst** extension for Tool 3 (slope, aspect, curvature, traditional hillshade), Tool 4 (solar radiation), Tool 7 (contours: Contour and Focal Statistics; Smooth Line is core), and Tool 9 (suitability mask: Con and Extract By Mask). RasterSolarRadiation uses the GPU when available and falls back to the CPU.
 - **Image Analyst** extension for Tool 3 only when the hillshade type is Multidirectional.
 - **Network access, a free CDD account, and the `requests` library** (bundled with ArcGIS Pro) for Tool 1 (Download DGT Data).
-- Tools 1, 2, 5, 6 and 8 need no extension (download, mosaicking, resampling and the verification are core, and the reclassification is pure numpy).
+- Tools 1, 2, 5, 6, 8, 10 and 11 need no extension (download, mosaicking, resampling, verification, merging and vectorizing are core, and the reclassification is pure numpy).
+- **gdal (`osgeo`)**, bundled with ArcGIS Pro, for the sparse BigTIFF in Tool 10 (and the optional VRT in Tool 1). Both fall back or warn cleanly when it is missing.
 - Tiles in the project CRS, ETRS89 / PT-TM06 (EPSG:3763). The tools log the CRS and warn if it differs.
 
 ---
@@ -276,11 +290,12 @@ Resample the named rasters to a coarser cell size (for example 2 m to 5 m), in b
 | --- | --- |
 | Results folder | The results root; a `Resample` subfolder is created inside it. |
 | Recurse subfolders | On (default) finds the `per_area_subfolder` layout. |
-| Data types to resample | Multi-select of the sources (`DEM`, `DSM`), the surfaces (`SLOPE`, `SLOPEP`, `ASPECT`, ...), the solar variants, and the `_RCL` factors. The list is derived from the naming convention, so new products appear automatically. Default `DEM`, `DSM`. |
+| Data types to resample | Multi-select of the sources (`DEM`, `DSM`), the surfaces (`SLOPE`, `SLOPEP`, `ASPECT`, `ASPECT_DIR`, ...), the solar variants, the suitability rasters (`APT`, `APTCLS`) and the `_RCL` factors. The list is derived from the naming convention, so new products appear automatically. Default `DEM`, `DSM`. |
 | Target cell size (meters) | Default 5. |
+| Resampling method | `auto` (default) picks per type: bilinear for continuous, nearest for the class rasters. Or force one: `MAJORITY`, `NEAREST`, `BILINEAR`, `CUBIC`. |
 | Overwrite existing outputs | Off skips existing resampled rasters. |
 
-The method is automatic per type: bilinear for continuous rasters, nearest for reclassified (`_RCL`) so the ordinal classes are preserved. A raster already at the target cell size is copied through unchanged, so the `Resample` folder stays a complete set; a target finer than the native cell size warns, since upsampling adds no real detail.
+In `auto` the method is chosen per type: bilinear for continuous rasters, nearest for the class rasters (`_RCL`, `APT`, `APTCLS`, `ASPECT_DIR`) so the ordinal classes are preserved. **To generalize a class raster, force `MAJORITY`**: nearest only subsamples and keeps the speckle, while majority gives each output cell the most common class in the window, which is what actually simplifies the data (going from 0.5 m to 5 m, each output cell summarizes 100 input cells). Forcing an interpolating method (`BILINEAR`, `CUBIC`) on a class raster is allowed but warned about at the end of the run, since it invents class values that are not in the legend. A raster already at the target cell size is copied through unchanged, so the `Resample` folder stays a complete set; a target finer than the native cell size warns, since upsampling adds no real detail.
 
 ### Tool 7, Contours
 
@@ -337,6 +352,43 @@ The final binary mask per mine: `1` = suitable (gentle slope AND enough solar), 
 
 Each mine is matched to the area raster that covers it, by name first (an area named like the mine) and spatially otherwise (the raster whose extent contains the most polygon centroids), so it works on per area results and on cluster results; a warning is issued when part of a mine falls outside the chosen raster. When the results folder holds more than one resolution tree (for example the `2m` and `50cm` trees Tool 2 builds), it uses the finest resolution present for both the slope and the solar of each area, the same one for both so a mine never mixes grids, and reports a single summary line. The computation is bounded to the mine polygons (snapped to the slope grid) and clipped to their shape with Extract By Mask. Cells that are NoData in either input stay NoData in the mask (only cells with data become 1 or 0).
 
+### Tool 10, Merge Classes
+
+Merge the per area class rasters of a product into **one raster covering every area**, for delivery or for a single layer in the map. Class rasters only (`APT`, `APTCLS`, `ASPECT_DIR`, and the `_RCL` factors); a continuous surface is out of scope. No extension needed.
+
+| Parameter | Description |
+| --- | --- |
+| Results folder | The tree with the class rasters. Point at the `Resample` folder to merge the 5 m generalized rasters. |
+| Recurse subfolders | On (default). |
+| Source | `DEM` (default), `DSM`, or `BOTH`. |
+| Class products to merge | Multi-select, derived from the naming convention: `APT`, `APTCLS`, `ASPECT_DIR`, `SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`. Default `APT`, `APTCLS`. |
+| Output folder | Where the merged rasters go. |
+| Output name prefix | Names the output (sanitized); default `Todas`. Output `<Prefix>_<SOURCE>_<PRODUCT>.tif`. |
+| Overwrite existing outputs | Off skips existing merged rasters. |
+
+**Why sparse matters.** Areas of interest are usually scattered (in this project, mines from Valença to Faro), so the merged grid has to span their whole bounding box while only a tiny fraction carries data. At 5 m that is billions of cells and >99.9% NoData, past the 4 GB limit of a classic TIFF. The tool writes it with GDAL as a **sparse, LZW compressed, tiled BigTIFF** (`SPARSE_OK=TRUE`, `BIGTIFF=YES`): the all-NoData blocks are never written, so the file stays small and the run stays quick. Without gdal (`osgeo`) it falls back to core `MosaicToNewRaster`, which writes every block; the tool warns that this is slow, can be very large, and does not guarantee BigTIFF above 4 GB.
+
+The tool logs the merged grid size in cells before writing, and warns when it exceeds about 2 billion, so merging the native 0.5 m or 2 m rasters instead of the 5 m ones is an informed choice rather than a surprise. It fails loud when the rasters of a product do not all share one CRS or one cell size, since mosaicking a mix would silently resample.
+
+### Tool 11, Vectorize Classes
+
+Convert the class rasters to polygons, with **every area merged into one shapefile per product**, and the polygon areas computed. For scattered areas this is the container that stays small and answers "how many hectares are suitable" straight from the attribute table. No extension needed.
+
+| Parameter | Description |
+| --- | --- |
+| Results folder | The tree with the class rasters. |
+| Recurse subfolders | On (default). |
+| Source | `DEM` (default), `DSM`, or `BOTH`. |
+| Class products to vectorize | Multi-select, same list as Tool 10. Default `APT`, `APTCLS`, `ASPECT_DIR`. |
+| Output folder | Where the shapefiles go. |
+| Output name prefix | Names the output (sanitized); default `Todas`. Output `<Prefix>_<SOURCE>_<PRODUCT>.shp`. |
+| Simplify polygons | Off by default, so the outline follows the cell edges exactly. On smooths the staircase, at the cost of the areas no longer matching the cell count exactly. |
+| Overwrite existing outputs | Off skips existing shapefiles. |
+
+Each polygon carries `AREA_NAME` (the area or mine it came from), `GRIDCODE` (the class value) and `AREA_M2` (the polygon area in square meters, computed with Calculate Geometry Attributes; the CRS must be projected, which EPSG:3763 is). **Every polygon is kept, including the not suitable `0`**, so the suitable share of each area can be computed rather than only the suitable patches. NoData cells produce no polygon, so the outline of each area is its clipped mosaic.
+
+> Point Tool 11 at the **5 m** rasters. Vectorizing a 0.5 m raster produces millions of stair step polygons: a huge shapefile that is slow to draw and no more informative. Generalize first with Tool 6 (`MAJORITY`, 5 m), then vectorize.
+
 ---
 
 ## Naming convention
@@ -346,7 +398,9 @@ A single convention links the tools:
 - Mosaic: `{Area}_{SOURCE}` where SOURCE is `DEM` or `DSM`.
 - Surface: `{Area}_{SOURCE}_{PRODUCT}` where PRODUCT is `SLOPE` (degrees), `SLOPEP` (percent), `ASPECT`, `HILLSHADE`, `PROFC` or `PLANC`.
 - Solar: `{Area}_{SOURCE}_SOLARUNI` or `_SOLAROVC` (global, by diffuse model), with `_SOLARUNIDIR` / `_SOLARUNIDIF` / `_SOLARUNIDUR` (and the `_SOLAROVC` equivalents) for the optional direct, diffuse and duration rasters.
-- Reclassified (Tool 5): the suitability rasters go to a `Reclass` subfolder. The surface name plus `_RCL` (`SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`), and the aspect quadrants as `{Area}_{SOURCE}_ASPECT_DIR`.
+- Reclassified (Tool 5): the suitability rasters go to a `Reclass` subfolder. The surface name plus `_RCL` (`SLOPE_RCL`, `ASPECT_RCL`, `SOLARUNI_RCL`), and the aspect quadrants as `{Area}_{SOURCE}_ASPECT_DIR`. `ASPECT_DIR` is a product token that itself contains an underscore, so the parser tries the last two tokens joined before the last one alone.
+- Merged (Tool 10): `{Prefix}_{SOURCE}_{PRODUCT}.tif`, one raster per product covering every area.
+- Vectorized (Tool 11): `{Prefix}_{SOURCE}_{PRODUCT}.shp`, one shapefile per product with every area, fields `AREA_NAME`, `GRIDCODE`, `AREA_M2`.
 - Contours (Tool 7): `{Area}_{SOURCE}_CONT.shp` in a `Contours` subfolder, with `Contour` (elevation) and `master` (1/0) fields.
 - Suitability mask (Tool 9): `{Mine}_{SOURCE}_APT.tif` (1 = suitable, 0 = not), and optionally `{Mine}_{SOURCE}_APTCLS.tif` (the same mask graded by solar class 3 to 6, 0 elsewhere), one per mine.
 - Cluster: `Cluster_NNN_{SOURCE}` (overlap clustering), numbered by the smallest member FID; a `Cluster_NNN_members.txt` lists the member areas.
@@ -414,7 +468,7 @@ The shared helpers have pure unit tests inside the toolbox file, runnable outsid
 python LidarTerrainToolbox.pyt
 ```
 
-This exercises name sanitization and collision handling, the output name build and parse round trip, the class interval validation and the fixed reclassification schemes, the area grouping, the folder prefix auto-detection, the VRT extent parsing, the tile resolution parsing and selection, the resample type mapping, and the numpy reclassification logic (the numpy tests are skipped if numpy is not installed in the Python being used). Under ArcGIS Pro the test block does not run; ArcGIS imports the module, it does not execute it as a script.
+This exercises name sanitization and collision handling, the output name build and parse round trip (including the two token `ASPECT_DIR` product), the class interval validation and the fixed reclassification schemes, the area grouping, the folder prefix auto-detection, the VRT extent parsing, the tile resolution parsing and selection, the resample type mapping, the class product list and the integer pixel type check, and the numpy reclassification logic (the numpy tests are skipped if numpy is not installed in the Python being used). Under ArcGIS Pro the test block does not run; ArcGIS imports the module, it does not execute it as a script.
 
 ---
 
@@ -431,6 +485,10 @@ This exercises name sanitization and collision handling, the output name build a
 | `... are on different datums. Projecting WITHOUT a datum shift ...` | The AOI layer CRS declares a different datum than the tiles | See the datum note under Limitations: outputs aligned + layer drawn offset = mislabeled layer CRS (redefine it); outputs offset = project the layer properly first. |
 | `Different area names sanitize to the same folder name ...` | Two distinct names (for example `Covas-1` and `Covas 1`) collapse to one sanitized name | Rename the areas so the sanitized names differ, or use the by geometry mapping. |
 | `ERROR 010240: Could not save raster dataset ...` on many areas late in a long run | Process memory or handles exhausted after hundreds of rasters | Restart ArcGIS Pro and re-run with overwrite off; only the failed areas are redone. |
+| `gdal (osgeo) is not available, falling back to arcpy` (Tool 10) | The Python in use has no `osgeo` | Use the ArcGIS Pro Python, which bundles gdal. The fallback works but writes the whole grid densely, so for scattered areas expect it to be slow and large. |
+| `the merged grid is ... cells` warning (Tool 10) | The areas are far apart, so the merged raster spans their whole bounding box | Expected, and harmless on the sparse BigTIFF path. If it worries you, merge the 5 m rasters rather than the native ones. |
+| `... is not an integer raster, so it cannot be polygonized` (Tool 11) | A continuous surface was selected | Vectorize only the class rasters (`APT`, `APTCLS`, `ASPECT_DIR`, `_RCL`). |
+| `... has a X m cell but the others have Y m` (Tool 10) | The product exists at more than one resolution under the folder | Point at a single resolution tree, or resample them to a common cell size with Tool 6 first. |
 
 ---
 

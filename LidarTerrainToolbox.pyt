@@ -69,9 +69,14 @@ except ImportError:
 
 PROJECT_EPSG = 3763                                  # ETRS89 / PT-TM06, meters
 SOURCES = ("DEM", "DSM")
-PRODUCTS = ("SLOPE", "SLOPEP", "ASPECT", "HILLSHADE", "PROFC", "PLANC", "SOLAR",
+PRODUCTS = ("SLOPE", "SLOPEP", "ASPECT", "ASPECT_DIR", "HILLSHADE", "PROFC", "PLANC", "SOLAR",
             "SOLARUNI", "SOLAROVC", "SOLARUNIDIR", "SOLARUNIDIF", "SOLARUNIDUR",
             "SOLAROVCDIR", "SOLAROVCDIF", "SOLAROVCDUR", "CONT", "APT", "APTCLS")
+# Products whose values are classes, not a continuous measure: interpolating them would invent
+# fractional classes, so they resample with nearest or majority, never bilinear or cubic.
+CATEGORICAL_PRODUCTS = ("ASPECT_DIR", "APT", "APTCLS")
+# The products Tool 05 reclassifies, so the _RCL variants exist for exactly these.
+RECLASSIFIED_PRODUCTS = ("SLOPE", "ASPECT", "SOLARUNI")
 RECLASS_SUFFIX = "RCL"
 MAX_NAME_LEN = 40                                    # margin for suffixes like _DEM_ASPECT_RCL
 RECLASS_NODATA = 9999                                # NoData for reclassified integer outputs
@@ -352,8 +357,13 @@ def parse_source_and_product(filename):
         reclass = True
         tokens = tokens[:-1]
 
+    # Try the last TWO tokens joined before the last one alone, so a product token that itself
+    # contains an underscore (ASPECT_DIR) parses without renaming the files already on disk.
     product = None
-    if tokens and tokens[-1] in PRODUCTS:
+    if len(tokens) >= 2 and "_".join(tokens[-2:]) in PRODUCTS:
+        product = "_".join(tokens[-2:])
+        tokens = tokens[:-2]
+    elif tokens and tokens[-1] in PRODUCTS:
         product = tokens[-1]
         tokens = tokens[:-1]
 
@@ -609,9 +619,11 @@ class Toolbox(object):
         # (no toolset categories): 01 Download DGT Data, 02 Build Mosaics by Polygon,
         # 03 Generate Surfaces, 04 Solar Radiation, 05 Reclassify Factors, 06 Resample,
         # 07 Contours (optional cartographic output), 08 Verify Outputs (read-only check),
-        # 09 Suitability Mask (binary slope x solar mask per mine).
+        # 09 Suitability Mask (binary slope x solar mask per mine), 10 Merge Classes and
+        # 11 Vectorize Classes (delivery: every area together as one raster or one shapefile).
         self.tools = [DownloadDGTData, BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation,
-                      ReclassifyFactor, Resample, Contours, VerifyOutputs, SuitabilityMask]
+                      ReclassifyFactor, Resample, Contours, VerifyOutputs, SuitabilityMask,
+                      MergeClasses, VectorizeClasses]
 
 
 # ===========================================================================
@@ -3009,7 +3021,7 @@ class ReclassifyFactor(object):
         two rasters (quadrants and suitability); slope and solar yield one each."""
         if product == "ASPECT":
             return [
-                (build_output_name(area, source, "ASPECT") + "_DIR.tif",
+                (build_output_name(area, source, "ASPECT_DIR") + ".tif",
                  ASPECT_DIR_CLASSES, ASPECT_DIR_FLAT),
                 (build_output_name(area, source, "ASPECT", reclass=True) + ".tif",
                  ASPECT_RCL_CLASSES, ASPECT_RCL_FLAT),
@@ -3603,7 +3615,7 @@ class Resample(object):
         # automatically; the _RCL variants are the products Tool 05 reclassifies. CONT is a
         # shapefile (Tool 7), so it is excluded, there is no contour raster to resample.
         p_types.filter.list = (list(SOURCES) + [p for p in PRODUCTS if p != "CONT"]
-                               + [p + "_" + RECLASS_SUFFIX for p in ("SLOPE", "ASPECT")])
+                               + [p + "_" + RECLASS_SUFFIX for p in RECLASSIFIED_PRODUCTS])
         p_types.value = ["DEM", "DSM"]
 
         p_cell = arcpy.Parameter(
@@ -3611,12 +3623,19 @@ class Resample(object):
             datatype="GPDouble", parameterType="Required", direction="Input")
         p_cell.value = 5
 
+        p_method = arcpy.Parameter(
+            displayName="Resampling method", name="method",
+            datatype="GPString", parameterType="Optional", direction="Input")
+        p_method.filter.type = "ValueList"
+        p_method.filter.list = ["auto", "NEAREST", "MAJORITY", "BILINEAR", "CUBIC"]
+        p_method.value = "auto"          # bilinear for continuous, nearest for categorical
+
         p_overwrite = arcpy.Parameter(
             displayName="Overwrite existing outputs", name="overwrite_existing",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
-        return [p_in, p_recurse, p_types, p_cell, p_overwrite]
+        return [p_in, p_recurse, p_types, p_cell, p_method, p_overwrite]
 
     def isLicensed(self):
         # Core Data Management Resample, no extension needed.
@@ -3643,7 +3662,8 @@ class Resample(object):
         recurse = bool(parameters[1].value)
         selected = set(str(s).upper() for s in (parameters[2].values or []))
         target_cell = float(parameters[3].value)
-        overwrite_existing = bool(parameters[4].value)
+        method_choice = (parameters[4].valueAsText or "auto")
+        overwrite_existing = bool(parameters[5].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -3690,6 +3710,7 @@ class Resample(object):
         skipped_existing = 0
         copied_native = 0
         failed = []
+        interpolated = []              # categorical rasters an explicit method would interpolate
         arcpy.SetProgressor("step", "Resampling rasters...", 0, total, 1)
         for path, info, token in rasters:
             arcpy.SetProgressorPosition()
@@ -3719,10 +3740,15 @@ class Resample(object):
                 if target_cell < native:
                     _warn("{} ({}): target {:g} m is finer than native {:g} m; upsampling adds no "
                           "real detail.".format(area, token, target_cell, native))
-                # Categorical rasters (reclassified, and the APT/APTCLS suitability rasters) must
-                # use nearest, or interpolation would produce fractional class values.
-                method = ("NEAREST" if (info["reclass"] or info["product"] in ("APT", "APTCLS"))
-                          else "BILINEAR")
+                categorical = info["reclass"] or info["product"] in CATEGORICAL_PRODUCTS
+                if method_choice == "auto":
+                    # Categorical rasters must use nearest, or interpolation would produce
+                    # fractional class values.
+                    method = "NEAREST" if categorical else "BILINEAR"
+                else:
+                    method = method_choice
+                    if categorical and method in ("BILINEAR", "CUBIC"):
+                        interpolated.append("{} ({})".format(area, token))
                 arcpy.management.Resample(path, out_path, "{0} {0}".format(target_cell), method)
                 _msg("{} ({}): resampled {:g} m -> {:g} m ({}, {}) -> {}".format(
                     area, token, native, target_cell, method, _crs_label(sr), fn))
@@ -3736,6 +3762,11 @@ class Resample(object):
         _msg("Done. Selected rasters: {}. Resampled: {}. Copied (already at target): {}. "
              "Skipped existing: {}. Failed: {}.".format(
                  total, created, copied_native, skipped_existing, len(failed)))
+        if interpolated:
+            # The user asked for it explicitly, so this is a warning, not a failure.
+            _warn("{} categorical raster(s) were resampled with {}, which interpolates and can "
+                  "invent class values that are not in the legend: {}. Use MAJORITY or NEAREST "
+                  "for these.".format(len(interpolated), method_choice, ", ".join(interpolated)))
         if failed:
             msg = "Resample failed for: " + ", ".join(failed)
             _err(msg)
@@ -4252,6 +4283,440 @@ class SuitabilityMask(object):
                 arcpy.management.Delete(mask_fc)
 
 
+# arcpy Raster.pixelType strings mapped to the MosaicToNewRaster pixel_type wording. Only the
+# integer types the class rasters use are listed; anything else falls back to a safe signed 16 bit.
+_MOSAIC_PIXEL_TYPES = {
+    "U1": "1_BIT", "U2": "2_BIT", "U4": "4_BIT",
+    "U8": "8_BIT_UNSIGNED", "S8": "8_BIT_SIGNED",
+    "U16": "16_BIT_UNSIGNED", "S16": "16_BIT_SIGNED",
+    "U32": "32_BIT_UNSIGNED", "S32": "32_BIT_SIGNED",
+    "F32": "32_BIT_FLOAT", "F64": "64_BIT",
+}
+
+
+def is_integer_pixel_type(pixel_type):
+    """True when an arcpy Raster.pixelType string is an integer type. RasterToPolygon needs an
+    integer raster, so a float surface must be rejected with a clear message rather than let
+    arcpy fail with ERROR 010423. Pure (string in, bool out) so it is unit tested."""
+    return bool(pixel_type) and str(pixel_type).upper().startswith(("U", "S"))
+
+
+def class_products():
+    """The class (categorical) products that can be merged or vectorized: the suitability and
+    aspect quadrant rasters, plus the Tool 05 _RCL variants. Derived from the tuples, so a new
+    product needs no edit here."""
+    return list(CATEGORICAL_PRODUCTS) + [p + "_" + RECLASS_SUFFIX for p in RECLASSIFIED_PRODUCTS]
+
+
+def _group_class_rasters(in_folder, recurse, source, selected):
+    """Discover the class rasters under in_folder and group them by (source, product).
+
+    Returns {(source, product_token): [(path, area), ...]}. product_token carries the _RCL suffix
+    when the raster is reclassified, matching what class_products() offers. The Resample folder is
+    NOT skipped here: it is usually exactly where the 5 m generalized rasters live, so the caller
+    points at the folder it wants.
+    """
+    groups = {}
+    if recurse:
+        walker = os.walk(in_folder)
+    else:
+        only_files = [n for n in os.listdir(in_folder)
+                      if os.path.isfile(os.path.join(in_folder, n))]
+        walker = [(in_folder, [], only_files)]
+    for dirpath, dirs, files in walker:
+        for fn in files:
+            if not fn.lower().endswith(".tif"):
+                continue
+            info = parse_source_and_product(fn)
+            if info["area"] is None or info["source"] is None:
+                continue
+            if source != "BOTH" and info["source"] != source:
+                continue
+            token = _resample_type_token(info)
+            if token is None or token not in selected:
+                continue
+            groups.setdefault((info["source"], token), []).append(
+                (os.path.join(dirpath, fn), info["area"]))
+    return groups
+
+
+def _assert_uniform_grid(paths, label):
+    """Fail loud unless every raster shares one CRS and one cell size. Mosaicking a mix would
+    silently resample or reproject, and the merged classes would be wrong rather than obviously
+    broken. Returns (spatial_reference, cell_size, extent) of the union."""
+    sr = None
+    cell = None
+    xmin = ymin = xmax = ymax = None
+    for p in paths:
+        d = arcpy.Describe(p)
+        r_sr = d.spatialReference
+        r_cell = arcpy.Raster(p).meanCellWidth
+        if sr is None:
+            sr, cell = r_sr, r_cell
+        else:
+            if not _same_crs(sr, r_sr):
+                msg = ("{}: '{}' is {} but the others are {}. Merge one CRS at a time."
+                       .format(label, os.path.basename(p), _crs_label(r_sr), _crs_label(sr)))
+                _err(msg)
+                raise ValueError(msg)
+            if abs(r_cell - cell) > 1e-6:
+                msg = ("{}: '{}' has a {:g} m cell but the others have {:g} m. Resample them to a "
+                       "common cell size first (Tool 06)."
+                       .format(label, os.path.basename(p), r_cell, cell))
+                _err(msg)
+                raise ValueError(msg)
+        e = d.extent
+        xmin = e.XMin if xmin is None else min(xmin, e.XMin)
+        ymin = e.YMin if ymin is None else min(ymin, e.YMin)
+        xmax = e.XMax if xmax is None else max(xmax, e.XMax)
+        ymax = e.YMax if ymax is None else max(ymax, e.YMax)
+    return sr, cell, (xmin, ymin, xmax, ymax)
+
+
+class MergeClasses(object):
+    def __init__(self):
+        self.label = "10 - Merge Classes"
+        self.description = ("Merge the per area class rasters of each selected product into one "
+                            "raster covering every area: the suitability masks (APT, APTCLS), the "
+                            "aspect quadrants (ASPECT_DIR) and the Tool 05 _RCL factors. Only "
+                            "class rasters are merged; a continuous surface is out of scope. "
+                            "Areas of interest are scattered, so the merged grid spans their whole "
+                            "bounding box and is almost all NoData: it is written with GDAL as a "
+                            "sparse, LZW compressed BigTIFF, so the empty blocks cost nothing. "
+                            "Without gdal (osgeo) it falls back to arcpy, which writes the grid "
+                            "densely and can be very large and slow. Output "
+                            "<Prefix>_<SOURCE>_<PRODUCT>.tif.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Results folder (with the class rasters)", name="in_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_source = arcpy.Parameter(
+            displayName="Source", name="source_filter",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_source.filter.type = "ValueList"
+        p_source.filter.list = ["DEM", "DSM", "BOTH"]
+        p_source.value = "DEM"
+
+        p_products = arcpy.Parameter(
+            displayName="Class products to merge", name="products",
+            datatype="GPString", parameterType="Required", direction="Input", multiValue=True)
+        p_products.filter.type = "ValueList"
+        p_products.filter.list = class_products()
+        p_products.value = ["APT", "APTCLS"]
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder", name="out_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_prefix = arcpy.Parameter(
+            displayName="Output name prefix", name="prefix",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_prefix.value = "Todas"
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_in, p_recurse, p_source, p_products, p_out, p_prefix, p_overwrite]
+
+    def isLicensed(self):
+        # GDAL Translate, or core MosaicToNewRaster as the fallback. No extension.
+        return True
+
+    def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        prev_compression = arcpy.env.compression
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+            arcpy.env.compression = prev_compression
+
+    def _run(self, parameters, messages):
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        source = parameters[2].valueAsText
+        selected = set(str(s).upper() for s in (parameters[3].values or []))
+        out_folder = parameters[4].valueAsText
+        prefix = sanitize_name(parameters[5].valueAsText)
+        overwrite_existing = bool(parameters[6].value)
+
+        arcpy.env.overwriteOutput = overwrite_existing
+        arcpy.env.compression = "LZW"
+
+        groups = _group_class_rasters(in_folder, recurse, source, selected)
+        if not groups:
+            msg = ("No class rasters of the selected products ({}) found under '{}'. Run Tools 5 "
+                   "and 9 first, or point at the Resample folder with the 5 m rasters."
+                   .format(", ".join(sorted(selected)), in_folder))
+            _err(msg)
+            raise ValueError(msg)
+        if not os.path.isdir(out_folder):
+            os.makedirs(out_folder)
+
+        created = 0
+        skipped = 0
+        failed = []
+        arcpy.SetProgressor("step", "Merging class rasters...", 0, len(groups), 1)
+        for (src, token), items in sorted(groups.items()):
+            arcpy.SetProgressorPosition()
+            out_path = os.path.join(out_folder, "{}_{}_{}.tif".format(prefix, src, token))
+            if os.path.exists(out_path) and not overwrite_existing:
+                _msg("{} ({}): exists, skipping.".format(token, src))
+                skipped += 1
+                continue
+            try:
+                paths = sorted(p for p, _a in items)
+                sr, cell, (xmin, ymin, xmax, ymax) = _assert_uniform_grid(
+                    paths, "{} ({})".format(token, src))
+                ncols = int(math.ceil((xmax - xmin) / cell))
+                nrows = int(math.ceil((ymax - ymin) / cell))
+                cells = float(ncols) * float(nrows)
+                _msg("{} ({}, {}): {} raster(s), {:g} m cell, merged grid {} x {} = {:.3g} cells."
+                     .format(token, src, _crs_label(sr), len(paths), cell, ncols, nrows, cells))
+                if cells > 2e9:
+                    _warn("{} ({}): the merged grid is {:.3g} cells because the areas are far "
+                          "apart, and is almost all NoData. Sparse BigTIFF handles it, but a "
+                          "denser writer or a finer cell size will not. Consider merging the 5 m "
+                          "rasters, not the native ones.".format(token, src, cells))
+                self._merge(paths, out_path, token, src)
+                _msg("{} ({}): merged -> {} ({:.1f} MB)".format(
+                    token, src, os.path.basename(out_path),
+                    os.path.getsize(out_path) / (1024.0 * 1024.0)))
+                created += 1
+            except Exception as exc:
+                _warn("{} ({}): merge failed: {}. Skipping this product.".format(token, src, exc))
+                failed.append("{} ({})".format(token, src))
+
+        arcpy.ResetProgressor()
+        _msg("Done. Products: {}. Merged: {}. Skipped existing: {}. Failed: {}.".format(
+            len(groups), created, skipped, len(failed)))
+        # Fail loud: if any product failed, the tool result must be a failure, not SUCCESS.
+        if failed:
+            msg = "Merge failed for: " + ", ".join(failed)
+            _err(msg)
+            raise RuntimeError(msg)
+        return
+
+    def _merge(self, paths, out_path, token, src):
+        """Write the merged raster. GDAL builds a VRT over the inputs and translates it to a
+        sparse LZW BigTIFF, so the mostly empty country wide grid costs almost nothing. Without
+        osgeo, fall back to arcpy, which writes every block."""
+        try:
+            from osgeo import gdal
+        except ImportError:
+            gdal = None
+
+        if gdal is None:
+            _warn("{} ({}): gdal (osgeo) is not available, falling back to arcpy. The whole grid "
+                  "is written densely, which for scattered areas is slow and can be very large, "
+                  "and a BigTIFF above 4 GB is not guaranteed. Install gdal for the sparse path."
+                  .format(token, src))
+            self._merge_arcpy(paths, out_path)
+            return
+
+        tmp_vrt = out_path[:-4] + "_tmp.vrt"
+        try:
+            # gdal returns None on failure instead of raising; surface it.
+            if gdal.BuildVRT(tmp_vrt, paths) is None:
+                raise RuntimeError("gdal.BuildVRT returned None")
+            opts = ["BIGTIFF=YES", "COMPRESS=LZW", "TILED=YES", "SPARSE_OK=TRUE"]
+            if gdal.Translate(out_path, tmp_vrt, creationOptions=opts) is None:
+                raise RuntimeError("gdal.Translate returned None")
+        finally:
+            if os.path.exists(tmp_vrt):
+                os.remove(tmp_vrt)
+
+    def _merge_arcpy(self, paths, out_path):
+        """Fallback merge with core MosaicToNewRaster. Pixel type and band count come from the
+        first input; the classes are integers, so FIRST is a safe overlap rule."""
+        first = arcpy.Raster(paths[0])
+        arcpy.management.MosaicToNewRaster(
+            input_rasters=paths,
+            output_location=os.path.dirname(out_path),
+            raster_dataset_name_with_extension=os.path.basename(out_path),
+            coordinate_system_for_the_raster=arcpy.Describe(paths[0]).spatialReference,
+            pixel_type=_MOSAIC_PIXEL_TYPES.get(first.pixelType, "16_BIT_SIGNED"),
+            number_of_bands=1,
+            mosaic_method="FIRST")
+
+
+class VectorizeClasses(object):
+    def __init__(self):
+        self.label = "11 - Vectorize Classes"
+        self.description = ("Convert the class rasters to polygons, with every area merged into "
+                            "one shapefile per product. Scattered areas are cheap as polygons, and "
+                            "the area of each polygon comes out computed, which is what a merged "
+                            "raster cannot give directly. Each polygon carries the area name, the "
+                            "class value and its area in square meters. Every polygon is kept, "
+                            "including the not suitable 0, so the suitable share of each area can "
+                            "be computed. Output <Prefix>_<SOURCE>_<PRODUCT>.shp. Point it at the "
+                            "5 m rasters: vectorizing a 50 cm raster makes millions of stair step "
+                            "polygons.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_in = arcpy.Parameter(
+            displayName="Results folder (with the class rasters)", name="in_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Recurse subfolders", name="recurse_subfolders",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_source = arcpy.Parameter(
+            displayName="Source", name="source_filter",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_source.filter.type = "ValueList"
+        p_source.filter.list = ["DEM", "DSM", "BOTH"]
+        p_source.value = "DEM"
+
+        p_products = arcpy.Parameter(
+            displayName="Class products to vectorize", name="products",
+            datatype="GPString", parameterType="Required", direction="Input", multiValue=True)
+        p_products.filter.type = "ValueList"
+        p_products.filter.list = class_products()
+        p_products.value = ["APT", "APTCLS", "ASPECT_DIR"]
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder", name="out_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_prefix = arcpy.Parameter(
+            displayName="Output name prefix", name="prefix",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_prefix.value = "Todas"
+
+        p_simplify = arcpy.Parameter(
+            displayName="Simplify polygons", name="simplify",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_simplify.value = False           # off: the outline follows the cell edges exactly
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        return [p_in, p_recurse, p_source, p_products, p_out, p_prefix, p_simplify, p_overwrite]
+
+    def isLicensed(self):
+        # RasterToPolygon and CalculateGeometryAttributes are core. No extension.
+        return True
+
+    def execute(self, parameters, messages):
+        prev_overwrite = arcpy.env.overwriteOutput
+        try:
+            return self._run(parameters, messages)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+
+    def _run(self, parameters, messages):
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        source = parameters[2].valueAsText
+        selected = set(str(s).upper() for s in (parameters[3].values or []))
+        out_folder = parameters[4].valueAsText
+        prefix = sanitize_name(parameters[5].valueAsText)
+        simplify = "SIMPLIFY" if bool(parameters[6].value) else "NO_SIMPLIFY"
+        overwrite_existing = bool(parameters[7].value)
+
+        arcpy.env.overwriteOutput = True     # the in_memory scratch is rewritten per raster
+
+        groups = _group_class_rasters(in_folder, recurse, source, selected)
+        if not groups:
+            msg = ("No class rasters of the selected products ({}) found under '{}'. Run Tools 5 "
+                   "and 9 first, or point at the Resample folder with the 5 m rasters."
+                   .format(", ".join(sorted(selected)), in_folder))
+            _err(msg)
+            raise ValueError(msg)
+        if not os.path.isdir(out_folder):
+            os.makedirs(out_folder)
+
+        created = 0
+        skipped = 0
+        failed = []
+        arcpy.SetProgressor("step", "Vectorizing class rasters...", 0, len(groups), 1)
+        for (src, token), items in sorted(groups.items()):
+            arcpy.SetProgressorPosition()
+            out_shp = os.path.join(out_folder, "{}_{}_{}.shp".format(prefix, src, token))
+            if arcpy.Exists(out_shp) and not overwrite_existing:
+                _msg("{} ({}): exists, skipping.".format(token, src))
+                skipped += 1
+                continue
+            try:
+                n = self._vectorize_group(sorted(items), out_shp, simplify, token, src)
+                _msg("{} ({}): {} polygon(s) from {} area(s) -> {}".format(
+                    token, src, n, len(items), os.path.basename(out_shp)))
+                created += 1
+            except Exception as exc:
+                _warn("{} ({}): vectorize failed: {}. Skipping this product."
+                      .format(token, src, exc))
+                failed.append("{} ({})".format(token, src))
+
+        arcpy.ResetProgressor()
+        _msg("Done. Products: {}. Shapefiles created: {}. Skipped existing: {}. Failed: {}.".format(
+            len(groups), created, skipped, len(failed)))
+        if failed:
+            msg = "Vectorize failed for: " + ", ".join(failed)
+            _err(msg)
+            raise RuntimeError(msg)
+        return
+
+    def _vectorize_group(self, items, out_shp, simplify, token, src):
+        """Polygonize every area's raster and append them into one shapefile, then compute the
+        polygon areas. Returns the polygon count."""
+        sr = arcpy.Describe(items[0][0]).spatialReference
+        if sr is None or sr.type != "Projected":
+            msg = ("{} ({}): the rasters must be in a projected CRS to compute areas in meters; "
+                   "found {}.".format(token, src, _crs_label(sr)))
+            _err(msg)
+            raise ValueError(msg)
+
+        if arcpy.Exists(out_shp):
+            arcpy.management.Delete(out_shp)
+        arcpy.management.CreateFeatureclass(
+            os.path.dirname(out_shp), os.path.basename(out_shp), "POLYGON", spatial_reference=sr)
+        # Shapefile field names are limited to 10 characters.
+        arcpy.management.AddField(out_shp, "AREA_NAME", "TEXT", field_length=MAX_NAME_LEN)
+        arcpy.management.AddField(out_shp, "GRIDCODE", "LONG")
+
+        tmp = "in_memory/_vec_poly"
+        for path, area in items:
+            if not is_integer_pixel_type(arcpy.Raster(path).pixelType):
+                msg = ("{} ({}): '{}' is not an integer raster, so it cannot be polygonized. "
+                       "Vectorize the class rasters, not a continuous surface."
+                       .format(token, src, os.path.basename(path)))
+                _err(msg)
+                raise ValueError(msg)
+            if arcpy.Exists(tmp):
+                arcpy.management.Delete(tmp)
+            arcpy.conversion.RasterToPolygon(path, tmp, simplify, "Value")
+            # Map the RasterToPolygon schema onto ours: gridcode carries the class value, and the
+            # area name is constant per input raster.
+            with arcpy.da.SearchCursor(tmp, ["SHAPE@", "gridcode"]) as reader:
+                with arcpy.da.InsertCursor(out_shp, ["SHAPE@", "AREA_NAME", "GRIDCODE"]) as writer:
+                    for shape, gridcode in reader:
+                        writer.insertRow((shape, area, gridcode))
+        if arcpy.Exists(tmp):
+            arcpy.management.Delete(tmp)
+
+        arcpy.management.AddField(out_shp, "AREA_M2", "DOUBLE")
+        arcpy.management.CalculateGeometryAttributes(
+            out_shp, [["AREA_M2", "AREA"]], area_unit="SQUARE_METERS")
+        return int(arcpy.management.GetCount(out_shp)[0])
+
+
 # ===========================================================================
 # Self tests (pure functions; numpy tests run only if numpy is importable).
 # Run: python LidarTerrainToolbox.pyt
@@ -4315,6 +4780,8 @@ def _run_self_tests():
         ("AreaA", "DEM", "CONT", False),             # contour lines (Tool 7)
         ("Covas", "DEM", "APT", False),              # suitability mask (Tool 9)
         ("Covas", "DEM", "APTCLS", False),           # suitability graded by solar class (Tool 9)
+        ("Covas", "DEM", "ASPECT_DIR", False),       # product token that contains an underscore
+        ("Sao_Domingos", "DSM", "ASPECT_DIR", False),
     ]
     for area, source, product, reclass in cases:
         name = build_output_name(area, source, product, reclass)
@@ -4325,6 +4792,38 @@ def _run_self_tests():
 
     check("area with underscore not misparsed",
           parse_source_and_product("Sao_Domingos_DEM_SLOPE.tif")["area"] == "Sao_Domingos")
+    # ASPECT_DIR is a product token that itself contains an underscore, so the parser has to try
+    # the last two tokens joined before the last one alone. It must not eat ASPECT_RCL or ASPECT.
+    _dir = parse_source_and_product("Covas_DEM_ASPECT_DIR.tif")
+    check("two token product parsed",
+          _dir["area"] == "Covas" and _dir["source"] == "DEM"
+          and _dir["product"] == "ASPECT_DIR" and not _dir["reclass"])
+    check("two token product resample token",
+          _resample_type_token(parse_source_and_product("Covas_DEM_ASPECT_DIR.tif")) == "ASPECT_DIR")
+    check("plain aspect still parses",
+          parse_source_and_product("Covas_DEM_ASPECT.tif")["product"] == "ASPECT")
+    _rcl = parse_source_and_product("Covas_DEM_ASPECT_RCL.tif")
+    check("aspect reclass still parses",
+          _rcl["product"] == "ASPECT" and _rcl["reclass"] and _rcl["area"] == "Covas")
+    check("area ending in a product word not misparsed",
+          parse_source_and_product("Vale_ASPECT_DEM_SLOPE.tif")["area"] == "Vale_ASPECT")
+
+    print("class_products / is_integer_pixel_type")
+    _cp = class_products()
+    check("class products cover the suitability and aspect quadrants",
+          "APT" in _cp and "APTCLS" in _cp and "ASPECT_DIR" in _cp)
+    check("class products cover every reclassified factor",
+          all(p + "_RCL" in _cp for p in RECLASSIFIED_PRODUCTS))
+    check("class products exclude the continuous surfaces",
+          "SLOPE" not in _cp and "SLOPEP" not in _cp and "SOLARUNI" not in _cp)
+    check("integer pixel types accepted",
+          all(is_integer_pixel_type(t) for t in ("U8", "S16", "U16", "S32")))
+    check("float pixel types rejected",
+          not any(is_integer_pixel_type(t) for t in ("F32", "F64")))
+    check("empty pixel type rejected", not is_integer_pixel_type(None))
+    check("every mosaic pixel type maps to a known wording",
+          all(v.endswith(("BIT", "_SIGNED", "_UNSIGNED", "_FLOAT")) or v == "64_BIT"
+              for v in _MOSAIC_PIXEL_TYPES.values()))
     check("unknown name yields source None",
           parse_source_and_product("random_file.tif")["source"] is None)
     check("area ending in mixed case token kept (case sensitive parse)",
