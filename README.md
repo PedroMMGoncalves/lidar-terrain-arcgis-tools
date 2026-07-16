@@ -49,8 +49,8 @@ Five tools form the pipeline, run in order, with the input and output folders al
 7. **Contours** (optional): cartographic contour lines from the DEM or DSM mosaics, with a chosen equidistance and a master (index) interval, smoothed for high resolution LiDAR, into a `Contours` subfolder.
 8. **Verify Outputs**: read-only integrity check of a results tree; flags corrupt or unreadable rasters, a CRS other than the expected EPSG, and missing expected products per area, with an optional report file.
 9. **Suitability Mask**: binary mask per mine, 1 where the slope is at or below a threshold (degrees or percent) and the annual solar radiation is at or above a minimum, clipped to each mine polygon; optionally also a second raster with the suitable cells graded by solar class (1 to 6).
-10. **Merge Classes** (optional): merge the per area class rasters of a product into one raster covering every area, written as a sparse LZW BigTIFF so a scattered set of areas does not blow up.
-11. **Vectorize Classes** (optional): convert the class rasters to polygons, every area merged into one shapefile per product, with the area name, the class value and the polygon area in square meters.
+10. **Merge Class Rasters** (optional): merge the per area class rasters of a product into one raster covering every area, written as a sparse LZW BigTIFF so a scattered set of areas does not blow up.
+11. **Vectorize Class Rasters** (optional): convert the class rasters to polygons, every area merged into one shapefile per product, with the area name, the class value and the polygon area in square meters.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -93,10 +93,10 @@ flowchart TD
     S -.-> V8
     SOL -.-> V8
     V8 -.-> REP["VERIFY_report.txt<br/>integrity + completeness"]
-    APT -.-> T10["Tool 10 (optional)<br/>Merge Classes"]
+    APT -.-> T10["Tool 10 (optional)<br/>Merge Class Rasters"]
     RCL -.-> T10
     T10 -.-> BIG["One raster per product<br/>Prefix_SOURCE_PRODUCT.tif<br/>sparse LZW BigTIFF"]
-    APT -.-> T11["Tool 11 (optional)<br/>Vectorize Classes"]
+    APT -.-> T11["Tool 11 (optional)<br/>Vectorize Class Rasters"]
     RCL -.-> T11
     T11 -.-> SHP["One shapefile per product<br/>all areas together<br/>AREA_NAME, GRIDCODE, AREA_M2"]
     RCL --> EXT["Analysis<br/>(external to this toolbox)"]
@@ -228,7 +228,7 @@ Topographic surfaces from the Tool 2 mosaics. Each surface has its own checkbox 
 | Output structure | `same_as_input` (default; each surface is written next to its input mosaic), `per_area_subfolder`, or `flat`. |
 | Output folder | Only for `per_area_subfolder` or `flat`; greyed out and not needed for `same_as_input`. |
 | Source | `BOTH` (default), `DEM`, or `DSM`. |
-| Slope (degrees), Slope (percent), Aspect, Hillshade, Profile curvature, Plan curvature | One checkbox each; slope percent is off by default. |
+| Slope (degrees), Slope (percent), Aspect, Hillshade, Profile curvature, Plan curvature | One checkbox each; both slope outputs are on by default, since the Suitability Mask defaults to a percent threshold (which needs the percent slope raster). |
 | Z factor | Default 1 (project is metric). |
 | Hillshade type | `Multidirectional` (default, Image Analyst) or `Traditional`. |
 | Hillshade azimuth, altitude | Traditional hillshade only. |
@@ -277,7 +277,7 @@ Aspect yields **two** rasters; slope and solar one each. The boundaries are `[mi
 | --- | --- |
 | `..._ASPECT_DIR` | Quadrants (45 deg bins): N=1, NE=2, E=3, SE=4, S=5, SW=6, W=7, NW=8, Plano=9. |
 | `..._ASPECT_RCL` | Solar suitability (60 deg sectors): Norte=1, NE/NW=2, SE/SW=3, Sul and Plano=4. |
-| `..._SLOPE_RCL` | 1 if slope <= 14.04 deg (25 percent), else 0. |
+| `..._SLOPE_RCL` | 1 if slope <= 11.31 deg (20 percent), else 0. Same 20 percent break as the Suitability Mask default, so the factor and the mask agree. |
 | `..._SOLARUNI_RCL` | <1200=1, 1200-1400=2, 1400-1600=3, 1600-1800=4, 1800-2000=5, >=2000=6 (kWh/m2). |
 
 A `RECLASS_legenda.txt` in each `Reclass` subfolder lists the files written and this class matrix.
@@ -352,7 +352,7 @@ The final binary mask per mine: `1` = suitable (gentle slope AND enough solar), 
 
 Each mine is matched to the area raster that covers it, by name first (an area named like the mine) and spatially otherwise (the raster whose extent contains the most polygon centroids), so it works on per area results and on cluster results; a warning is issued when part of a mine falls outside the chosen raster. When the results folder holds more than one resolution tree (for example the `2m` and `50cm` trees Tool 2 builds), it uses the finest resolution present for both the slope and the solar of each area, the same one for both so a mine never mixes grids, and reports a single summary line. The computation is bounded to the mine polygons (snapped to the slope grid) and clipped to their shape with Extract By Mask. Cells that are NoData in either input stay NoData in the mask (only cells with data become 1 or 0).
 
-### Tool 10, Merge Classes
+### Tool 10, Merge Class Rasters
 
 Merge the per area class rasters of a product into **one raster covering every area**, for delivery or for a single layer in the map. Class rasters only (`APT`, `APTCLS`, `ASPECT_DIR`, and the `_RCL` factors); a continuous surface is out of scope. No extension needed.
 
@@ -373,7 +373,7 @@ The tool logs the merged grid size in cells before writing, and warns when it ex
 
 > **`0` and NoData are not the same thing.** `0` means "surveyed, not suitable"; NoData means "outside the area, never looked at". Declaring `0` as NoData makes them indistinguishable, and you lose the denominator: the suitable share of an area can no longer be computed from that raster alone. Keep it off unless the deliverable is meant to show only the suitable ground. On the GDAL path the flag is set on the sources, so a `0` is also transparent where two rasters overlap and can never hide a real class; the arcpy fallback can only stamp it on the output afterwards and warns about that difference.
 
-### Tool 11, Vectorize Classes
+### Tool 11, Vectorize Class Rasters
 
 Convert the class rasters to polygons, with **every area merged into one shapefile per product**, and the polygon areas computed. For scattered areas this is the container that stays small and answers "how many hectares are suitable" straight from the attribute table. No extension needed.
 

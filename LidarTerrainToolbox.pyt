@@ -92,7 +92,7 @@ CONTOURS_DIRNAME = "Contours"                        # output subfolder created 
 # Fixed project reclassification schemes (suitability classes). Each list is consumed by
 # reclassify_array as (class_id, lo, hi) with [lo, hi) intervals, the class with the largest
 # hi inclusive at the top. Aspect uses -1 for flat, handled by the flat_class override.
-SLOPE_BREAK_DEG = math.degrees(math.atan(0.25))      # 25 percent grade equals 14.04 degrees
+SLOPE_BREAK_DEG = math.degrees(math.atan(0.20))      # 20 percent grade equals 11.31 degrees
 # Aspect by quadrants (categorical, 45 degree bins). North wraps around 0/360.
 ASPECT_DIR_CLASSES = [(1, 0.0, 22.5), (2, 22.5, 67.5), (3, 67.5, 112.5), (4, 112.5, 157.5),
                       (5, 157.5, 202.5), (6, 202.5, 247.5), (7, 247.5, 292.5), (8, 292.5, 337.5),
@@ -102,7 +102,8 @@ ASPECT_DIR_FLAT = 9                                   # Plano
 ASPECT_RCL_CLASSES = [(1, 0.0, 30.0), (2, 30.0, 90.0), (3, 90.0, 150.0), (4, 150.0, 210.0),
                       (3, 210.0, 270.0), (2, 270.0, 330.0), (1, 330.0, 360.0)]
 ASPECT_RCL_FLAT = 4                                   # Plano counts as best
-# Slope suitability (degrees); the 25 percent break expressed in degrees.
+# Slope suitability (degrees); the 20 percent break expressed in degrees (matches the Tool 9
+# suitability mask default and the project rule of slope at or below 20 percent being suitable).
 SLOPE_RCL_CLASSES = [(1, 0.0, SLOPE_BREAK_DEG), (0, SLOPE_BREAK_DEG, 90.0)]
 # Annual global irradiation suitability (kWh/m2).
 SOLAR_RCL_CLASSES = [(1, 0.0, 1200.0), (2, 1200.0, 1400.0), (3, 1400.0, 1600.0),
@@ -124,10 +125,10 @@ ASPECT_RCL  -  aptidao por orientacao solar (setores de 60 graus; sul/plano = me
   3 = SE e SW (90-150 e 210-270)
   4 = Sul (150-210) e Plano (-1)
 
-SLOPE_RCL  -  aptidao por declive (em graus; corte 25% = 14.04 graus)
+SLOPE_RCL  -  aptidao por declive (em graus; corte 20% = 11.31 graus)
   ..._{DEM|DSM}_SLOPE_RCL.tif
-  1 = apto      (<= 14.04 graus, ou seja <= 25%)
-  0 = nao apto  (>  14.04 graus, ou seja >  25%)   (0 e valor real, nao NoData)
+  1 = apto      (<= 11.31 graus, ou seja <= 20%)
+  0 = nao apto  (>  11.31 graus, ou seja >  20%)   (0 e valor real, nao NoData)
 
 SOLARUNI_RCL  -  aptidao por irradiacao global anual (kWh/m2, ceu uniforme)
   ..._DEM_SOLARUNI_RCL.tif
@@ -682,8 +683,8 @@ class Toolbox(object):
         # (no toolset categories): 01 Download DGT Data, 02 Build Mosaics by Polygon,
         # 03 Generate Surfaces, 04 Solar Radiation, 05 Reclassify Factors, 06 Resample,
         # 07 Contours (optional cartographic output), 08 Verify Outputs (read-only check),
-        # 09 Suitability Mask (binary slope x solar mask per mine), 10 Merge Classes and
-        # 11 Vectorize Classes (delivery: every area together as one raster or one shapefile).
+        # 09 Suitability Mask (binary slope x solar mask per mine), 10 Merge Class Rasters and
+        # 11 Vectorize Class Rasters (delivery: every area together as one raster or one shapefile).
         self.tools = [DownloadDGTData, BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation,
                       ReclassifyFactor, Resample, Contours, VerifyOutputs, SuitabilityMask,
                       MergeClasses, VectorizeClasses]
@@ -1745,7 +1746,7 @@ class BuildMosaicsByPolygon(object):
             displayName="Products", name="products",
             datatype="GPString", parameterType="Required", direction="Input")
         p_products.filter.type = "ValueList"
-        p_products.filter.list = ["BOTH", "DEM", "DSM"]
+        p_products.filter.list = ["DEM", "DSM", "BOTH"]   # same order in every tool
         p_products.value = "BOTH"
 
         p_pixel = arcpy.Parameter(
@@ -1821,6 +1822,13 @@ class BuildMosaicsByPolygon(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_pyramids.value = False
 
+        # Group the less common parameters into collapsible categories, so the everyday run shows
+        # only the essentials (Pro shows uncategorized parameters first, categories collapsed).
+        for p in (p_clusters, p_dry_run):
+            p.category = "Clustering"
+        for p in (p_pixel, p_method, p_res, p_verify, p_prefix, p_pyramids):
+            p.category = "Advanced"
+
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
                 p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res,
                 p_clusters, p_dry_run, p_mapping, p_clip, p_pyramids]
@@ -1832,6 +1840,9 @@ class BuildMosaicsByPolygon(object):
     def updateParameters(self, parameters):
         # The cluster dry-run only applies when clustering is on.
         parameters[14].enabled = bool(parameters[13].value)
+        # The extent verification only runs under by FID mapping (by name and by geometry are
+        # authoritative), so grey it out otherwise instead of showing an inert checkbox.
+        parameters[10].enabled = (parameters[15].valueAsText == "by FID number")
         return
 
     def updateMessages(self, parameters):
@@ -2484,7 +2495,7 @@ class DeriveSurfaces(object):
         p_slopep = arcpy.Parameter(
             displayName="Slope (percent)", name="do_slope_percent",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
-        p_slopep.value = False
+        p_slopep.value = True          # the Suitability Mask defaults to a percent threshold (SLOPEP)
 
         p_aspect = arcpy.Parameter(
             displayName="Aspect", name="do_aspect",
@@ -3007,8 +3018,9 @@ class ReclassifyFactor(object):
                             "project suitability classes (a fixed scheme), in batch. Aspect "
                             "yields two rasters: quadrants (ASPECT_DIR) and solar suitability "
                             "(ASPECT_RCL); Slope and Solar yield SLOPE_RCL and SOLARUNI_RCL. "
-                            "Each output, plus a legend, goes to a Reclass subfolder. Uses "
-                            "numpy for deterministic boundaries.")
+                            "Solar reclassifies the uniform-sky annual raster (SOLARUNI) only, "
+                            "not the overcast variant. Each output, plus a legend, goes to a "
+                            "Reclass subfolder. Uses numpy for deterministic boundaries.")
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -3350,9 +3362,9 @@ class SolarRadiation(object):
         p_interval.value = 14
 
         return [p_in, p_recurse, p_out, p_struct, p_source, p_cell, p_method,
-                p_year, p_neigh, p_trans, p_diff, p_diffuse_model, p_overwrite,
+                p_year, p_neigh, p_trans, p_diff, p_diffuse_model,
                 p_out_direct, p_out_diffuse, p_out_duration, p_reuse,
-                p_grid, p_use_interval, p_interval_unit, p_interval]
+                p_grid, p_use_interval, p_interval_unit, p_interval, p_overwrite]
 
     def isLicensed(self):
         try:
@@ -3362,9 +3374,9 @@ class SolarRadiation(object):
 
     def updateParameters(self, parameters):
         parameters[2].enabled = parameters[3].valueAsText != "same_as_input"
-        use_interval = bool(parameters[18].value)
+        use_interval = bool(parameters[17].value)
+        parameters[18].enabled = use_interval
         parameters[19].enabled = use_interval
-        parameters[20].enabled = use_interval
         return
 
     def updateMessages(self, parameters):
@@ -3422,15 +3434,15 @@ class SolarRadiation(object):
         transmittivity = float(parameters[9].value)
         diffuse_proportion = float(parameters[10].value)
         diffuse_model = parameters[11].valueAsText
-        overwrite_existing = bool(parameters[12].value)
-        out_direct = bool(parameters[13].value)
-        out_diffuse = bool(parameters[14].value)
-        out_duration = bool(parameters[15].value)
-        reuse_surfaces = bool(parameters[16].value)
-        grid_level = int(parameters[17].value)
-        interval_mode = "INTERVAL" if bool(parameters[18].value) else "NO_INTERVAL"
-        interval_unit = parameters[19].valueAsText or "DAY"
-        interval = int(parameters[20].value or 14)   # optional param; guard a cleared value
+        out_direct = bool(parameters[12].value)
+        out_diffuse = bool(parameters[13].value)
+        out_duration = bool(parameters[14].value)
+        reuse_surfaces = bool(parameters[15].value)
+        grid_level = int(parameters[16].value)
+        interval_mode = "INTERVAL" if bool(parameters[17].value) else "NO_INTERVAL"
+        interval_unit = parameters[18].valueAsText or "DAY"
+        interval = int(parameters[19].value or 14)   # optional param; guard a cleared value
+        overwrite_existing = bool(parameters[20].value)
 
         # Idempotency is handled by an explicit os.path.exists skip below, so overwrite is
         # left on to let the scratch resample step overwrite a stale temp cleanly.
@@ -4359,7 +4371,7 @@ def _assert_uniform_grid(paths, label):
 
 class MergeClasses(object):
     def __init__(self):
-        self.label = "10 - Merge Classes"
+        self.label = "10 - Merge Class Rasters"
         self.description = ("Merge the per area class rasters of each selected product into one "
                             "raster covering every area: the suitability masks (APT, APTCLS), the "
                             "aspect quadrants (ASPECT_DIR) and the Tool 05 _RCL factors. Only "
@@ -4567,7 +4579,7 @@ class MergeClasses(object):
 
 class VectorizeClasses(object):
     def __init__(self):
-        self.label = "11 - Vectorize Classes"
+        self.label = "11 - Vectorize Class Rasters"
         self.description = ("Convert the class rasters to polygons, with every area merged into "
                             "one shapefile per product. Scattered areas are cheap as polygons, and "
                             "the area of each polygon comes out computed, which is what a merged "
@@ -5060,8 +5072,8 @@ def _run_self_tests():
               reclassify_array(_np.array([[0.0, 60.0, 120.0, 180.0, 340.0, -1.0]]),
                                ASPECT_RCL_CLASSES, 9999, flat_value=-1,
                                flat_class=ASPECT_RCL_FLAT).tolist() == [[1, 2, 3, 4, 1, 4]])
-        check("slope_rcl scheme (25 percent equals 14.04 deg)",
-              reclassify_array(_np.array([[10.0, 20.0]]), SLOPE_RCL_CLASSES, 9999).tolist()
+        check("slope_rcl scheme (20 percent equals 11.31 deg)",
+              reclassify_array(_np.array([[10.0, 12.0]]), SLOPE_RCL_CLASSES, 9999).tolist()
               == [[1, 0]])
         check("solar_rcl scheme",
               reclassify_array(_np.array([[1000.0, 1300.0, 1500.0, 2100.0]]),
