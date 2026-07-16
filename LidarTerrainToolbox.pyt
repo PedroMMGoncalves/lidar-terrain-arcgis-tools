@@ -3823,6 +3823,7 @@ class Resample(object):
         copied_native = 0
         failed = []
         interpolated = []              # categorical rasters an explicit method would interpolate
+        incompatible = []              # continuous rasters skipped because MAJORITY needs integer
         arcpy.SetProgressor("step", "Resampling rasters...", 0, total, 1)
         for path, info, token in rasters:
             arcpy.SetProgressorPosition()
@@ -3860,6 +3861,16 @@ class Resample(object):
                     method = "NEAREST" if no_interp else "BILINEAR"
                 else:
                     method = method_choice
+                    # MAJORITY needs an integer raster (ArcGIS ERROR 001847 on floating point), so
+                    # a continuous type in the selection would abort. Skip it with a clear note
+                    # instead: MAJORITY is for the class rasters, deselect DEM/DSM/slope/solar.
+                    if method == "MAJORITY" and not is_integer_pixel_type(src.pixelType):
+                        _warn("{} ({}): MAJORITY only applies to integer class rasters; this one is "
+                              "floating point, skipped. Deselect the continuous types (DEM, DSM, "
+                              "SLOPE, ASPECT, SOLAR) when resampling with MAJORITY."
+                              .format(area, token))
+                        incompatible.append("{} ({})".format(area, token))
+                        continue
                     if no_interp and method in ("BILINEAR", "CUBIC"):
                         interpolated.append("{} ({})".format(area, token))
                 arcpy.management.Resample(path, out_path, "{0} {0}".format(target_cell), method)
@@ -3873,8 +3884,8 @@ class Resample(object):
 
         arcpy.ResetProgressor()
         _msg("Done. Selected rasters: {}. Resampled: {}. Copied (already at target): {}. "
-             "Skipped existing: {}. Failed: {}.".format(
-                 total, created, copied_native, skipped_existing, len(failed)))
+             "Skipped existing: {}. Skipped (MAJORITY needs integer): {}. Failed: {}.".format(
+                 total, created, copied_native, skipped_existing, len(incompatible), len(failed)))
         if interpolated:
             # The user asked for it explicitly, so this is a warning, not a failure.
             _warn("{} class or aspect raster(s) were resampled with {}, which interpolates: it "
