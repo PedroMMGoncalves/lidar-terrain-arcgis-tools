@@ -716,6 +716,27 @@ def _same_crs(sr_a, sr_b):
     return sr_a.exportToString() == sr_b.exportToString()
 
 
+# Datums that are coincident to sub-meter, so a projection between them without a datum shift is
+# correct in practice and the mislabeled-CRS warning would be a false alarm. ETRS89 and WGS84 were
+# identical in 1989 and diverge only about 2.5 cm/year (sub-meter today), and the AOI is projected
+# to WGS84 only to compute a padded, kilometer-scale tile search box.
+_COINCIDENT_DATUMS = {"D_ETRS_1989", "D_WGS_1984"}
+
+
+def _datum_name(sr):
+    """The datum name of a SpatialReference (projected or geographic), or None if unavailable."""
+    try:
+        return sr.datumName
+    except Exception:
+        return None
+
+
+def _datums_coincident(datum_a, datum_b):
+    """True when both datums are in the coincident set, so projecting between them without a datum
+    shift introduces only a sub-meter error. Pure (names in, bool out) so it is unit tested."""
+    return datum_a in _COINCIDENT_DATUMS and datum_b in _COINCIDENT_DATUMS
+
+
 _DATUM_WARNED = set()                                 # (from wkid/name, to wkid/name) pairs warned
 
 
@@ -737,7 +758,10 @@ def _project_geom(geom, from_sr, to_sr):
             differs = arcpy.ListTransformations(from_sr, to_sr)
         except Exception:
             differs = []
-        if differs:
+        # ETRS89 to WGS84 (the download bbox projection) lists a transformation but the shift is
+        # sub-meter, so skip the mislabeled-CRS warning for coincident datums; still project below.
+        coincident = _datums_coincident(_datum_name(from_sr), _datum_name(to_sr))
+        if differs and not coincident:
             _warn("{} and {} are on different datums. Projecting WITHOUT a datum shift (the "
                   "transformation {} is NOT applied). Verify the outputs align with the terrain; "
                   "if they are offset by a few hundred meters, the layer CRS is likely correct "
@@ -4836,6 +4860,18 @@ def _run_self_tests():
     check("no collision returns empty", find_sanitize_collisions(["Lousal", "Jales"]) == {})
     check("same raw repeated is not a collision",
           find_sanitize_collisions(["Jales", "Jales"]) == {})
+
+    print("_datums_coincident")
+    check("etrs89 and wgs84 are coincident (no datum-shift warning)",
+          _datums_coincident("D_ETRS_1989", "D_WGS_1984"))
+    check("wgs84 and etrs89 are coincident either way",
+          _datums_coincident("D_WGS_1984", "D_ETRS_1989"))
+    check("datum 73 and etrs89 are not coincident",
+          not _datums_coincident("D_Datum_73", "D_ETRS_1989"))
+    check("lisboa and wgs84 are not coincident",
+          not _datums_coincident("D_Lisbon", "D_WGS_1984"))
+    check("unknown datum name is not coincident",
+          not _datums_coincident(None, "D_WGS_1984"))
 
     print("build_output_name / parse_source_and_product round trip")
     cases = [
