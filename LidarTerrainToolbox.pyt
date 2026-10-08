@@ -811,6 +811,31 @@ def _datums_coincident(datum_a, datum_b):
     return datum_a in _COINCIDENT_DATUMS and datum_b in _COINCIDENT_DATUMS
 
 
+def _snap_extent_outward(xmin, ymin, xmax, ymax, cell, anchor_x=0.0, anchor_y=0.0):
+    """Expand a box outward to the cell edges of a raster grid: cell size `cell`, with cell
+    edges passing through (anchor_x, anchor_y). The result lies on cell edges, contains the
+    input box and exceeds it by less than one cell per side.
+
+    Why: ArcGIS rounds an analysis extent, and a Clip extent, to the NEAREST cell edge of the
+    input raster. An AOI edge that falls inside a cell then leaves a gap of up to half a cell
+    between the mosaic and the AOI line, or overshoots it by as much. A Carta Militar sheet
+    projected to EPSG:3763 never sits on the 0.5 m DGT grid, so every sheet shows it. Snapping
+    outward first makes the cut cover the whole AOI without resampling. A tiny tolerance keeps
+    an edge already on the grid from gaining a whole extra cell through floating point noise.
+    Pure, unit tested."""
+    if not cell or cell <= 0:
+        raise ValueError("Cell size must be positive, got {!r}.".format(cell))
+    eps = cell * 1e-6
+
+    def down(value, anchor):
+        return anchor + math.floor((value - anchor + eps) / cell) * cell
+
+    def up(value, anchor):
+        return anchor + math.ceil((value - anchor - eps) / cell) * cell
+
+    return (down(xmin, anchor_x), down(ymin, anchor_y), up(xmax, anchor_x), up(ymax, anchor_y))
+
+
 _DATUM_WARNED = set()                                 # (from wkid/name, to wkid/name) pairs warned
 
 
@@ -1909,11 +1934,22 @@ class BuildMosaicsByPolygon(object):
             displayName="Clip mosaic to AOI", name="clip_to_aoi",
             datatype="GPString", parameterType="Required", direction="Input")
         p_clip.filter.type = "ValueList"
-        # none = full tile coverage; extent = the AOI bounding box (exact for a rectangular
-        # cartogram sheet, fast, no clip pass); polygon = the true vector mask (irregular AOIs
-        # such as mine polygons), a small extra clip pass per area.
+        # none = full tile coverage; extent = the AOI bounding box (a fast cut for a cartogram
+        # sheet, no clip pass); polygon = the true vector mask (irregular AOIs such as mine
+        # polygons), a small extra clip pass per area.
         p_clip.filter.list = ["none", "extent", "polygon"]
         p_clip.value = "none"
+
+        p_cover = arcpy.Parameter(
+            displayName="Cover the whole AOI (expand the cut outward to the tile grid)",
+            name="cover_aoi", datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # ArcGIS rounds a cut to the nearest cell edge, so an AOI edge that falls inside a cell
+        # leaves up to half a cell of gap between the mosaic and the AOI line (a cartogram sheet
+        # projected to EPSG:3763 never sits on the 0.5 m tile grid). On, the extent is snapped
+        # outward and the polygon buffered by half a cell, so the mosaic always reaches the AOI
+        # line and exceeds it by less than one cell, without resampling. Off keeps the nearest
+        # cell cut. No effect with clip mode none.
+        p_cover.value = True
 
         p_pyramids = arcpy.Parameter(
             displayName="Build pyramids and statistics", name="build_pyramids",
@@ -1929,7 +1965,7 @@ class BuildMosaicsByPolygon(object):
 
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
                 p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res,
-                p_clusters, p_dry_run, p_mapping, p_clip, p_pyramids]
+                p_clusters, p_dry_run, p_mapping, p_clip, p_pyramids, p_cover]
 
     def isLicensed(self):
         # Uses core Mosaic To New Raster, no Spatial Analyst needed.
@@ -1941,6 +1977,8 @@ class BuildMosaicsByPolygon(object):
         # The extent verification only runs under by FID mapping (by name and by geometry are
         # authoritative), so grey it out otherwise instead of showing an inert checkbox.
         parameters[10].enabled = (parameters[15].valueAsText == "by FID number")
+        # The coverage option only matters when the mosaic is cut.
+        parameters[18].enabled = (parameters[16].valueAsText or "none") != "none"
         return
 
     def updateMessages(self, parameters):
@@ -2112,7 +2150,7 @@ class BuildMosaicsByPolygon(object):
         """Combined extent of the area's AOI polygon(s) in the tile CRS, as an arcpy.Extent, used to
         bound the mosaic to the AOI (for example a cartogram sheet) through the analysis extent, so
         the mosaic comes out already cut with no extra clip pass. Returns None when there is no
-        usable geometry. This is the extent (a clean cut for a rectangular sheet); it does not mask
+        usable geometry. This is the bounding box (the cut for a cartogram sheet); it does not mask
         an irregular polygon to its shape."""
         box = None
         for g in geoms:
@@ -2127,10 +2165,21 @@ class BuildMosaicsByPolygon(object):
                        max(box[2], e.XMax), max(box[3], e.YMax)]
         return arcpy.Extent(*box) if box is not None else None
 
-    def _clip_to_polygon(self, in_raster, out_raster, geoms, aoi_sr, tile_sr):
+    def _snap_extent_to_tiles(self, extent, tile, cell):
+        """`extent` (an arcpy.Extent in the tile CRS) expanded outward to the cell grid of
+        `tile`, so a cut bounded by it covers the whole AOI; see _snap_extent_outward."""
+        te = arcpy.Describe(tile).extent
+        box = _snap_extent_outward(extent.XMin, extent.YMin, extent.XMax, extent.YMax, cell,
+                                   te.XMin % cell, te.YMin % cell)
+        return arcpy.Extent(*box)
+
+    def _clip_to_polygon(self, in_raster, out_raster, geoms, aoi_sr, tile_sr, buffer_dist=0.0):
         """Cut a mosaic to the true shape of the area's AOI polygon(s) with core Clip (dissolved
         and projected to the tile CRS); cells outside become NoData. The input mosaic is already
-        bounded to the AOI extent, so this clip runs on a small raster and stays fast."""
+        bounded to the AOI extent, so this clip runs on a small raster and stays fast. With
+        `buffer_dist` (half a cell, for full coverage) the polygon is buffered first, so Clip
+        keeps every cell the AOI line touches: its cell center rule would otherwise drop the
+        boundary cells whose center falls just outside, up to half a cell of gap."""
         union = None
         for g in geoms:
             if g is None:
@@ -2140,6 +2189,8 @@ class BuildMosaicsByPolygon(object):
         if union is None:
             arcpy.management.CopyRaster(in_raster, out_raster)
             return
+        if buffer_dist > 0:
+            union = union.buffer(buffer_dist)
         clip_fc = "in_memory/_clip_aoi"
         if arcpy.Exists(clip_fc):
             arcpy.management.Delete(clip_fc)
@@ -2248,6 +2299,7 @@ class BuildMosaicsByPolygon(object):
         mapping_mode = parameters[15].valueAsText
         clip_mode = parameters[16].valueAsText or "none"
         build_pyramids = bool(parameters[17].value)
+        cover_aoi = bool(parameters[18].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -2348,20 +2400,20 @@ class BuildMosaicsByPolygon(object):
                 self._build_for_resolution(
                     groups, fid_to_geom, fid_to_folder, products, res_root, output_structure,
                     pixel_type, mosaic_method, overwrite_existing, skip_incomplete,
-                    verify_extent, mapping_mode, clip_mode, build_pyramids, res, aoi_sr,
-                    build_cluster_mosaics, cluster_dry_run)
+                    verify_extent, mapping_mode, clip_mode, cover_aoi, build_pyramids, res,
+                    aoi_sr, build_cluster_mosaics, cluster_dry_run)
         else:
             tile_resolution = resolutions[0] if resolutions else None
             self._build_for_resolution(
                 groups, fid_to_geom, fid_to_folder, products, out_folder, output_structure,
                 pixel_type, mosaic_method, overwrite_existing, skip_incomplete,
-                verify_extent, mapping_mode, clip_mode, build_pyramids, tile_resolution, aoi_sr,
-                build_cluster_mosaics, cluster_dry_run)
+                verify_extent, mapping_mode, clip_mode, cover_aoi, build_pyramids,
+                tile_resolution, aoi_sr, build_cluster_mosaics, cluster_dry_run)
         return
 
     def _build_for_resolution(self, groups, fid_to_geom, fid_to_folder, products, out_folder,
                               output_structure, pixel_type, mosaic_method, overwrite_existing,
-                              skip_incomplete, verify_extent, mapping_mode, clip_mode,
+                              skip_incomplete, verify_extent, mapping_mode, clip_mode, cover_aoi,
                               build_pyramids, tile_resolution, aoi_sr,
                               build_cluster_mosaics, cluster_dry_run):
         """Build the per area mosaics (and optional clusters) for one tile resolution into
@@ -2466,9 +2518,13 @@ class BuildMosaicsByPolygon(object):
 
                 geoms = [fid_to_geom[f] for f in present]
                 clip_extent = self._area_extent(geoms, aoi_sr, sr) if clip_mode != "none" else None
+                if clip_extent is not None and cover_aoi:
+                    # Outward to the tile grid, so the cut reaches the AOI line instead of being
+                    # rounded to the nearest cell edge (see _snap_extent_outward).
+                    clip_extent = self._snap_extent_to_tiles(clip_extent, tiles[0], cell)
                 # polygon mode: mosaic into a temp bounded to the AOI extent (small window), then
                 # cut it to the true polygon shape with core Clip. Cheap on an area-sized raster;
-                # the extent mode remains the fast exact cut for rectangular sheets.
+                # the extent mode remains the fast bounding box cut for cartogram sheets.
                 to_polygon = clip_mode == "polygon" and clip_extent is not None
                 mosaic_name = ("_full_" + out_name) if to_polygon else out_name
                 mosaic_path = os.path.join(location, mosaic_name)
@@ -2487,7 +2543,8 @@ class BuildMosaicsByPolygon(object):
                             mosaic_method=mosaic_method,
                         )
                         if to_polygon:
-                            self._clip_to_polygon(mosaic_path, out_path, geoms, aoi_sr, sr)
+                            self._clip_to_polygon(mosaic_path, out_path, geoms, aoi_sr, sr,
+                                                  buffer_dist=cell / 2.0 if cover_aoi else 0.0)
                 finally:
                     arcpy.env.extent = prev_extent
                     if to_polygon:
@@ -2498,6 +2555,8 @@ class BuildMosaicsByPolygon(object):
                 clip_note = {"extent": ", clipped to the AOI extent",
                              "polygon": ", clipped to the AOI polygon"}.get(
                                  clip_mode if clip_extent is not None else "none", "")
+                if clip_note and cover_aoi:
+                    clip_note += " (full coverage)"
                 _msg("Area '{}' ({}): mosaicked {} tiles ({}) from {} folder(s){} -> {}".format(
                     final_area, source, len(tiles), size_label, len(present_folders), clip_note, out_name))
                 created_here += 1
@@ -5396,6 +5455,25 @@ def _run_self_tests():
         '<input name="username" value=""><input type="hidden" name="tab_id" value="abc"></form>')
     check("keycloak form action", _action == "https://x/auth")
     check("keycloak form hidden field", _fields.get("tab_id") == "abc")
+    print("_snap_extent_outward")
+    # a box whose edges fall inside 0.5 m cells (W +0.40, S +0.12, E +0.10, N +0.18 past a
+    # cell edge, the cartogram sheet case) lands on the enclosing cell edges
+    _box = _snap_extent_outward(-16800.40, 143200.12, -16200.10, 143800.18, 0.5)
+    check("edges off the grid expand outward",
+          _box == (-16800.5, 143200.0, -16200.0, 143800.5))
+    check("a box already on the grid is unchanged",
+          _snap_extent_outward(100.0, 200.0, 150.5, 260.0, 0.5) == (100.0, 200.0, 150.5, 260.0))
+    check("floating point noise on a grid edge does not add a cell",
+          _snap_extent_outward(100.0000000001, 200.0, 150.4999999999, 260.0, 0.5)
+          == (100.0, 200.0, 150.5, 260.0))
+    check("grid anchored off the origin (a 2 m tile starting at x = -60367.5)",
+          _snap_extent_outward(-60360.2, 0.3, -60350.1, 10.4, 2.0, anchor_x=0.5)
+          == (-60361.5, 0.0, -60349.5, 12.0))
+    check("the snapped box contains the input and grows less than a cell per side",
+          _snap_extent_outward(0.26, 0.74, 9.01, 9.99, 0.5) == (0.0, 0.5, 9.5, 10.0))
+    check_raises("non positive cell size rejected",
+                 lambda: _snap_extent_outward(0, 0, 1, 1, 0))
+
     import tempfile
     _cred = os.path.join(tempfile.gettempdir(), "lt_test_creds.json")
     write_dgt_credentials(_cred, "user1", "pw1")
