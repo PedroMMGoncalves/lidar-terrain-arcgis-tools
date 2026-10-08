@@ -192,9 +192,59 @@ class _CleanupOnError(object):
         return False
 
 
+def _overview_levels(width, height, block=256):
+    """Overview levels 2, 4, 8, ... down to the first level whose overview is within `block`
+    pixels on its longer side (the gdaladdo rule; the COG driver gave the same counts on the
+    real mosaics); empty for a raster already that small. Pure, unit tested."""
+    size = max(int(width), int(height))
+    if size <= block:
+        return []
+    levels = []
+    level = 2
+    while True:
+        levels.append(level)
+        if size / float(level) <= block:
+            return levels
+        level *= 2
+
+
 def _build_pyramids_stats(path):
-    """Build pyramids and statistics on a written raster so it displays fast in Pro. Best effort:
-    a failure here does not invalidate the raster itself, so it warns instead of raising."""
+    """Build pyramids and statistics on a written raster so it displays fast in Pro. With gdal
+    (osgeo) the pyramids are built by gdal into the usual .ovr sidecar (DEFLATE with a
+    predictor, average resampling; the gdal build that ships with Pro writes overviews
+    externally even on a dataset opened for update) and the statistics into the .aux.xml, the
+    PAM file Pro reads. That takes a fraction of a second, where CalculateStatistics took close
+    to a minute per raster in the tests, even with nothing to do. Without gdal the arcpy tools
+    do it. Either path leaves existing pyramids and statistics alone. Best effort: a failure here
+    does not invalidate the raster itself, so it warns instead of raising."""
+    try:
+        from osgeo import gdal
+    except ImportError:
+        gdal = None
+    if gdal is not None:
+        ds = None
+        try:
+            ds = gdal.Open(path)
+            if ds is None:
+                raise RuntimeError("gdal cannot open the raster")
+            band = ds.GetRasterBand(1)
+            if band.GetOverviewCount() == 0:
+                levels = _overview_levels(ds.RasterXSize, ds.RasterYSize)
+                if levels:
+                    is_float = band.DataType in (gdal.GDT_Float32, gdal.GDT_Float64)
+                    ds.BuildOverviews("AVERAGE", levels, options=[
+                        "COMPRESS_OVERVIEW=DEFLATE",
+                        "PREDICTOR_OVERVIEW=" + ("3" if is_float else "2"),
+                        "NUM_THREADS=ALL_CPUS"])
+            if band.GetMetadataItem("STATISTICS_MEAN") is None:
+                band.SetStatistics(*band.ComputeStatistics(True))   # approximate: display only
+                ds.FlushCache()
+            ds = None
+            return
+        except Exception as exc:
+            ds = None
+            _warn("gdal could not build the pyramids/statistics for {}: {}; trying arcpy.".format(
+                os.path.basename(path), exc))
     try:
         arcpy.management.BuildPyramids(path, skip_existing="SKIP_EXISTING")
         arcpy.management.CalculateStatistics(path, skip_existing="SKIP_EXISTING")
@@ -265,7 +315,17 @@ def _recompress_geotiff(path):
         src = None
         before = os.path.getsize(path)
         after = os.path.getsize(tmp)
-        os.replace(tmp, path)
+        import time
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # A transient lock (ArcGIS releasing the raster it just wrote, antivirus); wait
+                # a moment and retry, then give up with the original left as it was.
+                if attempt == 4:
+                    raise
+                time.sleep(1.0 + attempt)
         return before, after
     except Exception as exc:
         out = None
@@ -2892,9 +2952,14 @@ class BuildMosaicsByPolygon(object):
                     mosaic_name = ("_full_" + out_name) if to_polygon else out_name
                     mosaic_path = os.path.join(location, mosaic_name)
                     prev_extent = arcpy.env.extent
+                    prev_pyramid = arcpy.env.pyramid
                     try:
                         if clip_extent is not None:
                             arcpy.env.extent = clip_extent   # bound the mosaic to the AOI extent
+                        if not build_pyramids:
+                            # Pro's default pyramid environment adds a .ovr sidecar to every
+                            # output; honor the option instead.
+                            arcpy.env.pyramid = "NONE"
                         with _CleanupOnError(mosaic_path, out_path):
                             arcpy.management.MosaicToNewRaster(
                                 input_rasters=tiles,
@@ -2910,6 +2975,7 @@ class BuildMosaicsByPolygon(object):
                                                       buffer_dist=cell / 2.0 if cover_aoi else 0.0)
                     finally:
                         arcpy.env.extent = prev_extent
+                        arcpy.env.pyramid = prev_pyramid
                         if to_polygon:
                             _delete_partial_raster(mosaic_path)
                 if recompress:
@@ -3066,8 +3132,15 @@ class DeriveSurfaces(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
+        p_compress = arcpy.Parameter(
+            displayName="Recompress outputs (DEFLATE with predictor)", name="recompress",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # ArcGIS writes LZW with no predictor option; DEFLATE with a predictor is about 45 percent
+        # smaller on these rasters. See _recompress_geotiff.
+        p_compress.value = True
+
         return [p_in, p_recurse, p_out, p_struct, p_source, p_slope, p_slopep, p_aspect, p_hill,
-                p_profc, p_planc, p_z, p_htype, p_az, p_alt, p_overwrite]
+                p_profc, p_planc, p_z, p_htype, p_az, p_alt, p_overwrite, p_compress]
 
     def isLicensed(self):
         # Needs Spatial Analyst (slope/aspect/curvature/traditional hillshade). Image Analyst
@@ -3117,6 +3190,7 @@ class DeriveSurfaces(object):
         azimuth = float(parameters[13].value) if parameters[13].value is not None else 315.0
         altitude = float(parameters[14].value) if parameters[14].value is not None else 45.0
         overwrite_existing = bool(parameters[15].value)
+        recompress = bool(parameters[16].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
         multidirectional = do_hillshade and hillshade_type == "Multidirectional"
@@ -3175,7 +3249,8 @@ class DeriveSurfaces(object):
                 try:
                     created += self._surfaces_for_mosaic(
                         path, area, source, out_folder, output_structure, wanted,
-                        overwrite_existing, z_factor, multidirectional, azimuth, altitude)
+                        overwrite_existing, z_factor, multidirectional, azimuth, altitude,
+                        recompress)
                     _msg("{} ({}): surfaces done.".format(area, source))
                 except Exception as exc:
                     _warn("{} ({}): surfaces failed: {}. Skipping this mosaic; a re-run retries it "
@@ -3206,7 +3281,8 @@ class DeriveSurfaces(object):
         return
 
     def _surfaces_for_mosaic(self, path, area, source, out_folder, output_structure, wanted,
-                             overwrite_existing, z_factor, multidirectional, azimuth, altitude):
+                             overwrite_existing, z_factor, multidirectional, azimuth, altitude,
+                             recompress=False):
         """Derive the wanted surfaces for one mosaic (idempotent). Returns the number created.
         Isolated so a failure on one mosaic (for example a locked output) can be caught and the
         batch can continue with the rest."""
@@ -3264,6 +3340,10 @@ class DeriveSurfaces(object):
                                    targets["PROFC"] if want_profc else "#",
                                    targets["PLANC"] if want_planc else "#")
             created += (1 if want_profc else 0) + (1 if want_planc else 0)
+        if recompress:
+            for product, target in targets.items():
+                if todo.get(product):
+                    _recompress_output(target)
         return created
 
 
@@ -3567,7 +3647,14 @@ class ReclassifyFactor(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
-        return [p_in, p_recurse, p_factors, p_overwrite]
+        p_compress = arcpy.Parameter(
+            displayName="Recompress outputs (DEFLATE with predictor)", name="recompress",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # ArcGIS writes LZW with no predictor option; DEFLATE with a predictor is about 45 percent
+        # smaller on these rasters. See _recompress_geotiff.
+        p_compress.value = True
+
+        return [p_in, p_recurse, p_factors, p_overwrite, p_compress]
 
     def isLicensed(self):
         # Pure numpy reclassification (RasterToNumPyArray / NumPyArrayToRaster). No extension.
@@ -3616,6 +3703,7 @@ class ReclassifyFactor(object):
         recurse = bool(parameters[1].value)
         factors = [v.strip().upper() for v in (parameters[2].valueAsText or "").split(";") if v.strip()]
         overwrite_existing = bool(parameters[3].value)
+        recompress = bool(parameters[4].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -3664,7 +3752,7 @@ class ReclassifyFactor(object):
             try:
                 made, skipped = self._reclassify_raster(
                     path, area, source, product, location, folders_written[location],
-                    overwrite_existing)
+                    overwrite_existing, recompress)
                 created += made
                 skipped_existing += skipped
             except Exception as exc:
@@ -3690,7 +3778,7 @@ class ReclassifyFactor(object):
         return
 
     def _reclassify_raster(self, path, area, source, product, location, names,
-                           overwrite_existing):
+                           overwrite_existing, recompress=False):
         """Reclassify one factor raster into its scheme outputs (idempotent). Returns
         (created, skipped). Isolated so a failure on one raster (a locked output, memory) can be
         caught and the batch can continue with the rest."""
@@ -3751,6 +3839,9 @@ class ReclassifyFactor(object):
                 if sr_defined:
                     # NumPyArrayToRaster leaves the CRS undefined; set it when it is known.
                     arcpy.management.DefineProjection(out_path, sr)
+            if recompress:
+                del out_raster           # the Raster object keeps the file locked while it lives
+                _recompress_output(out_path)
             _msg("{} ({}): {} ({}) -> {}".format(area, source, product, _crs_label(sr), out_name))
             created += 1
         return created, skipped
@@ -3883,10 +3974,17 @@ class SolarRadiation(object):
             datatype="GPLong", parameterType="Optional", direction="Input")
         p_interval.value = 14
 
+        p_compress = arcpy.Parameter(
+            displayName="Recompress outputs (DEFLATE with predictor)", name="recompress",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # ArcGIS writes LZW with no predictor option; DEFLATE with a predictor is about 45 percent
+        # smaller on these rasters. See _recompress_geotiff.
+        p_compress.value = True
+
         return [p_in, p_recurse, p_out, p_struct, p_source, p_cell, p_method,
                 p_year, p_neigh, p_trans, p_diff, p_diffuse_model,
                 p_out_direct, p_out_diffuse, p_out_duration, p_reuse,
-                p_grid, p_use_interval, p_interval_unit, p_interval, p_overwrite]
+                p_grid, p_use_interval, p_interval_unit, p_interval, p_overwrite, p_compress]
 
     def isLicensed(self):
         try:
@@ -3965,6 +4063,7 @@ class SolarRadiation(object):
         interval_unit = parameters[18].valueAsText or "DAY"
         interval = int(parameters[19].value or 14)   # optional param; guard a cleared value
         overwrite_existing = bool(parameters[20].value)
+        recompress = bool(parameters[21].value)
 
         # Idempotency is handled by an explicit os.path.exists skip below, so overwrite is
         # left on to let the scratch resample step overwrite a stale temp cleanly.
@@ -4096,6 +4195,13 @@ class SolarRadiation(object):
 
                         rad = arcpy.sa.RasterSolarRadiation(**kwargs)
                         rad.save(out_path)
+                        if recompress:
+                            rad = None       # the Raster object keeps the file locked while it lives
+                            _recompress_output(out_path)
+                            for aux in ("out_direct_radiation_raster", "out_diffuse_radiation_raster",
+                                        "out_duration_raster"):
+                                if kwargs.get(aux):
+                                    _recompress_output(kwargs[aux])
                         note = " reusing slope/aspect" if in_slope else ""
                         note += (" + " + ", ".join(extras)) if extras else ""
                         _msg("{} ({}, {}): solar radiation (kWh/m2, {}){} -> {}".format(
@@ -4184,7 +4290,14 @@ class Resample(object):
             datatype="GPBoolean", parameterType="Optional", direction="Input")
         p_overwrite.value = False
 
-        return [p_in, p_recurse, p_types, p_cell, p_method, p_res_policy, p_overwrite]
+        p_compress = arcpy.Parameter(
+            displayName="Recompress outputs (DEFLATE with predictor)", name="recompress",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # ArcGIS writes LZW with no predictor option; DEFLATE with a predictor is about 45 percent
+        # smaller on these rasters. See _recompress_geotiff.
+        p_compress.value = True
+
+        return [p_in, p_recurse, p_types, p_cell, p_method, p_res_policy, p_overwrite, p_compress]
 
     def isLicensed(self):
         # Core Data Management Resample, no extension needed.
@@ -4283,6 +4396,7 @@ class Resample(object):
         method_choice = (parameters[4].valueAsText or "auto")
         res_policy = (parameters[5].valueAsText or "finest")
         overwrite_existing = bool(parameters[6].value)
+        recompress = bool(parameters[7].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -4359,6 +4473,8 @@ class Resample(object):
                     # Already at the target: copy it through so the Resample folder is a
                     # complete set of the selected types at the target resolution.
                     arcpy.management.CopyRaster(path, out_path)
+                    if recompress:
+                        _recompress_output(out_path)
                     _msg("{} ({}): already at {:g} m, copied -> {}".format(area, token, native, fn))
                     copied_native += 1
                     continue
@@ -4395,6 +4511,8 @@ class Resample(object):
                     cleaned = self._restrict_to_source_classes(path, out_path)
                     if cleaned:
                         cleaned_total += cleaned
+                if recompress:
+                    _recompress_output(out_path)
                 _msg("{} ({}): resampled {:g} m -> {:g} m ({}, {}) -> {}{}".format(
                     area, token, native, target_cell, method, _crs_label(sr), fn,
                     ", scrubbed {} boundary cell(s)".format(cleaned) if cleaned else ""))
@@ -6465,6 +6583,46 @@ def _run_self_tests():
           _snap_extent_nearest(100.0, 200.0, 150.5, 260.0, 0.5) == (100.0, 200.0, 150.5, 260.0))
     check_raises("nearest rounding rejects a non positive cell",
                  lambda: _snap_extent_nearest(0, 0, 1, 1, 0))
+
+    print("_overview_levels / _build_pyramids_stats")
+    check("raster within one block needs no overviews", _overview_levels(200, 100) == [])
+    check("one level just above the block", _overview_levels(400, 300) == [2])
+    check("levels halve until the overview is within the block",
+          _overview_levels(19447, 10001) == [2, 4, 8, 16, 32, 64, 128])
+    check("the orthophoto cut of the real test had five levels",
+          _overview_levels(8001, 6001) == [2, 4, 8, 16, 32])
+    check("the 1995 cut had three", _overview_levels(2001, 1501) == [2, 4, 8])
+    check("custom block size", _overview_levels(1100, 700, block=512) == [2, 4])
+    try:
+        from osgeo import gdal as _gdal_o
+        import numpy as _np_o
+    except ImportError:
+        _gdal_o = None
+    if _gdal_o is None:
+        print("  skip (gdal or numpy not available)")
+    else:
+        import shutil as _shutil_p
+        import tempfile as _tempfile_p
+        _dir = _tempfile_p.mkdtemp(prefix="lt_pyr_")
+        _p = os.path.join(_dir, "f.tif")
+        _ds = _gdal_o.GetDriverByName("GTiff").Create(_p, 1100, 700, 1, _gdal_o.GDT_Float32,
+                                                      options=["COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES"])
+        _ds.SetGeoTransform((0.0, 0.5, 0.0, 350.0, 0.0, -0.5))
+        _ds.GetRasterBand(1).SetNoDataValue(-999.0)
+        _ds.GetRasterBand(1).WriteArray(_np_o.random.default_rng(1).random((700, 1100)).astype("float32") * 100)
+        _ds = None
+        _build_pyramids_stats(_p)
+        _rd = _gdal_o.Open(_p)
+        _band = _rd.GetRasterBand(1)
+        check("pyramids in a .ovr sidecar with three levels",
+              os.path.exists(_p + ".ovr") and _band.GetOverviewCount() == 3)
+        check("statistics written to the .aux.xml",
+              os.path.exists(_p + ".aux.xml") and _band.GetMetadataItem("STATISTICS_MEAN") is not None)
+        _rd = None
+        _mtime = os.path.getmtime(_p + ".ovr")
+        _build_pyramids_stats(_p)
+        check("second call leaves the pyramids alone", os.path.getmtime(_p + ".ovr") == _mtime)
+        _shutil_p.rmtree(_dir, ignore_errors=True)
 
     print("_snap_extent_outward")
     # a box whose edges fall inside 0.5 m cells (W +0.40, S +0.12, E +0.10, N +0.18 past a
