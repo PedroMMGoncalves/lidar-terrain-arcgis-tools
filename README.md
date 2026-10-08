@@ -38,7 +38,7 @@ Each tool reads the previous tool's output folder and writes with one consistent
 
 ## Summary
 
-Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. Seven more are utilities you can run on the outputs:
+Five tools form the pipeline, run in order, with the input and output folders always chosen explicitly by the user. Eight more are utilities you can run on the outputs:
 
 1. **Download DGT Data**: download the LiDAR tiles from the DGT CDD portal, organized one folder per AOI feature (with a product subfolder each) or as a single flat folder, ready for the mosaic tool.
 2. **Build Mosaics by Polygon**: one DEM and one DSM mosaic per area of interest, from the DGT LiDAR download folders.
@@ -52,6 +52,7 @@ Five tools form the pipeline, run in order, with the input and output folders al
 10. **Merge Class Rasters** (optional): merge the per area class rasters of a product into one raster covering every area, written as a sparse LZW BigTIFF so a scattered set of areas does not blow up.
 11. **Vectorize Class Rasters** (optional): convert the class rasters to polygons, every area merged into one shapefile per product, with the area name, the class value and the polygon area in square meters.
 12. **Build Orthophoto Mosaics by Polygon** (optional): one orthophoto mosaic per area and per DGT collection (ORTOS 1995 to 2025, ORTOSAT 2023) from the Tool 1 download folders, as a cloud optimized GeoTIFF with the RGB and NIR bands, cut to the area.
+13. **Recompress GeoTIFFs** (optional): rewrite the GeoTIFFs under a folder in place with DEFLATE and a predictor, which roughly halves the DGT tiles and the mosaics written before the recompression existed; a dry run reports the sizes first.
 
 Every output is named by a single, consistent convention (see [Naming convention](#naming-convention)) so each tool can find and parse what the previous one produced.
 
@@ -220,6 +221,7 @@ One DEM and one DSM mosaic per area, merging all of that area's download folders
 | Clip mosaic to AOI | `none` (default; full tile coverage), `extent` (bounds each mosaic to the AOI bounding box through the analysis extent, a fast cut to the bounding box, for a cartogram sheet), or `polygon` (cuts to the true vector shape of the area's polygons with core Clip, for irregular AOIs such as mine polygons; cells outside become NoData, a small extra clip pass per area). Per area output only, not the overlap clusters. |
 | Cover the whole AOI | On by default. ArcGIS rounds a cut to the nearest cell edge of the tiles, so an AOI edge that falls inside a cell leaves a gap of up to half a cell between the mosaic and the AOI line, or overshoots it by as much (a Carta Militar sheet projected to EPSG:3763 never sits on the 0.5 m grid). On, the extent is expanded outward to the tile grid and, in `polygon` mode, the polygon is buffered by half a cell, so the mosaic always reaches the AOI line and exceeds it by less than one cell, with no resampling. Off keeps the nearest cell cut: the smallest deviation either way, and seamless edges between adjacent sheets. Greyed out with clip mode `none`. |
 | Recompress mosaics | On by default. Rewrites each mosaic with DEFLATE and predictor 3 (tiled, BigTIFF when needed) after the cut and before the pyramids. ArcGIS writes LZW with no predictor option, which leaves a float mosaic about 45 percent larger than DEFLATE with a predictor; on a 0.5 m 50K sheet that is roughly 9 GB against 5 GB. Values, CRS and NoData are unchanged. Needs gdal (osgeo), bundled with ArcGIS Pro; without it the mosaic is kept as written. |
+| Mosaic engine | Advanced. `auto` (default) builds each mosaic in one gdal pass: a VRT over the tiles, cut to the AOI, written tiled DEFLATE with predictor 3 by a single Translate, which halves the I/O of a 0.5 m sheet against MosaicToNewRaster followed by the recompression and gives the same cells and values; it keeps the tiles' NoData value, where MosaicToNewRaster may declare the float maximum instead, and where the AOI box reaches beyond the tiles (a sheet at the border or the coast) it keeps the box, NoData outside the tiles, where MosaicToNewRaster shrinks the raster to the tiles. On the 8C sheet at 2 m (2542 tiles) the gdal pass took 2 minutes against 10 for MosaicToNewRaster plus the recompression, with identical values on every cell both hold; the only difference was 81 cells at the seams of the survey's shifted edge tiles (49 of the 2288 tiles sit off the 2 m grid), NoData with MosaicToNewRaster and valued in the gdal pass. gdal needs the float pixel type and `FIRST` or `LAST`; `auto` falls back to arcpy otherwise and logs why, `gdal` fails loud instead, `arcpy` forces MosaicToNewRaster. |
 | Build pyramids and statistics | Off by default. On builds pyramids and statistics on each mosaic after writing (per area and clusters), so the large rasters display fast in ArcGIS Pro. Also runs on mosaics skipped as existing, so a re-run with overwrite off just adds pyramids to mosaics built earlier. Adds some time per mosaic. |
 
 With **overlap clustering** on, Tool 2 also groups areas whose AOI polygons are contiguous (touch or overlap) into one mosaic per cluster, in parallel to the per area output, which is unchanged. Every area belongs to exactly one cluster (a non overlapping area is its own one member cluster). Clusters go to a `clusters` subfolder, named `Cluster_NNN` by the smallest member FID, each with a `Cluster_NNN_members.txt` manifest listing the member areas (the ids renumber if the AOI is edited, so the manifest is the authority). Tiles shared between areas are deduplicated by name. Run the dry-run first to see the clusters before the heavy build.
@@ -422,9 +424,21 @@ One orthophoto mosaic per area and per DGT orthophoto collection, from the Tool 
 | Compression, JPEG quality | `JPEG` (default, quality 85; the DGT blocks are JPEG quality 75, so the extra loss is small) or `DEFLATE` (lossless, several times larger). |
 | Overwrite existing outputs | Off skips existing mosaics. |
 | Clip mosaic to AOI | `none`, `extent` (default; the AOI bounding box, for a cartogram sheet) or `polygon` (the true AOI shape, cells outside as NoData). |
-| Cover the whole AOI | On by default, same meaning as in Tool 2: the box is expanded outward to the block grid and, in `polygon` mode, every cell the polygon touches is kept, so the mosaic never falls short of the AOI line. |
+| Cover the whole AOI | On by default, same meaning as in Tool 2: the box is expanded outward to the block grid and, in `polygon` mode, the polygon is buffered by half a cell, so the mosaic never falls short of the AOI line. |
 
 A 25 cm block is 430 to 640 MB and a 50K sheet holds 16 of them, so expect 7 to 10 GB per sheet and year at 25 cm (2018, 2021, 2025), about 2 GB at 50 cm (2004 to 2015) and 0.5 GB for 1995. Older `_vNN` versions of a block are skipped as in Tool 2. Output `{Area}_ORTOS2021.tif` (the collection name closed up), one per area and collection; the elevation tools ignore these files.
+
+### Tool 13, Recompress GeoTIFFs
+
+Rewrites every `.tif` under a folder in place with DEFLATE and a predictor (3 for float, 2 for integer), tiled, BigTIFF when needed, through gdal. The DGT 2 m tiles ship uncompressed and the 50 cm ones LZW without a predictor (larger than raw), and ArcGIS writes LZW with no predictor option, so the rewrite roughly halves both the download folders and the mosaics written before Tools 1 and 2 recompressed on their own. Values, CRS and NoData do not change, and the sidecars (`.ovr` pyramids, `.aux.xml` statistics, world files) stay valid. Files already DEFLATE or ZSTD with a predictor and lossy JPEG or WebP ones (the orthophotos) are left alone, so a re-run is a no-op.
+
+| Parameter | Description |
+| --- | --- |
+| Folder | The folder to sweep, for example the Tool 1 download root or a deliverables folder. |
+| Include subfolders | On by default. |
+| Dry run | Reports how many files would be rewritten and their size, writes nothing. Run it first. |
+
+Close the rasters in ArcGIS Pro before running: a file open in a map is locked and is reported as failed, to be redone on a re-run.
 
 ---
 
@@ -506,7 +520,7 @@ The shared helpers have pure unit tests inside the toolbox file, runnable outsid
 python LidarTerrainToolbox.pyt
 ```
 
-This exercises name sanitization and collision handling, the output name build and parse round trip (including the two token `ASPECT_DIR` product), the class interval validation and the fixed reclassification schemes, the area grouping, the folder prefix auto-detection, the VRT extent parsing, the outward extent snap to the tile grid, the tile version filter, the GeoTIFF recompression (skipped without gdal), the orthophoto naming and folder discovery, the tile resolution parsing and selection, the resample type mapping, the class product list and the integer pixel type check, and the numpy reclassification logic (the numpy tests are skipped if numpy is not installed in the Python being used). Under ArcGIS Pro the test block does not run; ArcGIS imports the module, it does not execute it as a script.
+This exercises name sanitization and collision handling, the output name build and parse round trip (including the two token `ASPECT_DIR` product), the class interval validation and the fixed reclassification schemes, the area grouping, the folder prefix auto-detection, the VRT extent parsing, the outward extent snap to the tile grid, the tile version filter, the GeoTIFF recompression (skipped without gdal), the orthophoto naming and folder discovery, the recompression decision, the mosaic engine choice and the nearest cell rounding, the tile resolution parsing and selection, the resample type mapping, the class product list and the integer pixel type check, and the numpy reclassification logic (the numpy tests are skipped if numpy is not installed in the Python being used). Under ArcGIS Pro the test block does not run; ArcGIS imports the module, it does not execute it as a script.
 
 ---
 

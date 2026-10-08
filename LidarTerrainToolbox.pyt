@@ -202,6 +202,29 @@ def _build_pyramids_stats(path):
         _warn("Could not build pyramids/statistics for {}: {}".format(os.path.basename(path), exc))
 
 
+def _recompress_needed(compression, predictor):
+    """Whether a GeoTIFF with this compression and predictor gains from the DEFLATE plus
+    predictor rewrite: not a lossy JPEG or WebP (a lossless rewrite only inflates them) and not
+    already DEFLATE or ZSTD with a predictor (the rewrite would be a no-op). Pure, unit tested."""
+    comp = (compression or "").upper()
+    if comp in ("JPEG", "WEBP"):
+        return False
+    if comp in ("DEFLATE", "ZSTD") and str(predictor or "") in ("2", "3"):
+        return False
+    return True
+
+
+def _raster_compression(gdal, path):
+    """(compression, predictor) of a raster as gdal reports them, or None when it cannot be
+    opened. Used by the dry run and to tell a skip from a failure."""
+    ds = gdal.Open(path)
+    if ds is None:
+        return None
+    structure = ds.GetMetadata("IMAGE_STRUCTURE") or {}
+    ds = None
+    return structure.get("COMPRESSION") or "none", structure.get("PREDICTOR")
+
+
 def _recompress_geotiff(path):
     """Rewrite a GeoTIFF in place with DEFLATE compression, the predictor that fits its type (3
     for float, 2 for integer), 512 px tiles and BigTIFF when needed. Values, CRS, NoData and the
@@ -229,9 +252,7 @@ def _recompress_geotiff(path):
         if src is None:
             raise RuntimeError("gdal cannot open the raster")
         structure = src.GetMetadata("IMAGE_STRUCTURE") or {}
-        compression = (structure.get("COMPRESSION") or "").upper()
-        if compression in ("JPEG", "WEBP") or (
-                compression in ("DEFLATE", "ZSTD") and structure.get("PREDICTOR") in ("2", "3")):
+        if not _recompress_needed(structure.get("COMPRESSION"), structure.get("PREDICTOR")):
             src = None
             return None
         is_float = src.GetRasterBand(1).DataType in (gdal.GDT_Float32, gdal.GDT_Float64)
@@ -825,7 +846,7 @@ class Toolbox(object):
         # 11 Vectorize Class Rasters (delivery: every area together as one raster or one shapefile).
         self.tools = [DownloadDGTData, BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation,
                       ReclassifyFactor, Resample, Contours, VerifyOutputs, SuitabilityMask,
-                      MergeClasses, VectorizeClasses, BuildOrthoMosaics]
+                      MergeClasses, VectorizeClasses, BuildOrthoMosaics, RecompressRasters]
 
 
 # ===========================================================================
@@ -862,9 +883,15 @@ _COINCIDENT_DATUMS = {"D_ETRS_1989", "D_WGS_1984"}
 
 
 def _datum_name(sr):
-    """The datum name of a SpatialReference (projected or geographic), or None if unavailable."""
+    """The datum name of a SpatialReference (projected or geographic), or None if unavailable.
+    Under Pro 3.7 datumName (and GCSName) come back empty on a PROJECTED SpatialReference, the
+    datum lives on its GCS; without this fallback every ETRS89 projected AOI read as an unknown
+    datum against WGS84 and Tool 1 warned about a datum shift on every run."""
     try:
-        return sr.datumName
+        name = sr.datumName
+        if not name and getattr(sr, "type", "") == "Projected":
+            name = sr.GCS.datumName
+        return name or None
     except Exception:
         return None
 
@@ -898,6 +925,42 @@ def _snap_extent_outward(xmin, ymin, xmax, ymax, cell, anchor_x=0.0, anchor_y=0.
         return anchor + math.ceil((value - anchor - eps) / cell) * cell
 
     return (down(xmin, anchor_x), down(ymin, anchor_y), up(xmax, anchor_x), up(ymax, anchor_y))
+
+
+def _snap_extent_nearest(xmin, ymin, xmax, ymax, cell, anchor_x=0.0, anchor_y=0.0):
+    """Each edge of a box rounded to the NEAREST cell edge of the grid (cell size `cell`, edges
+    through the anchor): what MosaicToNewRaster and Clip do with an extent, reproduced for the
+    gdal mosaic path so both engines cut identically when the outward snap is off. Pure, unit
+    tested."""
+    if not cell or cell <= 0:
+        raise ValueError("Cell size must be positive, got {!r}.".format(cell))
+
+    def near(value, anchor):
+        return anchor + math.floor((value - anchor) / cell + 0.5) * cell
+
+    return (near(xmin, anchor_x), near(ymin, anchor_y), near(xmax, anchor_x), near(ymax, anchor_y))
+
+
+def _choose_mosaic_engine(requested, gdal_available, pixel_type, mosaic_method):
+    """Which engine builds the Tool 2 mosaics: ("gdal" | "arcpy", reason). The one pass gdal
+    path needs gdal (osgeo), the float pixel type (it writes the tiles as they are) and FIRST
+    or LAST (a VRT has no MEAN, BLEND, MIN or MAX). auto takes gdal when it can, else arcpy with
+    the reason; gdal fails loud when it cannot; arcpy is always honored. Pure, unit tested."""
+    requested = (requested or "auto").lower()
+    if requested == "arcpy":
+        return "arcpy", "requested"
+    blockers = []
+    if not gdal_available:
+        blockers.append("gdal (osgeo) is not available")
+    if (pixel_type or "").upper() != "32_BIT_FLOAT":
+        blockers.append("pixel type {} is not 32_BIT_FLOAT".format(pixel_type))
+    if (mosaic_method or "").upper() not in ("FIRST", "LAST"):
+        blockers.append("mosaic method {} is not FIRST or LAST".format(mosaic_method))
+    if not blockers:
+        return "gdal", "one pass, DEFLATE with predictor 3"
+    if requested == "gdal":
+        raise ValueError("The gdal mosaic engine cannot be used: {}.".format("; ".join(blockers)))
+    return "arcpy", "; ".join(blockers)
 
 
 _DATUM_WARNED = set()                                 # (from wkid/name, to wkid/name) pairs warned
@@ -2130,6 +2193,17 @@ class BuildMosaicsByPolygon(object):
         # smaller on these float mosaics, which halves a 0.5 m sheet. See _recompress_geotiff.
         p_compress.value = True
 
+        p_engine = arcpy.Parameter(
+            displayName="Mosaic engine", name="mosaic_engine",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_engine.filter.type = "ValueList"
+        # gdal = one pass (a VRT over the tiles, cut and written DEFLATE with predictor 3 in a
+        # single Translate), which halves the I/O of a 0.5 m sheet against MosaicToNewRaster
+        # followed by the recompression. It needs gdal, the float pixel type and FIRST or LAST;
+        # auto picks it when possible and says why when it cannot, arcpy forces the old path.
+        p_engine.filter.list = ["auto", "gdal", "arcpy"]
+        p_engine.value = "auto"
+
         p_pyramids = arcpy.Parameter(
             displayName="Build pyramids and statistics", name="build_pyramids",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
@@ -2139,12 +2213,13 @@ class BuildMosaicsByPolygon(object):
         # only the essentials (Pro shows uncategorized parameters first, categories collapsed).
         for p in (p_clusters, p_dry_run):
             p.category = "Clustering"
-        for p in (p_pixel, p_method, p_res, p_verify, p_prefix, p_pyramids):
+        for p in (p_pixel, p_method, p_res, p_verify, p_prefix, p_pyramids, p_engine):
             p.category = "Advanced"
 
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
                 p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res,
-                p_clusters, p_dry_run, p_mapping, p_clip, p_pyramids, p_cover, p_compress]
+                p_clusters, p_dry_run, p_mapping, p_clip, p_pyramids, p_cover, p_compress,
+                p_engine]
 
     def isLicensed(self):
         # Uses core Mosaic To New Raster, no Spatial Analyst needed.
@@ -2355,6 +2430,86 @@ class BuildMosaicsByPolygon(object):
                                    te.XMin % cell, te.YMin % cell)
         return arcpy.Extent(*box)
 
+    def _snap_box_to_tiles_nearest(self, box, tile, cell):
+        """`box` (xmin, ymin, xmax, ymax) with each edge rounded to the nearest cell edge of
+        `tile`, which is what MosaicToNewRaster and Clip do with an extent."""
+        te = arcpy.Describe(tile).extent
+        return _snap_extent_nearest(box[0], box[1], box[2], box[3], cell,
+                                    te.XMin % cell, te.YMin % cell)
+
+    def _mosaic_with_gdal(self, gdal, tiles, out_path, box, geoms, aoi_sr, tile_sr, clip_mode,
+                          cover_aoi, mosaic_method):
+        """One pass mosaic with gdal: a VRT over the tiles, cut to `box` (already snapped to the
+        cell grid, in the tile CRS) as a pixel window, or in polygon mode through a warped VRT
+        with the dissolved AOI as cutline (cells outside become NoData), written tiled DEFLATE
+        with predictor 3 and BigTIFF when needed, in a single Translate. The cutline keeps the
+        cells whose centre is inside the polygon, like Clip, so with the coverage option the
+        polygon is buffered by half a cell first, exactly as the arcpy path does; both engines
+        then produce the same cells. The tiles' NoData value is kept as it is (MosaicToNewRaster
+        may replace it with the float maximum). Where the AOI box reaches beyond the tiles (a
+        sheet at the border or the coast) the raster keeps the box, NoData outside the tiles,
+        where MosaicToNewRaster shrinks it to the tiles. FIRST puts the first tile on top (a VRT draws
+        its sources in order, the last on top, so the list is reversed); LAST keeps the order.
+        The tiles share one CRS and cell size (validated by _gather_product_tiles), so no
+        resampling happens."""
+        stem = os.path.splitext(out_path)[0]
+        vrt_path = stem + "_src.vrt"
+        cut_vrt = stem + "_cut.vrt"
+        cut_fc = stem + "_cut.shp"
+        ordered = list(tiles) if mosaic_method == "LAST" else list(reversed(tiles))
+        try:
+            with _CleanupOnError(out_path):
+                vrt = gdal.BuildVRT(vrt_path, ordered)
+                if vrt is None:
+                    raise RuntimeError("gdal.BuildVRT returned None")
+                nodata = vrt.GetRasterBand(1).GetNoDataValue()
+                cell = vrt.GetGeoTransform()[1]
+                vrt = None
+                source = vrt_path
+                kwargs = {"format": "GTiff",
+                          "creationOptions": ["COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES",
+                                              "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+                                              "BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS"]}
+                if box is not None:
+                    if clip_mode == "polygon":
+                        union = None
+                        for g in geoms:
+                            if g is None:
+                                continue
+                            pg = _project_geom(g, aoi_sr, tile_sr)
+                            union = pg if union is None else union.union(pg)
+                        if cover_aoi:
+                            union = union.buffer(cell / 2.0)
+                        arcpy.management.CopyFeatures([union], cut_fc)
+                        warp_kwargs = {"format": "VRT", "cutlineDSName": cut_fc,
+                                       "cutlineSRS": "EPSG:{}".format(PROJECT_EPSG),
+                                       "outputBounds": list(box)}
+                        if nodata is not None:
+                            warp_kwargs["dstNodata"] = nodata
+                        warped = gdal.Warp(cut_vrt, vrt_path, **warp_kwargs)
+                        if warped is None:
+                            raise RuntimeError("gdal.Warp returned None")
+                        warped = None
+                        source = cut_vrt
+                    else:
+                        kwargs["projWin"] = [box[0], box[3], box[2], box[1]]
+                out = gdal.Translate(out_path, source, **kwargs)
+                if out is None:
+                    raise RuntimeError("gdal.Translate returned None")
+                out = None
+        finally:
+            for path in (vrt_path, cut_vrt):
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            if arcpy.Exists(cut_fc):
+                try:
+                    arcpy.management.Delete(cut_fc)
+                except Exception:
+                    pass
+
     def _clip_to_polygon(self, in_raster, out_raster, geoms, aoi_sr, tile_sr, buffer_dist=0.0):
         """Cut a mosaic to the true shape of the area's AOI polygon(s) with core Clip (dissolved
         and projected to the tile CRS); cells outside become NoData. The input mosaic is already
@@ -2483,6 +2638,7 @@ class BuildMosaicsByPolygon(object):
         build_pyramids = bool(parameters[17].value)
         cover_aoi = bool(parameters[18].value)
         recompress = bool(parameters[19].value)
+        mosaic_engine = parameters[20].valueAsText or "auto"
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -2583,21 +2739,22 @@ class BuildMosaicsByPolygon(object):
                 self._build_for_resolution(
                     groups, fid_to_geom, fid_to_folder, products, res_root, output_structure,
                     pixel_type, mosaic_method, overwrite_existing, skip_incomplete,
-                    verify_extent, mapping_mode, clip_mode, cover_aoi, recompress, build_pyramids,
-                    res, aoi_sr, build_cluster_mosaics, cluster_dry_run)
+                    verify_extent, mapping_mode, clip_mode, cover_aoi, recompress,
+                    mosaic_engine, build_pyramids, res, aoi_sr, build_cluster_mosaics,
+                    cluster_dry_run)
         else:
             tile_resolution = resolutions[0] if resolutions else None
             self._build_for_resolution(
                 groups, fid_to_geom, fid_to_folder, products, out_folder, output_structure,
                 pixel_type, mosaic_method, overwrite_existing, skip_incomplete,
-                verify_extent, mapping_mode, clip_mode, cover_aoi, recompress, build_pyramids,
-                tile_resolution, aoi_sr, build_cluster_mosaics, cluster_dry_run)
+                verify_extent, mapping_mode, clip_mode, cover_aoi, recompress, mosaic_engine,
+                build_pyramids, tile_resolution, aoi_sr, build_cluster_mosaics, cluster_dry_run)
         return
 
     def _build_for_resolution(self, groups, fid_to_geom, fid_to_folder, products, out_folder,
                               output_structure, pixel_type, mosaic_method, overwrite_existing,
                               skip_incomplete, verify_extent, mapping_mode, clip_mode, cover_aoi,
-                              recompress, build_pyramids, tile_resolution, aoi_sr,
+                              recompress, mosaic_engine, build_pyramids, tile_resolution, aoi_sr,
                               build_cluster_mosaics, cluster_dry_run):
         """Build the per area mosaics (and optional clusters) for one tile resolution into
         out_folder. Called once per selected resolution, each with its own output tree."""
@@ -2609,6 +2766,18 @@ class BuildMosaicsByPolygon(object):
         skipped_incomplete = []
         skipped_no_tiles = []
         skipped_mismatch = []
+
+        try:
+            from osgeo import gdal as _gdal
+        except ImportError:
+            _gdal = None
+        try:
+            engine, reason = _choose_mosaic_engine(mosaic_engine, _gdal is not None, pixel_type,
+                                                   mosaic_method)
+        except ValueError as exc:
+            _err(str(exc))
+            raise
+        _msg("Mosaic engine: {} ({}).".format(engine, reason))
 
         arcpy.SetProgressor("step", "Building one mosaic per area...", 0, total, 1)
         for final_area, fids in groups:
@@ -2705,33 +2874,44 @@ class BuildMosaicsByPolygon(object):
                     # Outward to the tile grid, so the cut reaches the AOI line instead of being
                     # rounded to the nearest cell edge (see _snap_extent_outward).
                     clip_extent = self._snap_extent_to_tiles(clip_extent, tiles[0], cell)
-                # polygon mode: mosaic into a temp bounded to the AOI extent (small window), then
-                # cut it to the true polygon shape with core Clip. Cheap on an area-sized raster;
-                # the extent mode remains the fast bounding box cut for cartogram sheets.
-                to_polygon = clip_mode == "polygon" and clip_extent is not None
-                mosaic_name = ("_full_" + out_name) if to_polygon else out_name
-                mosaic_path = os.path.join(location, mosaic_name)
-                prev_extent = arcpy.env.extent
-                try:
+                if engine == "gdal":
+                    box = None
                     if clip_extent is not None:
-                        arcpy.env.extent = clip_extent   # bound the mosaic to the AOI extent
-                    with _CleanupOnError(mosaic_path, out_path):
-                        arcpy.management.MosaicToNewRaster(
-                            input_rasters=tiles,
-                            output_location=location,
-                            raster_dataset_name_with_extension=mosaic_name,
-                            coordinate_system_for_the_raster=sr,
-                            pixel_type=pixel_type,
-                            number_of_bands=1,
-                            mosaic_method=mosaic_method,
-                        )
+                        box = (clip_extent.XMin, clip_extent.YMin, clip_extent.XMax, clip_extent.YMax)
+                        if not cover_aoi:
+                            # The arcpy path rounds each edge to the nearest cell edge; do the
+                            # same, so both engines cut identically.
+                            box = self._snap_box_to_tiles_nearest(box, tiles[0], cell)
+                    self._mosaic_with_gdal(_gdal, tiles, out_path, box, geoms, aoi_sr, sr,
+                                           clip_mode, cover_aoi, mosaic_method)
+                else:
+                    # polygon mode: mosaic into a temp bounded to the AOI extent (small window), then
+                    # cut it to the true polygon shape with core Clip. Cheap on an area-sized raster;
+                    # the extent mode remains the fast bounding box cut for cartogram sheets.
+                    to_polygon = clip_mode == "polygon" and clip_extent is not None
+                    mosaic_name = ("_full_" + out_name) if to_polygon else out_name
+                    mosaic_path = os.path.join(location, mosaic_name)
+                    prev_extent = arcpy.env.extent
+                    try:
+                        if clip_extent is not None:
+                            arcpy.env.extent = clip_extent   # bound the mosaic to the AOI extent
+                        with _CleanupOnError(mosaic_path, out_path):
+                            arcpy.management.MosaicToNewRaster(
+                                input_rasters=tiles,
+                                output_location=location,
+                                raster_dataset_name_with_extension=mosaic_name,
+                                coordinate_system_for_the_raster=sr,
+                                pixel_type=pixel_type,
+                                number_of_bands=1,
+                                mosaic_method=mosaic_method,
+                            )
+                            if to_polygon:
+                                self._clip_to_polygon(mosaic_path, out_path, geoms, aoi_sr, sr,
+                                                      buffer_dist=cell / 2.0 if cover_aoi else 0.0)
+                    finally:
+                        arcpy.env.extent = prev_extent
                         if to_polygon:
-                            self._clip_to_polygon(mosaic_path, out_path, geoms, aoi_sr, sr,
-                                                  buffer_dist=cell / 2.0 if cover_aoi else 0.0)
-                finally:
-                    arcpy.env.extent = prev_extent
-                    if to_polygon:
-                        _delete_partial_raster(mosaic_path)
+                            _delete_partial_raster(mosaic_path)
                 if recompress:
                     _recompress_output(out_path)
                 if build_pyramids:
@@ -5481,8 +5661,9 @@ class BuildOrthoMosaics(BuildMosaicsByPolygon):
             displayName="Cover the whole AOI (expand the cut outward to the block grid)",
             name="cover_aoi", datatype="GPBoolean", parameterType="Optional", direction="Input")
         # Same meaning as in Tool 2: gdal cuts a window to whole pixels too, so the box is snapped
-        # outward to the block grid first, and in polygon mode every pixel the polygon touches is
-        # kept (CUTLINE_ALL_TOUCHED), so the mosaic never falls short of the AOI line.
+        # outward to the block grid first, and in polygon mode the polygon is buffered by half a
+        # cell (the cutline keeps the cells whose centre is inside), so the mosaic never falls
+        # short of the AOI line.
         p_cover.value = True
 
         return [p_aoi, p_field, p_root, p_out, p_struct, p_collections, p_bands, p_compress,
@@ -5667,11 +5848,12 @@ class BuildOrthoMosaics(BuildMosaicsByPolygon):
                                 continue
                             pg = _project_geom(g, aoi_sr, tile_sr)
                             union = pg if union is None else union.union(pg)
+                        if cover_aoi:
+                            union = union.buffer(cell / 2.0)
                         arcpy.management.CopyFeatures([union], cut_fc)
                         warped = gdal.Warp(
                             cut_vrt, vrt_path, format="VRT", cutlineDSName=cut_fc,
-                            cutlineSRS="EPSG:{}".format(PROJECT_EPSG), outputBounds=list(box),
-                            warpOptions=["CUTLINE_ALL_TOUCHED=TRUE"] if cover_aoi else [])
+                            cutlineSRS="EPSG:{}".format(PROJECT_EPSG), outputBounds=list(box))
                         if warped is None:
                             raise RuntimeError("gdal.Warp returned None")
                         warped = None
@@ -5706,6 +5888,121 @@ class BuildOrthoMosaics(BuildMosaicsByPolygon):
                     arcpy.management.Delete(cut_fc)
                 except Exception:
                     pass
+
+
+# ===========================================================================
+# Tool 13 - Recompress GeoTIFFs
+# ===========================================================================
+
+class RecompressRasters(object):
+    def __init__(self):
+        self.label = "13 - Recompress GeoTIFFs"
+        self.description = (
+            "Rewrite the GeoTIFFs under a folder in place with DEFLATE and a predictor (3 for "
+            "float, 2 for integer), tiled, BigTIFF when needed. The DGT tiles ship uncompressed "
+            "(2 m) or LZW without a predictor (50 cm, larger than raw) and ArcGIS writes LZW with "
+            "no predictor, so the rewrite roughly halves them; values, CRS and NoData are "
+            "unchanged. Files already DEFLATE or ZSTD with a predictor and lossy JPEG or WebP "
+            "ones are left alone, so a re-run is a no-op. Dry run reports the sizes without "
+            "writing. Needs gdal (osgeo), bundled with ArcGIS Pro.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_folder = arcpy.Parameter(
+            displayName="Folder", name="in_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_recurse = arcpy.Parameter(
+            displayName="Include subfolders", name="recurse",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_recurse.value = True
+
+        p_dry = arcpy.Parameter(
+            displayName="Dry run (report sizes, write nothing)", name="dry_run",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_dry.value = False
+
+        return [p_folder, p_recurse, p_dry]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        try:
+            from osgeo import gdal
+        except ImportError:
+            msg = "gdal (osgeo) is not available in this Python; the recompression needs it."
+            _err(msg)
+            raise ImportError(msg)
+        in_folder = parameters[0].valueAsText
+        recurse = bool(parameters[1].value)
+        dry_run = bool(parameters[2].value)
+        if not os.path.isdir(in_folder):
+            msg = "Folder not found: '{}'.".format(in_folder)
+            _err(msg)
+            raise ValueError(msg)
+
+        files = []
+        for dirpath, dirnames, filenames in os.walk(in_folder):
+            for fn in sorted(filenames):
+                if fn.lower().endswith(".tif"):
+                    files.append(os.path.join(dirpath, fn))
+            if not recurse:
+                break
+        if not files:
+            _warn("No .tif files under '{}'.".format(in_folder))
+            return
+        _msg("{} GeoTIFF(s) under '{}'{}.".format(
+            len(files), in_folder, " (dry run)" if dry_run else ""))
+
+        rewritten = skipped = failed = unreadable = 0
+        before_total = after_total = 0
+        to_rewrite_bytes = 0
+        arcpy.SetProgressor("step", "Recompressing GeoTIFFs...", 0, len(files), 1)
+        for path in files:
+            arcpy.SetProgressorPosition()
+            info = _raster_compression(gdal, path)
+            if info is None:
+                unreadable += 1
+                _warn("Cannot open {}; skipped.".format(path))
+                continue
+            if not _recompress_needed(*info):
+                skipped += 1
+                continue
+            size = os.path.getsize(path)
+            if dry_run:
+                rewritten += 1
+                to_rewrite_bytes += size
+                continue
+            sizes = _recompress_geotiff(path)
+            if sizes is None:
+                failed += 1          # the helper already warned with the reason
+                continue
+            rewritten += 1
+            before_total += sizes[0]
+            after_total += sizes[1]
+
+        if dry_run:
+            _msg("Would rewrite {} file(s) holding {:.2f} GB; {} already compressed well or "
+                 "lossy (left alone); {} unreadable.".format(
+                     rewritten, to_rewrite_bytes / 1e9, skipped, unreadable))
+            _msg("Expect roughly half of that size back (DEFLATE with a predictor on these "
+                 "tiles measured 40 to 60 percent of the LZW or raw size).")
+        else:
+            saved = before_total - after_total
+            _msg("Rewrote {} file(s): {:.2f} GB -> {:.2f} GB ({:.2f} GB freed); {} left alone; "
+                 "{} failed; {} unreadable.".format(
+                     rewritten, before_total / 1e9, after_total / 1e9, saved / 1e9, skipped,
+                     failed, unreadable))
+            if failed:
+                _warn("{} file(s) could not be rewritten (see the warnings above; a file open in "
+                      "ArcGIS Pro is locked). Re-run after closing them.".format(failed))
 
 
 # ===========================================================================
@@ -6137,6 +6434,37 @@ def _run_self_tests():
     check("missing root gives no collections",
           _ortho_collections_under(os.path.join(_root, "nope")) == [])
     _shutil_o.rmtree(_root, ignore_errors=True)
+
+    print("_recompress_needed / _choose_mosaic_engine / _snap_extent_nearest")
+    check("uncompressed needs the rewrite", _recompress_needed("none", None))
+    check("LZW without predictor needs the rewrite", _recompress_needed("LZW", None))
+    check("LZW with predictor still gains from DEFLATE", _recompress_needed("LZW", "3"))
+    check("DEFLATE with predictor is left alone", not _recompress_needed("DEFLATE", "3"))
+    check("ZSTD with predictor is left alone", not _recompress_needed("zstd", "2"))
+    check("DEFLATE without predictor is rewritten", _recompress_needed("DEFLATE", None))
+    check("JPEG is left alone", not _recompress_needed("JPEG", None))
+    check("WebP is left alone", not _recompress_needed("WEBP", "2"))
+    check("auto picks gdal when possible",
+          _choose_mosaic_engine("auto", True, "32_BIT_FLOAT", "FIRST")[0] == "gdal")
+    check("auto falls back without gdal",
+          _choose_mosaic_engine("auto", False, "32_BIT_FLOAT", "FIRST") == ("arcpy", "gdal (osgeo) is not available"))
+    check("auto falls back on a mosaic method a VRT cannot do",
+          _choose_mosaic_engine("auto", True, "32_BIT_FLOAT", "MEAN")[0] == "arcpy")
+    check("auto falls back on a non float pixel type",
+          _choose_mosaic_engine("auto", True, "16_BIT_SIGNED", "LAST")[0] == "arcpy")
+    check("arcpy is always honored", _choose_mosaic_engine("arcpy", True, "32_BIT_FLOAT", "FIRST") == ("arcpy", "requested"))
+    check("LAST is fine for gdal", _choose_mosaic_engine("gdal", True, "32_BIT_FLOAT", "last")[0] == "gdal")
+    check_raises("gdal requested but impossible fails loud",
+                 lambda: _choose_mosaic_engine("gdal", False, "32_BIT_FLOAT", "FIRST"))
+    check("nearest rounding matches the arcpy cut seen on the 0.5 m tile",
+          _snap_extent_nearest(-16800.40, 143200.12, -16200.10, 143800.18, 0.5)
+          == (-16800.5, 143200.0, -16200.0, 143800.0))
+    check("nearest rounding with an anchored grid",
+          _snap_extent_nearest(-60360.2, 0.3, -60350.1, 10.4, 2.0, anchor_x=0.5) == (-60359.5, 0.0, -60349.5, 10.0))
+    check("a box on the grid is unchanged by nearest rounding",
+          _snap_extent_nearest(100.0, 200.0, 150.5, 260.0, 0.5) == (100.0, 200.0, 150.5, 260.0))
+    check_raises("nearest rounding rejects a non positive cell",
+                 lambda: _snap_extent_nearest(0, 0, 1, 1, 0))
 
     print("_snap_extent_outward")
     # a box whose edges fall inside 0.5 m cells (W +0.40, S +0.12, E +0.10, N +0.18 past a
