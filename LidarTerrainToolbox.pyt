@@ -202,6 +202,70 @@ def _build_pyramids_stats(path):
         _warn("Could not build pyramids/statistics for {}: {}".format(os.path.basename(path), exc))
 
 
+def _recompress_geotiff(path):
+    """Rewrite a GeoTIFF in place with DEFLATE compression, the predictor that fits its type (3
+    for float, 2 for integer), 512 px tiles and BigTIFF when needed. Values, CRS, NoData and the
+    sidecar files (.ovr pyramids, .aux.xml statistics, world file) stay valid, since the pixels
+    do not change. Why: the DGT 2 m tiles ship uncompressed and the 50 cm ones LZW without a
+    predictor, which is larger than raw (20.4 MB for a 16.0 MB tile); ArcGIS writes LZW with no
+    predictor option (14.7 MB); DEFLATE with predictor 3 gives 8.3 MB, about 45 percent less,
+    which halves a 0.5 m sheet deliverable. A raster that is already DEFLATE or ZSTD with a
+    predictor is left alone (re-runs are idempotent), and so is a lossy JPEG or WebP one such as
+    the orthophoto COGs, which a lossless rewrite would only inflate. Returns (bytes before,
+    bytes after), or None when nothing was done: gdal (osgeo) missing, nothing to gain, or the
+    rewrite failed, in which case the file is left as it was."""
+    try:
+        from osgeo import gdal
+    except ImportError:
+        _warn("gdal (osgeo) is not available; {} is kept as written.".format(os.path.basename(path)))
+        return None
+    if not os.path.isfile(path):
+        _warn("Could not recompress {}: file not found.".format(os.path.basename(path)))
+        return None
+    tmp = path + ".recompress.tif"
+    src = out = None
+    try:
+        src = gdal.Open(path)
+        if src is None:
+            raise RuntimeError("gdal cannot open the raster")
+        structure = src.GetMetadata("IMAGE_STRUCTURE") or {}
+        compression = (structure.get("COMPRESSION") or "").upper()
+        if compression in ("JPEG", "WEBP") or (
+                compression in ("DEFLATE", "ZSTD") and structure.get("PREDICTOR") in ("2", "3")):
+            src = None
+            return None
+        is_float = src.GetRasterBand(1).DataType in (gdal.GDT_Float32, gdal.GDT_Float64)
+        opts = ["COMPRESS=DEFLATE", "PREDICTOR=" + ("3" if is_float else "2"), "TILED=YES",
+                "BLOCKXSIZE=512", "BLOCKYSIZE=512", "BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS"]
+        out = gdal.Translate(tmp, src, creationOptions=opts)
+        if out is None:
+            raise RuntimeError("gdal.Translate returned None")
+        out = None        # close before the rename, Windows keeps open files locked
+        src = None
+        before = os.path.getsize(path)
+        after = os.path.getsize(tmp)
+        os.replace(tmp, path)
+        return before, after
+    except Exception as exc:
+        out = None
+        src = None
+        _warn("Could not recompress {}: {}".format(os.path.basename(path), exc))
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return None
+
+
+def _recompress_output(path):
+    """Recompress a written output raster and log the size change; see _recompress_geotiff."""
+    sizes = _recompress_geotiff(path)
+    if sizes:
+        _msg("  {}: recompressed {:.1f} MB -> {:.1f} MB".format(
+            os.path.basename(path), sizes[0] / 1e6, sizes[1] / 1e6))
+
+
 def _build_class_rat(path):
     """Build statistics and a raster attribute table on a merged class raster, so ArcGIS lists its
     exact class values in the symbology. gdal writes the mosaic without a raster attribute table; on
@@ -761,7 +825,7 @@ class Toolbox(object):
         # 11 Vectorize Class Rasters (delivery: every area together as one raster or one shapefile).
         self.tools = [DownloadDGTData, BuildMosaicsByPolygon, DeriveSurfaces, SolarRadiation,
                       ReclassifyFactor, Resample, Contours, VerifyOutputs, SuitabilityMask,
-                      MergeClasses, VectorizeClasses]
+                      MergeClasses, VectorizeClasses, BuildOrthoMosaics]
 
 
 # ===========================================================================
@@ -885,6 +949,39 @@ def _is_data_folder(folder):
     return False
 
 
+_TILE_VERSION_RE = re.compile(r"^(.+)_v(\d+)$", re.IGNORECASE)
+
+
+def _tile_version(stem):
+    """(base name, version) of a tile stem. DGT publishes a corrected tile with a _vNN suffix
+    next to the original (MDS-50cm-152470-07-2025_v01); the unversioned original is version 0.
+    Pure, unit tested."""
+    m = _TILE_VERSION_RE.match(stem)
+    if m is None:
+        return stem, 0
+    return m.group(1), int(m.group(2))
+
+
+def _latest_versions(stems):
+    """Split tile stems into the highest version of each base name and the older ones, as
+    (kept set, dropped sorted list). Why: an old and a corrected version of a tile must not both
+    enter a mosaic, where FIRST would take whichever sorts first, the OLD one ("2025.tif" sorts
+    before "2025_v01.tif"). Pure, unit tested."""
+    best = {}
+    for stem in stems:
+        base, ver = _tile_version(stem)
+        best[base] = max(best.get(base, -1), ver)
+    kept = set()
+    dropped = []
+    for stem in stems:
+        base, ver = _tile_version(stem)
+        if ver == best[base]:
+            kept.add(stem)
+        else:
+            dropped.append(stem)
+    return kept, sorted(dropped)
+
+
 def _parse_tile_resolution(filename):
     """Resolution token from a DGT tile name, or None.
 
@@ -983,6 +1080,19 @@ def _gather_product_tiles(folders, product_prefix, resolution=None):
                     tokens.add(token.lower())
                 folder_tiles.append((token, path))
         per_folder.append(folder_tiles)
+
+    # A corrected tile (_vNN) replaces its older version; it must not sit next to it in the
+    # mosaic, where FIRST would take whichever sorts first, the old one. Keep the highest version
+    # of each base name across the area's folders.
+    stems = [os.path.splitext(os.path.basename(p))[0] for ft in per_folder for _t, p in ft]
+    dropped = _latest_versions(stems)[1]
+    if dropped:
+        drop = set(dropped)
+        per_folder = [[(t, p) for t, p in ft
+                       if os.path.splitext(os.path.basename(p))[0] not in drop]
+                      for ft in per_folder]
+        _warn("{} older tile version(s) skipped, a newer _vNN exists: {}".format(
+            len(dropped), ", ".join(dropped)))
 
     try:
         chosen = _choose_resolution(tokens, resolution)
@@ -1099,9 +1209,20 @@ DGT_HEADERS = {                            # our client identity and the types w
     "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
     "Accept-Language": "pt-PT,pt;q=0.8,en;q=0.6",
 }
-# Elevation products offered as a checklist in the tool. The orthophoto and Sentinel collections
-# the portal also has are not relevant to this terrain toolbox; "List collections only" shows all.
+# Elevation products and orthophoto series offered as a checklist in the tool. The Sentinel
+# collections the portal also has are not relevant to this toolbox; "List collections only"
+# shows all. The orthophotos come as 8 km by 5 km cloud optimized GeoTIFF blocks (JPEG, red,
+# green, blue, NIR, alpha; 1995 has NIR, red, green, alpha) in EPSG:3763, one per Carta Militar
+# 1:25k quadrant, ids like ORTOS-2021-cog-25cm-144-4: 1 m in 1995, 50 cm from 2004 to 2015,
+# 25 cm from 2018, 30 cm for the 2023 satellite series.
 DGT_ELEVATION_COLLECTIONS = ["LAZ", "MDT-2m", "MDS-2m", "MDT-50cm", "MDS-50cm"]
+DGT_ORTHO_COLLECTIONS = ["ORTOS-1995", "ORTOS-2004", "ORTOS-2007", "ORTOS-2010", "ORTOS-2012",
+                         "ORTOS-2015", "ORTOS-2018", "ORTOS-2021", "ORTOS-2025", "ORTOSAT-2023"]
+# Collections the CDD search does not return under a collections filter (observed 2026-10-08 for
+# ORTOSAT-2023: the item is in an unfiltered search, a filtered search returns nothing). They are
+# found through an unfiltered search and filtered here. That search is capped at 1000 items, so a
+# block can still be missed where the Sentinel collections crowd it out; the log then says so.
+DGT_UNFILTERED_COLLECTIONS = ("ORTOSAT-2023",)
 # Order in which products are downloaded, so each folder fills one product at a time, not mixed.
 DGT_DOWNLOAD_ORDER = ["MDT-50cm", "MDS-50cm", "MDT-2m", "MDS-2m", "LAZ"]
 
@@ -1162,10 +1283,16 @@ def _http_status(exc):
 
 
 def _asset_extension(mime):
-    """File extension for a STAC asset MIME type (.bin if unknown)."""
+    """File extension for a STAC asset MIME type (.bin if unknown). Matched on the base type when
+    the full string is unknown: the type carries parameters that differ per collection (the
+    orthophotos announce 'image/tiff; application=geotiff; profile=cloud-optimized'), so an exact
+    match alone would file a valid GeoTIFF as .bin."""
     if not mime:
         return ".bin"
-    return DGT_ASSET_EXT.get(mime.strip().lower(), ".bin")
+    key = mime.strip().lower()
+    if key in DGT_ASSET_EXT:
+        return DGT_ASSET_EXT[key]
+    return DGT_ASSET_EXT.get(key.split(";")[0].strip(), ".bin")
 
 
 def divide_bbox(bbox, max_km2=DGT_MAX_CHUNK_KM2):
@@ -1289,7 +1416,7 @@ class DownloadDGTData(object):
             displayName="Collections to download", name="collections",
             datatype="GPString", parameterType="Optional", direction="Input", multiValue=True)
         p_collections.filter.type = "ValueList"
-        p_collections.filter.list = list(DGT_ELEVATION_COLLECTIONS)
+        p_collections.filter.list = list(DGT_ELEVATION_COLLECTIONS) + list(DGT_ORTHO_COLLECTIONS)
         p_collections.value = ["MDT-2m", "MDS-2m"]
 
         p_list = arcpy.Parameter(
@@ -1337,8 +1464,23 @@ class DownloadDGTData(object):
         p_layout.filter.list = [LAYOUT_PER_AREA, LAYOUT_FLAT]
         p_layout.value = LAYOUT_PER_AREA
 
+        p_latest = arcpy.Parameter(
+            displayName="Keep only the latest version of each tile", name="latest_only",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # DGT publishes a corrected tile with a _v01, _v02 suffix next to the original (version
+        # 0). On, only the highest version of each tile is fetched; off fetches every version.
+        p_latest.value = True
+
+        p_compress = arcpy.Parameter(
+            displayName="Recompress tiles (DEFLATE with predictor)", name="recompress",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # The tiles ship uncompressed (2 m) or LZW without a predictor (50 cm, larger than raw);
+        # DEFLATE with a predictor roughly halves them. See _recompress_geotiff.
+        p_compress.value = True
+
         return [p_aoi, p_field, p_out, p_point, p_collections, p_list,
-                p_user, p_pass, p_save, p_delay, p_overwrite, p_vrt, p_dry, p_layout]
+                p_user, p_pass, p_save, p_delay, p_overwrite, p_vrt, p_dry, p_layout,
+                p_latest, p_compress]
 
     def isLicensed(self):
         return True
@@ -1453,7 +1595,7 @@ class DownloadDGTData(object):
         we = ll.extent
         return (we.XMin, we.YMin, we.XMax, we.YMax)
 
-    def _collect_assets(self, session, bbox, collections, delay):
+    def _collect_assets(self, session, bbox, collections, delay, latest_only=True):
         """Search a bbox (split if large) and return {(collection, item_id, extension): [urls]}.
         Keyed by the output file, with the list of candidate asset URLs for it: a feature can expose
         the same tile through more than one href, and one of a tile's per search download tokens can
@@ -1461,8 +1603,17 @@ class DownloadDGTData(object):
         file (not the URL) also keeps each tile listed and counted once."""
         import time
         assets = {}
+        server_side = [c for c in (collections or []) if c not in DGT_UNFILTERED_COLLECTIONS]
+        client_side = [c for c in (collections or []) if c in DGT_UNFILTERED_COLLECTIONS]
         for chunk in divide_bbox(bbox):
-            for feat in self._search(session, chunk, collections or None):
+            feats = []
+            if server_side or not collections:
+                feats.extend(self._search(session, chunk, server_side or None))
+            if client_side:
+                # see DGT_UNFILTERED_COLLECTIONS
+                feats.extend(f for f in self._search(session, chunk, None)
+                             if f.get("collection") in client_side)
+            for feat in feats:
                 col = feat.get("collection") or "unknown"
                 item_id = self._item_id(feat)
                 for asset in (feat.get("assets") or {}).values():
@@ -1475,7 +1626,24 @@ class DownloadDGTData(object):
                         urls.append(url)
             if delay:
                 time.sleep(delay)
+        if latest_only:
+            assets = self._drop_old_versions(assets)
         return assets
+
+    def _drop_old_versions(self, assets):
+        """Keep only the highest _vNN version of each tile, per collection and extension (the
+        unversioned original is version 0), and log what is left out. See _latest_versions."""
+        stems = {}
+        for col, item_id, ext in assets:
+            stems.setdefault((col, ext), []).append(item_id)
+        drop = set()
+        for (col, ext), ids in stems.items():
+            for stem in _latest_versions(ids)[1]:
+                drop.add((col, stem, ext))
+        if drop:
+            _msg("  Keeping the latest version of each tile; {} older file(s) left out: {}".format(
+                len(drop), ", ".join(sorted(stem + ext for _c, stem, ext in drop))))
+        return {key: urls for key, urls in assets.items() if key not in drop}
 
     def _download_assets(self, session, assets, dest_root, overwrite, delay, flat=False):
         """Download an assets dict into dest_root. With flat=False (the per area layout) each
@@ -1578,6 +1746,8 @@ class DownloadDGTData(object):
                                 if chunk:
                                     fh.write(chunk)
                         os.replace(tmp, dest)
+                    if getattr(self, "_recompress", False) and dest.lower().endswith(".tif"):
+                        _recompress_geotiff(dest)
                     return "ok"
                 except Exception as exc:
                     throttled = throttled or _http_status(exc) in (403, 429)
@@ -1686,6 +1856,8 @@ class DownloadDGTData(object):
         build_vrt = bool(parameters[11].value)
         dry_run = bool(parameters[12].value)
         layout = parameters[13].valueAsText or LAYOUT_PER_AREA
+        latest_only = bool(parameters[14].value)
+        self._recompress = bool(parameters[15].value)   # read by _download per tile
         per_feature = (layout == LAYOUT_PER_AREA)
 
         cred_path = dgt_credentials_path()
@@ -1771,7 +1943,7 @@ class DownloadDGTData(object):
         if per_feature:
             # One folder per feature (the recurrence).
             for area, bbox in features:
-                assets = self._collect_assets(session, bbox, collections, delay)
+                assets = self._collect_assets(session, bbox, collections, delay, latest_only)
                 if dry_run:
                     _msg("{}: {} tiles (dry run, not downloaded).".format(area, len(assets)))
                     continue
@@ -1796,7 +1968,7 @@ class DownloadDGTData(object):
             # All features into one flat folder, deduplicated by URL.
             merged = {}
             for area, bbox in features:
-                for key, urls in self._collect_assets(session, bbox, collections, delay).items():
+                for key, urls in self._collect_assets(session, bbox, collections, delay, latest_only).items():
                     dst = merged.setdefault(key, [])
                     for u in urls:
                         if u not in dst:
@@ -1951,6 +2123,13 @@ class BuildMosaicsByPolygon(object):
         # cell cut. No effect with clip mode none.
         p_cover.value = True
 
+        p_compress = arcpy.Parameter(
+            displayName="Recompress mosaics (DEFLATE with predictor 3)", name="recompress",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # ArcGIS writes LZW with no predictor option; DEFLATE with predictor 3 is about 45 percent
+        # smaller on these float mosaics, which halves a 0.5 m sheet. See _recompress_geotiff.
+        p_compress.value = True
+
         p_pyramids = arcpy.Parameter(
             displayName="Build pyramids and statistics", name="build_pyramids",
             datatype="GPBoolean", parameterType="Optional", direction="Input")
@@ -1965,7 +2144,7 @@ class BuildMosaicsByPolygon(object):
 
         return [p_aoi, p_field, p_root, p_out, p_struct, p_products,
                 p_pixel, p_method, p_overwrite, p_skip, p_verify, p_prefix, p_res,
-                p_clusters, p_dry_run, p_mapping, p_clip, p_pyramids, p_cover]
+                p_clusters, p_dry_run, p_mapping, p_clip, p_pyramids, p_cover, p_compress]
 
     def isLicensed(self):
         # Uses core Mosaic To New Raster, no Spatial Analyst needed.
@@ -1986,7 +2165,8 @@ class BuildMosaicsByPolygon(object):
 
     def _build_clusters(self, groups, fid_to_geom, fid_to_folder, products,
                         out_folder, pixel_type, mosaic_method, tile_resolution,
-                        skip_incomplete, overwrite_existing, dry_run, build_pyramids=False):
+                        skip_incomplete, overwrite_existing, dry_run, build_pyramids=False,
+                        recompress=False):
         """Aggregate areas whose AOI polygons are contiguous (touch or overlap) into one
         mosaic per cluster, in parallel to the per area output.
 
@@ -2093,6 +2273,8 @@ class BuildMosaicsByPolygon(object):
                         number_of_bands=1,
                         mosaic_method=mosaic_method,
                     )
+                if recompress:
+                    _recompress_output(out_path)
                 if build_pyramids:
                     _build_pyramids_stats(out_path)
                 size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
@@ -2300,6 +2482,7 @@ class BuildMosaicsByPolygon(object):
         clip_mode = parameters[16].valueAsText or "none"
         build_pyramids = bool(parameters[17].value)
         cover_aoi = bool(parameters[18].value)
+        recompress = bool(parameters[19].value)
 
         arcpy.env.overwriteOutput = overwrite_existing
 
@@ -2400,21 +2583,21 @@ class BuildMosaicsByPolygon(object):
                 self._build_for_resolution(
                     groups, fid_to_geom, fid_to_folder, products, res_root, output_structure,
                     pixel_type, mosaic_method, overwrite_existing, skip_incomplete,
-                    verify_extent, mapping_mode, clip_mode, cover_aoi, build_pyramids, res,
-                    aoi_sr, build_cluster_mosaics, cluster_dry_run)
+                    verify_extent, mapping_mode, clip_mode, cover_aoi, recompress, build_pyramids,
+                    res, aoi_sr, build_cluster_mosaics, cluster_dry_run)
         else:
             tile_resolution = resolutions[0] if resolutions else None
             self._build_for_resolution(
                 groups, fid_to_geom, fid_to_folder, products, out_folder, output_structure,
                 pixel_type, mosaic_method, overwrite_existing, skip_incomplete,
-                verify_extent, mapping_mode, clip_mode, cover_aoi, build_pyramids,
+                verify_extent, mapping_mode, clip_mode, cover_aoi, recompress, build_pyramids,
                 tile_resolution, aoi_sr, build_cluster_mosaics, cluster_dry_run)
         return
 
     def _build_for_resolution(self, groups, fid_to_geom, fid_to_folder, products, out_folder,
                               output_structure, pixel_type, mosaic_method, overwrite_existing,
                               skip_incomplete, verify_extent, mapping_mode, clip_mode, cover_aoi,
-                              build_pyramids, tile_resolution, aoi_sr,
+                              recompress, build_pyramids, tile_resolution, aoi_sr,
                               build_cluster_mosaics, cluster_dry_run):
         """Build the per area mosaics (and optional clusters) for one tile resolution into
         out_folder. Called once per selected resolution, each with its own output tree."""
@@ -2549,6 +2732,8 @@ class BuildMosaicsByPolygon(object):
                     arcpy.env.extent = prev_extent
                     if to_polygon:
                         _delete_partial_raster(mosaic_path)
+                if recompress:
+                    _recompress_output(out_path)
                 if build_pyramids:
                     _build_pyramids_stats(out_path)
                 size_label = "{}, {:g} m".format(res_used, cell) if res_used else "{:g} m".format(cell)
@@ -2585,7 +2770,7 @@ class BuildMosaicsByPolygon(object):
             self._build_clusters(
                 groups, fid_to_geom, fid_to_folder, products, out_folder, pixel_type,
                 mosaic_method, tile_resolution, skip_incomplete, overwrite_existing,
-                cluster_dry_run, build_pyramids)
+                cluster_dry_run, build_pyramids, recompress)
         return
 
 
@@ -5119,6 +5304,411 @@ class VectorizeClasses(object):
 
 
 # ===========================================================================
+# Tool 12 - Build Orthophoto Mosaics by Polygon
+# ===========================================================================
+
+def _is_ortho_folder(folder):
+    """True if `folder` directly contains an orthophoto subfolder (ORTOS-<year> or
+    ORTOSAT-<year>, the DGT collection names Tool 1 uses as product subfolders)."""
+    try:
+        for entry in os.listdir(folder):
+            if entry.upper().startswith("ORTOS") and os.path.isdir(os.path.join(folder, entry)):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _ortho_collections_under(root):
+    """Sorted orthophoto collection names (ORTOS-2021, ...) present as product subfolders of the
+    area folders under root, so the dialog offers only what was downloaded. Pure, unit tested."""
+    found = set()
+    try:
+        for entry in os.listdir(root):
+            area_dir = os.path.join(root, entry)
+            if not os.path.isdir(area_dir):
+                continue
+            for sub in os.listdir(area_dir):
+                if sub.upper().startswith("ORTOS") and os.path.isdir(os.path.join(area_dir, sub)):
+                    found.add(sub)
+    except OSError:
+        pass
+    return sorted(found)
+
+
+def _ortho_output_name(area, collection):
+    """Mosaic name {Area}_{COLLECTION} with the collection closed up: AreaA_ORTOS2021. Kept out of
+    build_output_name on purpose: SOURCES and PRODUCTS describe the elevation chain, and the
+    downstream tools must not pick an orthophoto up as one of its products. Pure, unit tested."""
+    token = re.sub(r"[^A-Za-z0-9]", "", str(collection).upper())
+    if not token:
+        raise ValueError("Empty orthophoto collection name '{}'.".format(collection))
+    return "{}_{}".format(area, token)
+
+
+def _ortho_tiles(folders, collection):
+    """The blocks of one orthophoto collection across an area's folders, <folder>/<collection>/
+    *.tif, deduplicated by file name (areas sharing a block) and reduced to the latest _vNN
+    version of each block. Sorted, for a stable mosaic order."""
+    by_name = {}
+    for folder in folders:
+        sub = os.path.join(folder, collection)
+        if not os.path.isdir(sub):
+            continue
+        for fn in sorted(os.listdir(sub)):
+            if fn.lower().endswith(".tif") and fn not in by_name:
+                by_name[fn] = os.path.join(sub, fn)
+    stems = {os.path.splitext(fn)[0]: fn for fn in by_name}
+    kept, dropped = _latest_versions(list(stems))
+    if dropped:
+        _warn("{}: {} older block version(s) skipped, a newer _vNN exists: {}".format(
+            collection, len(dropped), ", ".join(dropped)))
+    return [by_name[stems[s]] for s in sorted(kept)]
+
+
+def _read_aoi(in_aoi, area_field):
+    """Read an AOI layer into (fid -> raw area name, fid -> geometry, spatial reference), failing
+    loud on an undefined CRS or an empty layer, and warning when the CRS is not the project one
+    (the polygons are projected for the cut, without a datum shift, see _project_geom)."""
+    desc = arcpy.Describe(in_aoi)
+    aoi_sr = desc.spatialReference
+    if aoi_sr is None or aoi_sr.name in (None, "", "Unknown"):
+        msg = "AOI layer has no spatial reference. Define its CRS first."
+        _err(msg)
+        raise ValueError(msg)
+    _msg("AOI layer CRS: {}.".format(_crs_label(aoi_sr)))
+    if aoi_sr.factoryCode and int(aoi_sr.factoryCode) != PROJECT_EPSG:
+        _warn("AOI layer is {}, not the project EPSG:{}. Polygons are projected for the cut "
+              "only.".format(_crs_label(aoi_sr), PROJECT_EPSG))
+    fid_to_area = {}
+    fid_to_geom = {}
+    with arcpy.da.SearchCursor(in_aoi, ["OID@", "SHAPE@", area_field]) as cursor:
+        for oid, shape, raw in cursor:
+            fid_to_area[int(oid)] = raw
+            fid_to_geom[int(oid)] = shape
+    if not fid_to_area:
+        msg = "AOI layer '{}' has no features.".format(in_aoi)
+        _err(msg)
+        raise ValueError(msg)
+    return fid_to_area, fid_to_geom, aoi_sr
+
+
+class BuildOrthoMosaics(BuildMosaicsByPolygon):
+    """Orthophoto mosaics per area from the Tool 1 ORTOS download folders. Subclasses Tool 2 only
+    to reuse its folder mapping and AOI extent helpers; the parameters and the run are its own,
+    because the product is a multi band Byte image written with gdal as a cloud optimized
+    GeoTIFF, not a float elevation mosaic written with MosaicToNewRaster."""
+
+    def __init__(self):
+        self.label = "12 - Build Orthophoto Mosaics by Polygon"
+        self.description = (
+            "Build one orthophoto mosaic per area and per DGT orthophoto collection (ORTOS-<year>, "
+            "ORTOSAT-<year>) from the Tool 1 download folders: a cloud optimized GeoTIFF with the "
+            "RGB (and NIR) bands, JPEG or DEFLATE, cut to the AOI extent or polygon, with the "
+            "ground outside the survey as NoData. Needs gdal (osgeo), bundled with ArcGIS Pro.")
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        p_aoi = arcpy.Parameter(
+            displayName="AOI layer (areas of interest)", name="in_aoi",
+            datatype="GPFeatureLayer", parameterType="Required", direction="Input")
+        p_aoi.filter.list = ["Polygon"]
+
+        p_field = arcpy.Parameter(
+            displayName="Area name field", name="area_field",
+            datatype="Field", parameterType="Required", direction="Input")
+        p_field.parameterDependencies = [p_aoi.name]
+        p_field.filter.list = ["Text", "Short", "Long"]
+
+        p_root = arcpy.Parameter(
+            displayName="Download root folder (Tool 1 output)", name="download_root",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_out = arcpy.Parameter(
+            displayName="Output folder", name="out_folder",
+            datatype="DEFolder", parameterType="Required", direction="Input")
+
+        p_struct = arcpy.Parameter(
+            displayName="Output structure", name="output_structure",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_struct.filter.type = "ValueList"
+        p_struct.filter.list = ["per_area_subfolder", "flat"]
+        p_struct.value = "per_area_subfolder"
+
+        p_collections = arcpy.Parameter(
+            displayName="Orthophoto collections (blank = all present under the root)",
+            name="collections", datatype="GPString", parameterType="Optional",
+            direction="Input", multiValue=True)
+        p_collections.filter.type = "ValueList"
+        p_collections.filter.list = list(DGT_ORTHO_COLLECTIONS)
+
+        p_bands = arcpy.Parameter(
+            displayName="Bands", name="bands",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_bands.filter.type = "ValueList"
+        # RGB+NIR = every image band as DGT delivers it (red, green, blue, NIR; the 1995 series
+        # has three, NIR, red, green); RGB = the first three. The trailing alpha band is never
+        # copied as a band: it becomes the internal mask.
+        p_bands.filter.list = ["RGB+NIR", "RGB"]
+        p_bands.value = "RGB+NIR"
+
+        p_compress = arcpy.Parameter(
+            displayName="Compression", name="compression",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_compress.filter.type = "ValueList"
+        p_compress.filter.list = ["JPEG", "DEFLATE"]
+        p_compress.value = "JPEG"
+
+        p_quality = arcpy.Parameter(
+            displayName="JPEG quality (1 to 100)", name="jpeg_quality",
+            datatype="GPLong", parameterType="Optional", direction="Input")
+        # The DGT blocks are JPEG quality 75; re-encoding at 85 keeps the extra loss small.
+        p_quality.value = 85
+
+        p_overwrite = arcpy.Parameter(
+            displayName="Overwrite existing outputs", name="overwrite_existing",
+            datatype="GPBoolean", parameterType="Optional", direction="Input")
+        p_overwrite.value = False
+
+        p_clip = arcpy.Parameter(
+            displayName="Clip mosaic to AOI", name="clip_to_aoi",
+            datatype="GPString", parameterType="Required", direction="Input")
+        p_clip.filter.type = "ValueList"
+        p_clip.filter.list = ["none", "extent", "polygon"]
+        p_clip.value = "extent"
+
+        p_cover = arcpy.Parameter(
+            displayName="Cover the whole AOI (expand the cut outward to the block grid)",
+            name="cover_aoi", datatype="GPBoolean", parameterType="Optional", direction="Input")
+        # Same meaning as in Tool 2: gdal cuts a window to whole pixels too, so the box is snapped
+        # outward to the block grid first, and in polygon mode every pixel the polygon touches is
+        # kept (CUTLINE_ALL_TOUCHED), so the mosaic never falls short of the AOI line.
+        p_cover.value = True
+
+        return [p_aoi, p_field, p_root, p_out, p_struct, p_collections, p_bands, p_compress,
+                p_quality, p_overwrite, p_clip, p_cover]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        # Offer only the orthophoto collections that exist under the chosen root.
+        p_root, p_cols = parameters[2], parameters[5]
+        if p_root.altered and p_root.valueAsText and os.path.isdir(p_root.valueAsText):
+            present = _ortho_collections_under(p_root.valueAsText)
+            p_cols.filter.list = present or list(DGT_ORTHO_COLLECTIONS)
+            if p_cols.values:
+                p_cols.value = [v for v in p_cols.values if v in set(p_cols.filter.list)]
+        parameters[8].enabled = (parameters[7].valueAsText or "JPEG") == "JPEG"
+        parameters[11].enabled = (parameters[10].valueAsText or "none") != "none"
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        # The .pyt runs in-process, so env settings leak into the Pro session; restore on exit.
+        prev_overwrite = arcpy.env.overwriteOutput
+        try:
+            return self._run_ortho(parameters)
+        finally:
+            arcpy.env.overwriteOutput = prev_overwrite
+
+    def _run_ortho(self, parameters):
+        try:
+            from osgeo import gdal
+        except ImportError:
+            msg = "gdal (osgeo) is not available in this Python; the orthophoto mosaics need it."
+            _err(msg)
+            raise ImportError(msg)
+
+        in_aoi = parameters[0].valueAsText
+        area_field = parameters[1].valueAsText
+        root = parameters[2].valueAsText
+        out_folder = parameters[3].valueAsText
+        output_structure = parameters[4].valueAsText or "per_area_subfolder"
+        selected = [str(v).strip() for v in (parameters[5].values or []) if str(v).strip()]
+        bands_mode = parameters[6].valueAsText or "RGB+NIR"
+        compression = parameters[7].valueAsText or "JPEG"
+        quality = int(parameters[8].value or 85)
+        overwrite_existing = bool(parameters[9].value)
+        clip_mode = parameters[10].valueAsText or "none"
+        cover_aoi = bool(parameters[11].value)
+
+        arcpy.env.overwriteOutput = overwrite_existing
+        if compression == "JPEG" and not 1 <= quality <= 100:
+            msg = "JPEG quality must be between 1 and 100, got {}.".format(quality)
+            _err(msg)
+            raise ValueError(msg)
+
+        fid_to_area, fid_to_geom, aoi_sr = _read_aoi(in_aoi, area_field)
+        groups = build_area_groups([(fid, fid_to_area[fid]) for fid in fid_to_area])
+
+        data_folders = []
+        for entry in sorted(os.listdir(root)):
+            full = os.path.join(root, entry)
+            if os.path.isdir(full) and _is_ortho_folder(full):
+                data_folders.append((entry, full))
+        if not data_folders:
+            msg = ("No orthophoto folders (an area folder with an ORTOS subfolder) found under "
+                   "'{}'. Download the ORTOS collections with Tool 1 first.".format(root))
+            _err(msg)
+            raise ValueError(msg)
+        fid_to_folder = self._map_folders_by_name(data_folders, fid_to_area)
+
+        collections = selected or _ortho_collections_under(root)
+        _msg("Collections: {}. Bands: {}. Output: COG {}{}.".format(
+            ", ".join(collections), bands_mode, compression,
+            " quality {}".format(quality) if compression == "JPEG" else ""))
+        if not os.path.isdir(out_folder):
+            os.makedirs(out_folder)
+
+        built = 0
+        existing = 0
+        no_folder = []
+        no_blocks = []
+        arcpy.SetProgressor("step", "Building orthophoto mosaics...", 0, len(groups), 1)
+        for final_area, fids in groups:
+            arcpy.SetProgressorPosition()
+            folders = [fid_to_folder[f] for f in fids if f in fid_to_folder]
+            if not folders:
+                no_folder.append(final_area)
+                continue
+            geoms = [fid_to_geom[f] for f in fids]
+            location = out_folder if output_structure == "flat" else os.path.join(out_folder, final_area)
+            for col in collections:
+                tiles = _ortho_tiles(folders, col)
+                if not tiles:
+                    no_blocks.append("{} ({})".format(final_area, col))
+                    continue
+                out_name = _ortho_output_name(final_area, col) + ".tif"
+                out_path = os.path.join(location, out_name)
+                if os.path.exists(out_path) and not overwrite_existing:
+                    _msg("Area '{}' ({}): output exists, skipping ({}).".format(final_area, col, out_name))
+                    existing += 1
+                    continue
+                if not os.path.isdir(location):
+                    os.makedirs(location)
+                nbands, cell, width, height = self._build_ortho_mosaic(
+                    gdal, tiles, out_path, geoms, aoi_sr, clip_mode, cover_aoi, bands_mode,
+                    compression, quality)
+                clip_note = {"extent": ", cut to the AOI extent",
+                             "polygon": ", cut to the AOI polygon"}.get(clip_mode, "")
+                if clip_note and cover_aoi:
+                    clip_note += " (full coverage)"
+                _msg("Area '{}' ({}): mosaicked {} block(s), {} band(s), {:g} m, {} x {} px{}, "
+                     "{:.0f} MB -> {}".format(final_area, col, len(tiles), nbands, cell, width,
+                                              height, clip_note,
+                                              os.path.getsize(out_path) / 1e6, out_name))
+                built += 1
+        if no_folder:
+            _warn("{} area(s) without a download folder under the root (not downloaded yet): "
+                  "{}.".format(len(no_folder), ", ".join(no_folder)))
+        if no_blocks:
+            _warn("No blocks found for: {}.".format(", ".join(no_blocks)))
+        _msg("Done. Mosaics built: {}. Already present: {}.".format(built, existing))
+
+    def _build_ortho_mosaic(self, gdal, tiles, out_path, geoms, aoi_sr, clip_mode, cover_aoi,
+                            bands_mode, compression, quality):
+        """Mosaic the blocks through a VRT and write the COG with one gdal.Translate pass (no
+        intermediate raster), cut to the AOI box (a pixel window) or polygon (a warped VRT with
+        the polygon as cutline). The blocks' trailing alpha band becomes the internal mask, which
+        ArcGIS Pro and gdal readers show as NoData. Returns (bands, cell, width, height)."""
+        # Scratch files next to the output, named without extra dots: a shapefile name may not
+        # contain them (CopyFeatures rejects "x.tif.cut.shp").
+        stem = os.path.splitext(out_path)[0]
+        vrt_path = stem + "_src.vrt"
+        cut_vrt = stem + "_cut.vrt"
+        cut_fc = stem + "_cut.shp"
+        tile_sr = arcpy.SpatialReference(PROJECT_EPSG)
+        try:
+            with _CleanupOnError(out_path):
+                vrt = gdal.BuildVRT(vrt_path, tiles)
+                if vrt is None:
+                    raise RuntimeError("gdal.BuildVRT returned None")
+                # The blocks must be in the project CRS. Accept the EPSG code when the file carries
+                # one, else the same definition (a WKT without an authority node is still TM06).
+                from osgeo import osr
+                srs = vrt.GetSpatialRef()
+                ref = osr.SpatialReference()
+                ref.ImportFromEPSG(PROJECT_EPSG)
+                code = srs.GetAuthorityCode(None) if srs is not None else None
+                same = srs is not None and (
+                    (code is not None and int(code) == PROJECT_EPSG) or srs.IsSame(ref) == 1)
+                if not same:
+                    msg = ("Orthophoto blocks are not EPSG:{} ('{}'); the DGT blocks are expected "
+                           "in the project CRS.".format(
+                               PROJECT_EPSG, srs.GetName() if srs is not None else "unknown"))
+                    _err(msg)
+                    raise ValueError(msg)
+                count = vrt.RasterCount
+                has_alpha = vrt.GetRasterBand(count).GetColorInterpretation() == gdal.GCI_AlphaBand
+                image_bands = list(range(1, count if has_alpha else count + 1))
+                if bands_mode == "RGB":
+                    image_bands = image_bands[:3]
+                gt = vrt.GetGeoTransform()
+                cell = gt[1]
+                vrt = None
+
+                source = vrt_path
+                kwargs = {"format": "COG", "bandList": image_bands}
+                if has_alpha:
+                    kwargs["maskBand"] = count
+                if clip_mode != "none":
+                    ext = self._area_extent(geoms, aoi_sr, tile_sr)
+                    box = (ext.XMin, ext.YMin, ext.XMax, ext.YMax)
+                    if cover_aoi:
+                        box = _snap_extent_outward(box[0], box[1], box[2], box[3], cell,
+                                                   gt[0] % cell, gt[3] % cell)
+                    if clip_mode == "polygon":
+                        union = None
+                        for g in geoms:
+                            if g is None:
+                                continue
+                            pg = _project_geom(g, aoi_sr, tile_sr)
+                            union = pg if union is None else union.union(pg)
+                        arcpy.management.CopyFeatures([union], cut_fc)
+                        warped = gdal.Warp(
+                            cut_vrt, vrt_path, format="VRT", cutlineDSName=cut_fc,
+                            cutlineSRS="EPSG:{}".format(PROJECT_EPSG), outputBounds=list(box),
+                            warpOptions=["CUTLINE_ALL_TOUCHED=TRUE"] if cover_aoi else [])
+                        if warped is None:
+                            raise RuntimeError("gdal.Warp returned None")
+                        warped = None
+                        source = cut_vrt
+                    else:
+                        kwargs["projWin"] = [box[0], box[3], box[2], box[1]]
+                # Band interleave: one JPEG stream per band, which is how DGT writes the blocks and
+                # what keeps a 4 band JPEG from being read as CMYK; also avoids the YCbCr overview
+                # path, which gdal refuses together with a mask.
+                options = ["INTERLEAVE=BAND", "BLOCKSIZE=512", "BIGTIFF=IF_SAFER",
+                           "NUM_THREADS=ALL_CPUS"]
+                if compression == "JPEG":
+                    options += ["COMPRESS=JPEG", "QUALITY={}".format(int(quality))]
+                else:
+                    options += ["COMPRESS=DEFLATE", "PREDICTOR=2"]
+                kwargs["creationOptions"] = options
+                out = gdal.Translate(out_path, source, **kwargs)
+                if out is None:
+                    raise RuntimeError("gdal.Translate returned None")
+                width, height = out.RasterXSize, out.RasterYSize
+                out = None
+                return len(image_bands), cell, width, height
+        finally:
+            for path in (vrt_path, cut_vrt):
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            if arcpy.Exists(cut_fc):
+                try:
+                    arcpy.management.Delete(cut_fc)
+                except Exception:
+                    pass
+
+
+# ===========================================================================
 # Self tests (pure functions; numpy tests run only if numpy is importable).
 # Run: python LidarTerrainToolbox.pyt
 # ===========================================================================
@@ -5445,6 +6035,8 @@ def _run_self_tests():
           _asset_extension("image/tiff; application=geotiff") == ".tif")
     check("asset extension laz", _asset_extension("application/vnd.laszip") == ".laz")
     check("asset extension unknown", _asset_extension("application/json") == ".bin")
+    check("asset extension with extra MIME parameters (orthophoto COG)",
+          _asset_extension("image/tiff; application=geotiff; profile=cloud-optimized") == ".tif")
     check("geotiff head is a valid asset", _looks_like_asset(b"II*\x00\x08\x00"))
     check("laz head is a valid asset", _looks_like_asset(b"LASF\x00\x00"))
     check("html login page is not an asset", not _looks_like_asset(b"<!DOCTYPE html>"))
@@ -5455,6 +6047,97 @@ def _run_self_tests():
         '<input name="username" value=""><input type="hidden" name="tab_id" value="abc"></form>')
     check("keycloak form action", _action == "https://x/auth")
     check("keycloak form hidden field", _fields.get("tab_id") == "abc")
+    print("_tile_version / _latest_versions")
+    check("unversioned stem is version 0",
+          _tile_version("MDS-50cm-152470-07-2025") == ("MDS-50cm-152470-07-2025", 0))
+    check("versioned stem split",
+          _tile_version("MDS-50cm-152470-07-2025_v01") == ("MDS-50cm-152470-07-2025", 1))
+    check("version suffix is case insensitive",
+          _tile_version("MDT-2m-1-2-3_V12") == ("MDT-2m-1-2-3", 12))
+    _kept, _dropped = _latest_versions(["MDS-50cm-1-07-2025", "MDS-50cm-1-07-2025_v01",
+                                        "MDS-50cm-1-07-2025_v02", "MDS-50cm-2-07-2025",
+                                        "MDT-2m-1-07-2025_v01"])
+    check("only the highest version of each tile is kept",
+          _kept == {"MDS-50cm-1-07-2025_v02", "MDS-50cm-2-07-2025", "MDT-2m-1-07-2025_v01"})
+    check("older versions are reported, sorted",
+          _dropped == ["MDS-50cm-1-07-2025", "MDS-50cm-1-07-2025_v01"])
+    check("no versions, nothing dropped",
+          _latest_versions(["a", "b"]) == ({"a", "b"}, []))
+
+    print("_recompress_geotiff")
+    try:
+        from osgeo import gdal as _gdal
+        import numpy as _np
+    except ImportError:
+        _gdal = None
+    if _gdal is None:
+        print("  skip (gdal or numpy not available)")
+    else:
+        import shutil as _shutil
+        import tempfile as _tempfile
+        _dir = _tempfile.mkdtemp(prefix="lt_recompress_")
+        _gt = (1000.0, 0.5, 0.0, 2000.0, 0.0, -0.5)
+        for _name, _dtype, _nodata, _pred in (("f.tif", _gdal.GDT_Float32, -999.0, "3"),
+                                              ("b.tif", _gdal.GDT_Byte, 255.0, "2")):
+            _p = os.path.join(_dir, _name)
+            _ds = _gdal.GetDriverByName("GTiff").Create(_p, 64, 48, 1, _dtype)
+            _ds.SetGeoTransform(_gt)
+            _band = _ds.GetRasterBand(1)
+            _band.SetNoDataValue(_nodata)
+            _arr = (_np.arange(64 * 48).reshape(48, 64) % 200).astype(
+                "float32" if _dtype == _gdal.GDT_Float32 else "uint8")
+            _band.WriteArray(_arr)
+            _band = None
+            _ds = None
+            _sizes = _recompress_geotiff(_p)
+            _rd = _gdal.Open(_p)
+            _md = _rd.GetMetadata("IMAGE_STRUCTURE")
+            check("{} rewritten as DEFLATE with predictor {}".format(_name, _pred),
+                  _sizes is not None and _md.get("COMPRESSION") == "DEFLATE"
+                  and _md.get("PREDICTOR") == _pred)
+            check("{} keeps values, NoData and geotransform".format(_name),
+                  bool((_rd.ReadAsArray() == _arr).all())
+                  and _rd.GetRasterBand(1).GetNoDataValue() == _nodata
+                  and _rd.GetGeoTransform() == _gt)
+            _rd = None
+        _p = os.path.join(_dir, "f.tif")
+        _size = os.path.getsize(_p)
+        check("a file already DEFLATE with predictor is left alone",
+              _recompress_geotiff(_p) is None and os.path.getsize(_p) == _size)
+        _p = os.path.join(_dir, "jpeg.tif")
+        _ds = _gdal.GetDriverByName("GTiff").Create(_p, 64, 48, 3, _gdal.GDT_Byte,
+                                                    options=["COMPRESS=JPEG", "JPEG_QUALITY=75"])
+        _ds.SetGeoTransform(_gt)
+        for _i in range(3):
+            _ds.GetRasterBand(_i + 1).WriteArray(
+                (_np.arange(64 * 48).reshape(48, 64) % 200).astype("uint8"))
+        _ds = None
+        check("a lossy JPEG raster (orthophoto) is left alone",
+              _recompress_geotiff(_p) is None
+              and _gdal.Open(_p).GetMetadata("IMAGE_STRUCTURE").get("COMPRESSION") == "JPEG")
+        check("missing file is reported, not raised",
+              _recompress_geotiff(os.path.join(_dir, "nope.tif")) is None)
+        _shutil.rmtree(_dir, ignore_errors=True)
+
+    print("orthophoto helpers")
+    check("collection closed up in the output name",
+          _ortho_output_name("Area_A", "ORTOS-2021") == "Area_A_ORTOS2021")
+    check("satellite collection name", _ortho_output_name("A", "ortosat-2023") == "A_ORTOSAT2023")
+    check_raises("empty collection rejected", lambda: _ortho_output_name("A", "-"))
+    import shutil as _shutil_o
+    import tempfile as _tempfile_o
+    _root = _tempfile_o.mkdtemp(prefix="lt_ortho_")
+    for sub in ("12A/ORTOS-2021", "12A/MDT-2m", "12C/ORTOS-1995", "notes"):
+        os.makedirs(os.path.join(_root, sub))
+    check("ortho folder detected", _is_ortho_folder(os.path.join(_root, "12A")))
+    check("folder without ORTOS is not an ortho folder",
+          not _is_ortho_folder(os.path.join(_root, "notes")))
+    check("collections present under the root",
+          _ortho_collections_under(_root) == ["ORTOS-1995", "ORTOS-2021"])
+    check("missing root gives no collections",
+          _ortho_collections_under(os.path.join(_root, "nope")) == [])
+    _shutil_o.rmtree(_root, ignore_errors=True)
+
     print("_snap_extent_outward")
     # a box whose edges fall inside 0.5 m cells (W +0.40, S +0.12, E +0.10, N +0.18 past a
     # cell edge, the cartogram sheet case) lands on the enclosing cell edges
