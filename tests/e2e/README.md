@@ -24,6 +24,7 @@ README and the commit messages come from these runs.
 | `e2e_ortho.py` | Tool 12 on synthetic DGT style orthophoto blocks (no network). |
 | `e2e_download.py` | Tool 1 against the live CDD: version filter, orthophoto MIME, one tile recompressed on arrival (needs credentials). |
 | `e2e_real.py` | Tool 1 plus Tool 12 on real orthophoto blocks from the live CDD (needs credentials, ~460 MB). |
+| `e2e_missing.py` | Tool 1 against the live CDD on cells whose tiles the catalogue lists but the storage does not hold: reported as missing with the object key, no retries, batch finishes (needs credentials). |
 | `validate_toolbox.py` | Loads the toolbox like Pro and validates every tool's parameters (no data needed). |
 
 The sheet scale script creates a junction named after the area that points at the tile folder

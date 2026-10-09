@@ -1315,6 +1315,7 @@ DGT_CDD_REDIRECT = DGT_CDD_BASE + "/auth/callback"
 DGT_STAC_LIMIT = 1000
 DGT_MAX_CHUNK_KM2 = 200.0                 # split a WGS84 bbox larger than this before searching
 DGT_DOWNLOAD_RETRIES = 4
+DGT_SEARCH_RETRIES = 3                    # a stalled STAC search is retried with backoff
 DGT_SESSION_TIMEOUT = 25 * 60             # renew the CDD session before its token (about 30 min) expires
 DGT_CRED_DIRNAME = "LidarTerrainToolbox"
 DGT_CRED_FILENAME = "dgt_cdd_credentials.json"
@@ -1403,6 +1404,60 @@ def _requests_ca_bundle():
 def _http_status(exc):
     """HTTP status code carried by a requests exception, or None."""
     return getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _missing_entries(area, failed):
+    """(area, tile, key) for the entries of a failed list that are missing on the CDD storage,
+    as _download_assets writes them: '<tile> (missing on the CDD storage, <code> <key>)'. Pure,
+    unit tested."""
+    out = []
+    for entry in failed:
+        marker = " (missing on the CDD storage, "
+        if marker in entry and entry.endswith(")"):
+            tile = entry.split(marker)[0]
+            key = entry[len(tile) + len(marker):-1].split(" ", 1)[-1]
+            out.append((area, tile, key))
+    return out
+
+
+_STORAGE_ERROR_RE = re.compile(r"<Code>([^<]+)</Code>|<Key>([^<]+)</Key>")
+
+
+def _parse_storage_error(body):
+    """(code, key) from the XML error the CDD storage returns for a download it cannot serve,
+    for example NoSuchKey with the object key; (None, None) when the body is not such an error.
+    The catalogue sometimes points at a revised tile (a _v02 object) that was never uploaded,
+    so the download answers 404 (or 403) with this body; no retry can help, and the key is what
+    DGT needs to fix it. Pure, unit tested."""
+    if not body:
+        return None, None
+    text = body if isinstance(body, str) else body.decode("utf-8", "replace")
+    if "<Error>" not in text:
+        return None, None
+    code = key = None
+    for m in _STORAGE_ERROR_RE.finditer(text):
+        if m.group(1) and code is None:
+            code = m.group(1)
+        elif m.group(2) and key is None:
+            key = m.group(2)
+    return code, key
+
+
+def _merge_missing_list(existing_text, entries):
+    """Merge (area, tile, key) entries into the consolidated missing list text, one tab separated
+    line per tile, keeping every earlier line and adding only new keys, sorted by area and
+    tile. The list grows across runs as more sheets are downloaded. Pure, unit tested."""
+    rows = {}
+    for line in (existing_text or "").splitlines():
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) == 3 and parts[2] and not line.startswith("#"):
+            rows[parts[2]] = (parts[0], parts[1], parts[2])
+    for area, tile, key in entries:
+        if key and key not in rows:
+            rows[key] = (area, tile, key)
+    header = ["# Tiles the CDD catalogue lists but the CDD storage does not hold (NoSuchKey): "
+              "report the keys to DGT. One line per tile: area, tile, object key."]
+    return "\n".join(header + ["\t".join(r) for r in sorted(rows.values())]) + "\n"
 
 
 def _asset_extension(mime):
@@ -1664,13 +1719,33 @@ class DownloadDGTData(object):
             return False
 
     def _search(self, session, bbox, collections):
-        """STAC search for one bbox; returns the features list."""
+        """STAC search for one bbox; returns the features list. A timeout, a connection error or
+        a server side error is retried with backoff (the CDD search stalls now and then, and one
+        slow answer must not abort a batch of sheets); a client side error raises at once."""
+        import time
         payload = {"bbox": list(bbox), "limit": DGT_STAC_LIMIT}
         if collections:
             payload["collections"] = collections
-        r = session.post(DGT_CDD_SEARCH, json=payload, timeout=60)
-        r.raise_for_status()
-        return r.json().get("features", [])
+        last = None
+        for attempt in range(DGT_SEARCH_RETRIES):
+            try:
+                r = session.post(DGT_CDD_SEARCH, json=payload, timeout=120)
+                if r.status_code >= 500 or r.status_code == 429:
+                    raise requests.HTTPError(
+                        "HTTP {} from the CDD search".format(r.status_code), response=r)
+                r.raise_for_status()
+                return r.json().get("features", [])
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+                status = _http_status(exc)
+                if status is not None and status < 500 and status != 429:
+                    raise
+                last = exc
+                if attempt < DGT_SEARCH_RETRIES - 1:
+                    wait = 10 * (2 ** attempt)
+                    _warn("CDD search failed ({}); retrying in {} s.".format(exc, wait))
+                    time.sleep(wait)
+        raise RuntimeError("CDD search failed after {} attempts: {}".format(
+            DGT_SEARCH_RETRIES, last))
 
     def _collections_via_endpoint(self, session):
         """Collections from the standard STAC /collections endpoint (empty list on failure)."""
@@ -1794,7 +1869,7 @@ class DownloadDGTData(object):
                 if not os.path.isdir(sub_dir):
                     os.makedirs(sub_dir)
             _msg("  {0}: {1} tiles".format(col, total))
-            col_ok = col_skip = col_fail = 0
+            col_ok = col_skip = col_fail = col_missing = 0
             for n, (item_id, ext, urls) in enumerate(tiles, 1):
                 dest = os.path.join(sub_dir, item_id + ext)
                 result = self._download(session, urls, dest, overwrite)
@@ -1808,6 +1883,14 @@ class DownloadDGTData(object):
                 elif result == "skip":
                     skip += 1
                     col_skip += 1
+                elif result.startswith("missing: "):
+                    fail += 1
+                    col_fail += 1
+                    col_missing += 1
+                    failed.append("{} (missing on the CDD storage, {})".format(
+                        item_id + ext, result[len("missing: "):]))
+                    _msg("    [{0}/{1}] {2} - MISSING on the CDD storage ({3})".format(
+                        n, total, item_id + ext, result[len("missing: "):]))
                 else:
                     fail += 1
                     col_fail += 1
@@ -1815,8 +1898,9 @@ class DownloadDGTData(object):
                     _msg("    [{0}/{1}] {2} - FAILED".format(n, total, item_id + ext))
                 if delay and result != "skip":     # a skip does not hit the server, so no delay
                     time.sleep(delay)
-            _msg("  {0}: {1} downloaded, {2} skipped, {3} failed.".format(
-                col, col_ok, col_skip, col_fail))
+            _msg("  {0}: {1} downloaded, {2} skipped, {3} failed{4}.".format(
+                col, col_ok, col_skip, col_fail,
+                " ({} missing on the CDD storage)".format(col_missing) if col_missing else ""))
         return ok, skip, fail, failed
 
     def _download(self, session, urls, dest, overwrite):
@@ -1842,6 +1926,13 @@ class DownloadDGTData(object):
             for url in urls:
                 try:
                     with session.get(url, stream=True, timeout=120) as r:
+                        if r.status_code in (403, 404):
+                            # The storage answers a missing object with an XML error (NoSuchKey):
+                            # the catalogue points at a revision that was never uploaded. No
+                            # retry can help; report the key so DGT can fix it.
+                            code, key = _parse_storage_error(next(r.iter_content(4096), b""))
+                            if code:
+                                return "missing: {} {}".format(code, key or "?")
                         if r.status_code in (401, 403):
                             # Lost authorization or a forbidden token; re-auth once per tile
                             # (attempted at most once, even if it fails, so a dead auth service
@@ -1933,7 +2024,10 @@ class DownloadDGTData(object):
         retries only these, since the downloaded tiles are skipped."""
         path = os.path.join(folder, area + "_failed.txt")
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write("Tiles that failed to download (re-run later to retry):\n")
+            fh.write("Tiles that could not be downloaded. A tile marked 'missing on the CDD "
+                     "storage' is one the catalogue points at but DGT never uploaded (the object "
+                     "key follows): a re-run cannot fetch it, report the key to DGT. The other "
+                     "tiles are retried on a re-run (downloaded tiles are skipped).\n")
             for name in failed:
                 fh.write(name + "\n")
         _warn("{}: {} tile(s) failed; listed in {}".format(area, len(failed), os.path.basename(path)))
@@ -2063,10 +2157,19 @@ class DownloadDGTData(object):
                 _err(msg)
                 raise ValueError(msg)
 
+        failed_areas = []          # areas whose search failed; the batch goes on and fails at the end
+        all_failed = []            # every failed tile entry, to tell missing from retryable
+        missing_entries = []       # (area, tile, key) of the tiles missing on the CDD storage
         if per_feature:
             # One folder per feature (the recurrence).
             for area, bbox in features:
-                assets = self._collect_assets(session, bbox, collections, delay, latest_only)
+                try:
+                    assets = self._collect_assets(session, bbox, collections, delay, latest_only)
+                except Exception as exc:
+                    _err("{}: the CDD search failed: {}. Skipping this area; a re-run retries "
+                         "it.".format(area, exc))
+                    failed_areas.append(area)
+                    continue
                 if dry_run:
                     _msg("{}: {} tiles (dry run, not downloaded).".format(area, len(assets)))
                     continue
@@ -2080,6 +2183,8 @@ class DownloadDGTData(object):
                 self._write_manifest(folder, area, bbox, collections, len(assets))
                 if failed:
                     self._write_failed(folder, area, failed)
+                    all_failed.extend(failed)
+                    missing_entries.extend(_missing_entries(area, failed))
                 if build_vrt:
                     self._build_vrt(folder)
                 total_ok += ok
@@ -2091,7 +2196,14 @@ class DownloadDGTData(object):
             # All features into one flat folder, deduplicated by URL.
             merged = {}
             for area, bbox in features:
-                for key, urls in self._collect_assets(session, bbox, collections, delay, latest_only).items():
+                try:
+                    found = self._collect_assets(session, bbox, collections, delay, latest_only)
+                except Exception as exc:
+                    _err("{}: the CDD search failed: {}. Skipping this feature; a re-run retries "
+                         "it.".format(area, exc))
+                    failed_areas.append(area)
+                    continue
+                for key, urls in found.items():
                     dst = merged.setdefault(key, [])
                     for u in urls:
                         if u not in dst:
@@ -2108,16 +2220,41 @@ class DownloadDGTData(object):
                 self._write_manifest(out_folder, "ALL", None, collections, len(merged))
                 if failed:
                     self._write_failed(out_folder, "ALL", failed)
+                    all_failed.extend(failed)
+                    missing_entries.extend(_missing_entries("ALL", failed))
                 if build_vrt:
                     _warn("VRT is not built for the flat layout (products share one folder).")
                 _msg("Block: downloaded {}, skipped {}, failed {} -> {}".format(
                     total_ok, total_skip, total_fail, out_folder))
 
-        _msg("Download done. Tiles downloaded {}, skipped {}, failed {}.".format(
-            total_ok, total_skip, total_fail))
-        if total_fail:
-            _warn("{} tile(s) failed. Re-run to retry; existing tiles are skipped.".format(total_fail))
+        missing_total = sum(1 for f in all_failed if "missing on the CDD storage" in f)
+        _msg("Download done. Tiles downloaded {}, skipped {}, failed {}{}.".format(
+            total_ok, total_skip, total_fail,
+            " ({} missing on the CDD storage)".format(missing_total) if missing_total else ""))
+        if total_fail - missing_total:
+            _warn("{} tile(s) failed. Re-run to retry; existing tiles are skipped.".format(
+                total_fail - missing_total))
+        if missing_total:
+            listing = os.path.join(out_folder, "tiles_missing_on_CDD_storage.txt")
+            try:
+                existing = ""
+                if os.path.exists(listing):
+                    with open(listing, encoding="utf-8") as fh:
+                        existing = fh.read()
+                with open(listing, "w", encoding="utf-8") as fh:
+                    fh.write(_merge_missing_list(existing, missing_entries))
+            except OSError as exc:
+                _warn("Could not write {}: {}".format(listing, exc))
+            _warn("{} tile(s) are missing on the CDD storage: the catalogue points at a file DGT "
+                  "never uploaded. A re-run cannot fetch them; the object keys are in the "
+                  "_failed.txt files and consolidated across runs in {}, report them to "
+                  "DGT.".format(missing_total, os.path.basename(listing)))
         session.close()
+        if failed_areas:
+            msg = ("The CDD search failed for {} area(s), skipped: {}. Re-run to retry "
+                   "them.".format(len(failed_areas), ", ".join(failed_areas)))
+            _err(msg)
+            raise RuntimeError(msg)
         return
 
 
@@ -6462,6 +6599,25 @@ def _run_self_tests():
         '<input name="username" value=""><input type="hidden" name="tab_id" value="abc"></form>')
     check("keycloak form action", _action == "https://x/auth")
     check("keycloak form hidden field", _fields.get("tab_id") == "abc")
+    _xml = ('<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchKey</Code><Message>The '
+            'specified key does not exist.</Message><Key>MDT50cm/MDT-50cm-209516-07-2025_v02.tif'
+            '</Key><BucketName>lidar</BucketName></Error>')
+    check("storage error parsed (code and key)",
+          _parse_storage_error(_xml) == ("NoSuchKey", "MDT50cm/MDT-50cm-209516-07-2025_v02.tif"))
+    check("storage error parsed from bytes", _parse_storage_error(_xml.encode("utf-8"))[0] == "NoSuchKey")
+    check("html login page is not a storage error",
+          _parse_storage_error("<html><body>login</body></html>") == (None, None))
+    check("empty body is not a storage error", _parse_storage_error(b"") == (None, None))
+    _entries = _missing_entries("6C", ["MDT-50cm-1.tif (missing on the CDD storage, NoSuchKey MDT50cm/MDT-50cm-1_v02.tif)",
+                                       "MDT-50cm-2.tif"])
+    check("missing entries parsed from the failed list",
+          _entries == [("6C", "MDT-50cm-1.tif", "MDT50cm/MDT-50cm-1_v02.tif")])
+    _merged = _merge_missing_list("# header\n6C\tMDT-50cm-0.tif\tMDT50cm/MDT-50cm-0_v02.tif\n", _entries)
+    check("missing list merged, header first, sorted, no duplicates",
+          _merged.splitlines()[0].startswith("#") and _merged.count("MDT-50cm-0_v02") == 1
+          and _merged.count("MDT-50cm-1_v02") == 1 and len(_merged.splitlines()) == 3)
+    check("merging the same entry again changes nothing",
+          _merge_missing_list(_merged, _entries) == _merged)
     print("_tile_version / _latest_versions")
     check("unversioned stem is version 0",
           _tile_version("MDS-50cm-152470-07-2025") == ("MDS-50cm-152470-07-2025", 0))
