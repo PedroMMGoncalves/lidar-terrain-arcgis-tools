@@ -76,6 +76,7 @@ def run(recompress):
     p[4].value = "flat"; p[5].value = "DEM"; p[8].value = True; p[9].value = True; p[10].value = False
     p[15].value = "by name"; p[16].value = "extent"; p[17].value = False; p[18].value = True
     p[19].value = recompress
+    p[20].value = "arcpy"   # the recompression option only matters on the arcpy path; gdal writes DEFLATE directly
     tool.execute(p, None)
     path = os.path.join(out, "T_DEM.tif")
     ds = gdal.Open(path)
