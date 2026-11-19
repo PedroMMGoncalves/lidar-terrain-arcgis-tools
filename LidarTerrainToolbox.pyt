@@ -938,8 +938,9 @@ def _same_crs(sr_a, sr_b):
 # Datums that are coincident to sub-meter, so a projection between them without a datum shift is
 # correct in practice and the mislabeled-CRS warning would be a false alarm. ETRS89 and WGS84 were
 # identical in 1989 and diverge only about 2.5 cm/year (sub-meter today), and the AOI is projected
-# to WGS84 only to compute a padded, kilometer-scale tile search box.
-_COINCIDENT_DATUMS = {"D_ETRS_1989", "D_WGS_1984"}
+# to WGS84 only to compute a padded, kilometer-scale tile search box. PTRA08 (Azores and Madeira)
+# is the ITRF93 realization for the islands, also sub-meter from WGS84.
+_COINCIDENT_DATUMS = {"D_ETRS_1989", "D_WGS_1984", "D_PTRA08"}
 
 
 def _datum_name(sr):
@@ -1059,13 +1060,16 @@ def _project_geom(geom, from_sr, to_sr):
 
 def _is_data_folder(folder):
     """True if `folder` directly contains a tile or tile subfolder for either product, i.e.
-    an immediate entry whose name starts with MDT or MDS (case insensitive). Cheap shallow
-    check used to tell real LiDAR folders from base data or scratch folders.
+    an immediate entry whose name starts with MDT or MDS (mainland) or ACORES-MD (the Azores
+    product subfolders ACORES-MDE-1, ACORES-MDS-5, ...), or that is an Azores tile (case
+    insensitive). Cheap shallow check used to tell real LiDAR folders from base data or
+    scratch folders.
     """
     try:
         for entry in os.listdir(folder):
             upper = entry.upper()
-            if upper.startswith("MDT") or upper.startswith("MDS"):
+            if (upper.startswith("MDT") or upper.startswith("MDS")
+                    or upper.startswith("ACORES-MD") or _tile_product(entry) is not None):
                 return True
     except OSError:
         return False
@@ -1105,21 +1109,80 @@ def _latest_versions(stems):
     return kept, sorted(dropped)
 
 
+# Azores tiles (collections ACORES-MDE-<res> and ACORES-MDS-<res>) are named
+# <year>_<island>_<county>_<sheet>_<NN>_<MDE|MDS>, for example 2024_SMG_PDL_31-4-1-5_01_MDE,
+# where NN is the cell size in meters (01, 05, 10). MDE is the terrain model, our DEM.
+_AZORES_TILE_RE = re.compile(r"^.+_(\d{2})_(MDE|MDS)(?:_v\d+)?$", re.IGNORECASE)
+
+
+def _tile_product(filename):
+    """Product of a DGT elevation tile from its file name: "MDT" (terrain, DEM) or "MDS"
+    (surface, DSM), or None when the name is neither. Mainland tiles start with the product
+    code (MDT-2m-..., MDS-50cm-...); Azores tiles end with it and call the terrain model MDE
+    (see _AZORES_TILE_RE). Pure, unit tested."""
+    if not filename:
+        return None
+    upper = filename.upper()
+    if upper.startswith("MDT") or upper.startswith("MDS"):
+        return upper[:3]
+    m = _AZORES_TILE_RE.match(os.path.splitext(filename)[0])
+    if m is None:
+        return None
+    return "MDT" if m.group(2).upper() == "MDE" else "MDS"
+
+
 def _parse_tile_resolution(filename):
     """Resolution token from a DGT tile name, or None.
 
     DGT tiles are named like 'MDT-2m-<code>-MM-YYYY.tif' or 'MDS-50cm-...tif'; the token
     is the segment after the product code (here '2m' or '50cm'), returned as written (the
-    product code match is case insensitive). Returns None when the name does not have the
-    'MD[TS]-<token>-...' shape, so non DGT or unlabeled names are left alone.
+    product code match is case insensitive). Azores tiles carry the cell size in meters
+    before the product code ('..._01_MDE.tif'), returned as '1m', '5m' or '10m'. Returns None
+    for any other shape, so non DGT or unlabeled names are left alone.
     """
     if not filename:
         return None
+    m = _AZORES_TILE_RE.match(os.path.splitext(filename)[0])
+    if m is not None:
+        return "{}m".format(int(m.group(1)))
     parts = filename.split("-")
     if len(parts) < 3 or parts[0].upper() not in ("MDT", "MDS"):
         return None
     token = parts[1].strip()
     return token or None
+
+
+# Every tile resolution the tools know, in the order the dialog lists them: the mainland
+# products first, then the Azores ones.
+TILE_RESOLUTIONS = ["2m", "50cm", "1m", "5m", "10m"]
+_PRODUCT_FOLDER_RE = re.compile(r"^(?:MD[TS]-([0-9.]+c?m)|ACORES-MD[ES]-(\d+))$", re.IGNORECASE)
+
+
+def _resolutions_under(root):
+    """Tile resolutions present under a LiDAR root, in TILE_RESOLUTIONS order, so the dialog
+    offers only what was downloaded (a mainland root shows 2m and 50cm, an Azores root 1m, 5m
+    and 10m). Reads the names of the area folders' entries only: the Tool 1 product subfolders
+    (MDT-2m, MDS-50cm, ACORES-MDE-1) and tiles lying directly in an area folder or in the
+    root. Returns [] when nothing is recognized; the caller then offers the whole list. Pure,
+    unit tested."""
+    found = set()
+    try:
+        for entry in os.listdir(root):
+            names = [entry]
+            full = os.path.join(root, entry)
+            if os.path.isdir(full):
+                names.extend(os.listdir(full))
+            for name in names:
+                m = _PRODUCT_FOLDER_RE.match(name)
+                if m is not None:
+                    token = m.group(1) or "{}m".format(int(m.group(2)))
+                else:
+                    token = _parse_tile_resolution(name) if name.lower().endswith(".tif") else None
+                if token:
+                    found.add(token.lower())
+    except OSError:
+        pass
+    return [r for r in TILE_RESOLUTIONS if r in found]
 
 
 def _choose_resolution(tokens, requested):
@@ -1143,8 +1206,8 @@ def _choose_resolution(tokens, requested):
 def _gather_product_tiles(folders, product_prefix, resolution=None):
     """Collect the .tif tiles for one product across an area's download folders.
 
-    product_prefix is "MDT" (DEM) or "MDS" (DSM). Recurses each folder, keeps files whose
-    name starts with product_prefix (case insensitive), and dedups by file name (adjacent
+    product_prefix is "MDT" (DEM) or "MDS" (DSM). Recurses each folder, keeps the tiles of
+    that product (see _tile_product, which also reads the Azores names), and dedups by file name (adjacent
     AOIs of the same area share tiles, the tile code identifies them). Returns
     (paths, tile_sr, cell_size, resolution_used); returns ([], None, None, None) if no tile
     matches.
@@ -1169,7 +1232,7 @@ def _gather_product_tiles(folders, product_prefix, resolution=None):
             for fn in filenames:
                 if not fn.lower().endswith(".tif"):
                     continue
-                if not fn.upper().startswith(product_prefix.upper()):
+                if _tile_product(fn) != product_prefix.upper():
                     continue
                 path = os.path.join(dirpath, fn)
                 if not folder_checked:
@@ -1177,18 +1240,22 @@ def _gather_product_tiles(folders, product_prefix, resolution=None):
                     sr = arcpy.Describe(path).spatialReference
                     if sr is None or sr.type != "Projected":
                         msg = ("Tile '{}' has a geographic or undefined CRS ('{}'). A projected "
-                               "CRS in meters is required (project CRS EPSG:{}).").format(
+                               "CRS in meters is required (EPSG:{} on the mainland, PTRA08 / UTM "
+                               "on the islands).").format(
                                    path, sr.name if sr else "Unknown", PROJECT_EPSG)
                         _err(msg)
                         raise ValueError(msg)
                     if ref_sr is None:
                         ref_sr = sr
+                        # The mosaic keeps the CRS of its tiles, whatever it is (EPSG:3763 on
+                        # the mainland, PTRA08 / UTM zone 25N or 26N in the Azores); say which
+                        # when it is not the mainland one, so the log always names the EPSG.
                         if not sr.factoryCode:
-                            _warn("Tiles use a projected CRS without an EPSG/WKID ('{}'). "
-                                  "Project CRS is EPSG:{}.".format(sr.name, PROJECT_EPSG))
+                            _warn("Tiles use a projected CRS without an EPSG/WKID ('{}'). The "
+                                  "mosaic keeps it.".format(sr.name))
                         elif int(sr.factoryCode) != PROJECT_EPSG:
-                            _warn("Tiles are EPSG:{} ('{}'), not the project EPSG:{}. Proceeding.".format(
-                                sr.factoryCode, sr.name, PROJECT_EPSG))
+                            _msg("Tiles are EPSG:{} ('{}'); the mosaic keeps the tile CRS.".format(
+                                sr.factoryCode, sr.name))
                     elif not _same_crs(ref_sr, sr):
                         msg = ("Tile '{}' CRS ({}) differs from the others ({}). All tiles of an "
                                "area must share one projected CRS.").format(
@@ -1269,6 +1336,19 @@ def _folder_extent_polygon(folder, sr):
     return arcpy.Polygon(corners, sr)
 
 
+def _folder_tile_sr(folder):
+    """Spatial reference of the first elevation tile under `folder`, or None when there is no
+    readable tile. The tiles of a download folder share one CRS."""
+    for dirpath, _dirs, files in os.walk(folder):
+        for fn in sorted(files):
+            if fn.lower().endswith(".tif") and _tile_product(fn) is not None:
+                try:
+                    return arcpy.Describe(os.path.join(dirpath, fn)).spatialReference
+                except Exception:
+                    return None
+    return None
+
+
 def _folder_extent_resolved(folder, sr):
     """Coverage extent of a download folder as a Polygon in `sr`, with a fallback chain: the
     folder's .vrt first (one cheap XML read), else the union of the MDT/MDS tile extents (more
@@ -1283,7 +1363,7 @@ def _folder_extent_resolved(folder, sr):
         for fn in files:
             if not fn.lower().endswith(".tif"):
                 continue
-            if not (fn.startswith("MDT") or fn.startswith("MDS")):
+            if _tile_product(fn) is None:
                 continue
             try:
                 e = arcpy.Describe(os.path.join(dirpath, fn)).extent
@@ -1340,15 +1420,25 @@ DGT_HEADERS = {                            # our client identity and the types w
 # 1:25k quadrant, ids like ORTOS-2021-cog-25cm-144-4: 1 m in 1995, 50 cm from 2004 to 2015,
 # 25 cm from 2018, 30 cm for the 2023 satellite series.
 DGT_ELEVATION_COLLECTIONS = ["LAZ", "MDT-2m", "MDS-2m", "MDT-50cm", "MDS-50cm"]
+# Azores LiDAR (2024 survey, all nine islands; nothing for Madeira as of 2026-11): point cloud
+# and terrain (MDE) / surface (MDS) models at 1, 5 and 10 m, in tiles of 1600 m by 1000 m,
+# Float32, NoData -32767, in PTRA08 / UTM zone 26N (EPSG:5015) for the central and eastern
+# groups and zone 25N (EPSG:5014) for Flores and Corvo. The CDD has no orthophotos there.
+DGT_AZORES_COLLECTIONS = ["ACORES-LAZ", "ACORES-MDE-1", "ACORES-MDS-1", "ACORES-MDE-5",
+                          "ACORES-MDS-5", "ACORES-MDE-10", "ACORES-MDS-10"]
 DGT_ORTHO_COLLECTIONS = ["ORTOS-1995", "ORTOS-2004", "ORTOS-2007", "ORTOS-2010", "ORTOS-2012",
                          "ORTOS-2015", "ORTOS-2018", "ORTOS-2021", "ORTOS-2025", "ORTOSAT-2023"]
 # Collections the CDD search does not return under a collections filter (observed 2026-10-08 for
 # ORTOSAT-2023: the item is in an unfiltered search, a filtered search returns nothing). They are
 # found through an unfiltered search and filtered here. That search is capped at 1000 items, so a
 # block can still be missed where the Sentinel collections crowd it out; the log then says so.
-DGT_UNFILTERED_COLLECTIONS = ("ORTOSAT-2023",)
+# ACORES-LAZ: a filtered search answers HTTP 500 "ST_Intersects: Operation on mixed SRID
+# geometries" (observed 2026-11-19), the unfiltered one returns the tiles.
+DGT_UNFILTERED_COLLECTIONS = ("ORTOSAT-2023", "ACORES-LAZ")
 # Order in which products are downloaded, so each folder fills one product at a time, not mixed.
-DGT_DOWNLOAD_ORDER = ["MDT-50cm", "MDS-50cm", "MDT-2m", "MDS-2m", "LAZ"]
+DGT_DOWNLOAD_ORDER = ["MDT-50cm", "MDS-50cm", "MDT-2m", "MDS-2m", "LAZ",
+                      "ACORES-MDE-1", "ACORES-MDS-1", "ACORES-MDE-5", "ACORES-MDS-5",
+                      "ACORES-MDE-10", "ACORES-MDS-10", "ACORES-LAZ"]
 
 
 def _download_order_key(collection):
@@ -1594,7 +1684,8 @@ class DownloadDGTData(object):
             displayName="Collections to download", name="collections",
             datatype="GPString", parameterType="Optional", direction="Input", multiValue=True)
         p_collections.filter.type = "ValueList"
-        p_collections.filter.list = list(DGT_ELEVATION_COLLECTIONS) + list(DGT_ORTHO_COLLECTIONS)
+        p_collections.filter.list = (list(DGT_ELEVATION_COLLECTIONS) + list(DGT_AZORES_COLLECTIONS)
+                                     + list(DGT_ORTHO_COLLECTIONS))
         p_collections.value = ["MDT-2m", "MDS-2m"]
 
         p_list = arcpy.Parameter(
@@ -1849,8 +1940,8 @@ class DownloadDGTData(object):
         tile lands directly in dest_root. Tiles download grouped by product in a stable order
         (DGT_DOWNLOAD_ORDER), not mixed, and each tile is logged. Returns (ok, skip, fail, failed
         list). The
-        subfolders mirror the DGT products (MDT-2m, MDS-2m, MDT-50cm, MDS-50cm, LAZ) and the
-        mosaic tool reads MDT*/MDS*."""
+        subfolders mirror the DGT products (MDT-2m, MDS-2m, MDT-50cm, MDS-50cm, LAZ, ACORES-*)
+        and the mosaic tool reads the tiles by product (see _tile_product)."""
         import time
         if not os.path.isdir(dest_root):
             os.makedirs(dest_root)
@@ -2343,7 +2434,7 @@ class BuildMosaicsByPolygon(object):
             name="tile_resolution", datatype="GPString", parameterType="Optional",
             direction="Input", multiValue=True)
         p_res.filter.type = "ValueList"
-        p_res.filter.list = ["2m", "50cm"]
+        p_res.filter.list = list(TILE_RESOLUTIONS)   # narrowed to the root's in updateParameters
 
         p_clusters = arcpy.Parameter(
             displayName="Also build overlap clusters", name="build_clusters",
@@ -2423,6 +2514,13 @@ class BuildMosaicsByPolygon(object):
         return True
 
     def updateParameters(self, parameters):
+        # Offer only the tile resolutions that exist under the chosen root (2m and 50cm on the
+        # mainland, 1m, 5m and 10m in the Azores); the whole list when none is recognized.
+        p_root, p_res = parameters[2], parameters[12]
+        if p_root.altered and p_root.valueAsText and os.path.isdir(p_root.valueAsText):
+            p_res.filter.list = _resolutions_under(p_root.valueAsText) or list(TILE_RESOLUTIONS)
+            if p_res.values:
+                p_res.value = [v for v in p_res.values if v in set(p_res.filter.list)]
         # The cluster dry-run only applies when clustering is on.
         parameters[14].enabled = bool(parameters[13].value)
         # The extent verification only runs under by FID mapping (by name and by geometry are
@@ -2661,6 +2759,7 @@ class BuildMosaicsByPolygon(object):
                     raise RuntimeError("gdal.BuildVRT returned None")
                 nodata = vrt.GetRasterBand(1).GetNoDataValue()
                 cell = vrt.GetGeoTransform()[1]
+                tile_wkt = vrt.GetProjection()
                 vrt = None
                 source = vrt_path
                 kwargs = {"format": "GTiff",
@@ -2678,9 +2777,12 @@ class BuildMosaicsByPolygon(object):
                         if cover_aoi:
                             union = union.buffer(cell / 2.0)
                         arcpy.management.CopyFeatures([union], cut_fc)
+                        # The cutline was projected to the tile CRS above, so declare it in
+                        # exactly the CRS of the tiles (not a fixed EPSG): no reprojection.
                         warp_kwargs = {"format": "VRT", "cutlineDSName": cut_fc,
-                                       "cutlineSRS": "EPSG:{}".format(PROJECT_EPSG),
                                        "outputBounds": list(box)}
+                        if tile_wkt:
+                            warp_kwargs["cutlineSRS"] = tile_wkt
                         if nodata is not None:
                             warp_kwargs["dstNodata"] = nodata
                         warped = gdal.Warp(cut_vrt, vrt_path, **warp_kwargs)
@@ -2743,19 +2845,20 @@ class BuildMosaicsByPolygon(object):
         to a shapefile whose FID order no longer matches the folder numbering. Folder extent
         comes from the .vrt, else the union of the tile extents. A feature with no folder extent
         around it is left unmapped and its area is skipped, since a downloaded folder always has
-        a resolvable extent, so no match means the data is not there. Tiles are EPSG:3763.
+        a resolvable extent, so no match means the data is not there. Each folder is compared
+        in the CRS of its own tiles (EPSG:3763 on the mainland, PTRA08 / UTM in the Azores).
         """
-        tile_sr = arcpy.SpatialReference(PROJECT_EPSG)
-
-        folders = []                       # (full, extent_polygon, center_x, center_y)
+        folders = []                       # (full, extent_polygon, center_x, center_y, tile_sr)
         for name, full in data_folders:
+            tile_sr = _folder_tile_sr(full) or arcpy.SpatialReference(PROJECT_EPSG)
             ext = _folder_extent_resolved(full, tile_sr)
             if ext is None:
                 _warn("Folder '{}' has no .vrt and no readable tiles; cannot place it by "
                       "geometry.".format(name))
                 continue
             ce = ext.extent
-            folders.append((full, ext, (ce.XMin + ce.XMax) / 2.0, (ce.YMin + ce.YMax) / 2.0))
+            folders.append((full, ext, (ce.XMin + ce.XMax) / 2.0, (ce.YMin + ce.YMax) / 2.0,
+                            tile_sr))
         if not folders:
             msg = ("No data folder yielded a tile extent (.vrt or tiles), so the geometry "
                    "mapping has nothing to match. Switch 'Folder to area mapping' to "
@@ -2770,15 +2873,18 @@ class BuildMosaicsByPolygon(object):
         for fid, geom in fid_to_geom.items():
             if geom is None:
                 continue
-            projected = _project_geom(geom, aoi_sr, tile_sr)
-            fe = projected.extent
-            fx = (fe.XMin + fe.XMax) / 2.0
-            fy = (fe.YMin + fe.YMax) / 2.0
-            pt = arcpy.PointGeometry(arcpy.Point(fx, fy), tile_sr)
+            centers = {}                   # tile CRS -> (fx, fy, point), projected once each
             best_full = None
             best_d = None
             second_d = None
-            for full, ext, cx, cy in folders:
+            for full, ext, cx, cy, tile_sr in folders:
+                sr_key = tile_sr.factoryCode or tile_sr.exportToString()
+                if sr_key not in centers:
+                    fe = _project_geom(geom, aoi_sr, tile_sr).extent
+                    px = (fe.XMin + fe.XMax) / 2.0
+                    py = (fe.YMin + fe.YMax) / 2.0
+                    centers[sr_key] = (px, py, arcpy.PointGeometry(arcpy.Point(px, py), tile_sr))
+                fx, fy, pt = centers[sr_key]
                 if not ext.contains(pt):
                     continue
                 d = (fx - cx) ** 2 + (fy - cy) ** 2
@@ -2856,9 +2962,10 @@ class BuildMosaicsByPolygon(object):
             _err(msg)
             raise ValueError(msg)
         _msg("AOI layer CRS: {}.".format(_crs_label(aoi_sr)))
-        if aoi_sr.factoryCode and int(aoi_sr.factoryCode) != PROJECT_EPSG:
-            _warn("AOI layer is {}, not the project EPSG:{}. Polygons are projected for the "
-                  "extent check only.".format(_crs_label(aoi_sr), PROJECT_EPSG))
+        # The mosaics keep the CRS of their tiles (EPSG:3763 on the mainland, PTRA08 / UTM in
+        # the Azores); the AOI polygons are projected to it for the mapping and the cut only.
+        _msg("Mosaics keep the CRS of their tiles; AOI polygons are projected to it for the "
+             "folder mapping and the cut.")
 
         # The download folder number equals the AOI FID. The folders were named at download
         # time from the original shapefile FID (0 based), which OID@ returns.
@@ -2893,7 +3000,7 @@ class BuildMosaicsByPolygon(object):
             if os.path.isdir(full) and _is_data_folder(full):
                 data_folders.append((entry, full))
         if not data_folders:
-            msg = "No LiDAR data folders (with MDT/MDS tiles) found under '{}'.".format(lidar_root)
+            msg = "No LiDAR data folders (with MDT/MDE/MDS tiles) found under '{}'.".format(lidar_root)
             _err(msg)
             raise ValueError(msg)
 
@@ -6592,6 +6699,32 @@ def _run_self_tests():
     check("geotiff head is a valid asset", _looks_like_asset(b"II*\x00\x08\x00"))
     check("laz head is a valid asset", _looks_like_asset(b"LASF\x00\x00"))
     check("html login page is not an asset", not _looks_like_asset(b"<!DOCTYPE html>"))
+    _res_root = tempfile.mkdtemp()
+    try:
+        for sub in ("12A/MDT-2m", "12A/MDS-50cm", "12A/ORTOS-2021", "SMG/ACORES-MDE-10", "notes"):
+            os.makedirs(os.path.join(_res_root, *sub.split("/")))
+        open(os.path.join(_res_root, "SMG", "2024_SMG_PDL_31-4-1-5_01_MDE.tif"), "w").close()
+        check("resolutions under a root, in dialog order",
+              _resolutions_under(_res_root) == ["2m", "50cm", "1m", "10m"])
+        check("no resolutions under an unrelated folder",
+              _resolutions_under(os.path.join(_res_root, "notes")) == [])
+    finally:
+        shutil.rmtree(_res_root, ignore_errors=True)
+    check("tile product: mainland and Azores names",
+          [_tile_product(n) for n in ("MDT-2m-1-2-3.tif", "mds-50cm-1-2-3_v01.tif",
+                                      "2024_SMG_PDL_31-4-1-5_01_MDE.tif",
+                                      "2024_FLO_LJF_1-2_10_mds.tif", "hillshade.tif",
+                                      "2024_SMG_PDL_31-4-1-5_CCL_RGBI.tif", "")]
+          == ["MDT", "MDS", "MDT", "MDS", None, None, None])
+    check("tile resolution: Azores names",
+          [_parse_tile_resolution(n) for n in ("2024_SMG_PDL_31-4-1-5_01_MDE.tif",
+                                               "2024_SMG_PDL_31-4-1-5_05_MDS.tif",
+                                               "2024_SMG_PDL_31-4-1-5_10_MDE_v02.tif")]
+          == ["1m", "5m", "10m"])
+    check("Azores collections are offered and ordered",
+          all(c in DGT_DOWNLOAD_ORDER for c in DGT_AZORES_COLLECTIONS)
+          and "ACORES-LAZ" in DGT_UNFILTERED_COLLECTIONS)
+    check("PTRA08 is coincident with WGS84", _datums_coincident("D_PTRA08", "D_WGS_1984"))
     check("small bbox is not split", len(divide_bbox((-8.0, 39.0, -7.99, 39.01))) == 1)
     check("large bbox is split into a grid", len(divide_bbox((-8.0, 39.0, -7.0, 39.5))) > 1)
     _action, _fields = parse_login_form(
